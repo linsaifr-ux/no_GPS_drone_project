@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""
+Chiayi, Taiwan — pure Cesium ion 3D Tiles scene.
+
+All geometry comes from Cesium ion REST API:
+  Asset 1      — Cesium World Terrain (quantized-mesh-1.0)
+  Asset 96188  — Cesium OSM Buildings (3D Tiles B3DM)
+
+Satellite imagery: Taiwan NLSC aerial orthophoto WMTS (PHOTO2, zoom 18).
+
+No OSM, no SRTM, no Overpass.  Just Cesium.
+
+Run:
+    DISPLAY=:2 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python cesium_scene.py
+"""
+
+import io as _io, json, math, os, struct, time, urllib.parse, urllib.request
+
+import numpy as np
+import requests
+from PIL import Image
+
+# ── SCENE CONSTANTS ────────────────────────────────────────────────────────────
+CENTER_LAT = 23.450868
+CENTER_LON = 120.286135
+RADIUS_M   = 2000.0
+R_EARTH    = 6_371_000.0
+COS_LAT    = math.cos(math.radians(CENTER_LAT))
+HERE       = os.path.dirname(os.path.abspath(__file__))
+
+# WGS-84
+_A  = 6_378_137.0
+_E2 = 0.006_694_379_990_14
+
+CESIUM_ION_TOKEN = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJqdGkiOiIzY2E1NmFkNC1jNjg3LTRjMmUtOWJlMi1hODhmNjY1NjcxMDMiLCJpZCI6NDMxNzYzLCJpc3MiOiJodHRwczovL2lvbi5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3Nzg4MDQzNDF9"
+    ".OLYEHi742XKljoOW6vPi7HnLcokgZuUr9M0BIbQheHI"
+)
+CESIUM_TERRAIN_ASSET   = 1
+CESIUM_BUILDINGS_ASSET = 96188
+
+# ── ENU helpers ────────────────────────────────────────────────────────────────
+def to_xy(lat, lon):
+    return (math.radians(lon - CENTER_LON) * R_EARTH * COS_LAT,
+            math.radians(lat - CENTER_LAT) * R_EARTH)
+
+def to_latlon(x, y):
+    return (CENTER_LAT + (y / R_EARTH) * (180 / math.pi),
+            CENTER_LON + (x / (R_EARTH * COS_LAT)) * (180 / math.pi))
+
+# ── ECEF → geodetic (vectorised) ───────────────────────────────────────────────
+def ecef_to_geodetic_vec(xyz: np.ndarray):
+    x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    lon = np.degrees(np.arctan2(y, x))
+    p   = np.sqrt(x**2 + y**2)
+    lat = np.arctan2(z, p * (1.0 - _E2))
+    for _ in range(10):
+        N   = _A / np.sqrt(1.0 - _E2 * np.sin(lat)**2)
+        lat = np.arctan2(z + _E2 * N * np.sin(lat), p)
+    N   = _A / np.sqrt(1.0 - _E2 * np.sin(lat)**2)
+    alt = np.where(np.abs(np.cos(lat)) > 1e-10,
+                   p / np.cos(lat) - N,
+                   np.abs(z) / np.abs(np.where(np.sin(lat) == 0, 1e-30, np.sin(lat)))
+                   - N * (1 - _E2))
+    return np.degrees(lat), lon, alt
+
+# ── Isaac Sim ──────────────────────────────────────────────────────────────────
+from isaacsim import SimulationApp
+simulation_app = SimulationApp({
+    "headless":     False,
+    "width":        1920,
+    "height":       1080,
+    "window_title": "Isaac Sim — Cesium ion  23.45°N 120.29°E",
+})
+
+import omni.usd
+from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
+
+stage = omni.usd.get_context().get_stage()
+UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+# Print and remove any default prims Isaac Sim adds (ground planes, default lights)
+print("[STAGE] Prims at startup:")
+for p in stage.Traverse():
+    print(f"  {p.GetPath()}  ({p.GetTypeName()})")
+for default_path in ["/World/defaultGroundPlane", "/groundPlane", "/World/GroundPlane",
+                     "/World/groundPlane", "/Environment", "/World/Environment"]:
+    prim = stage.GetPrimAtPath(default_path)
+    if prim.IsValid():
+        stage.RemovePrim(default_path)
+        print(f"[STAGE] Removed: {default_path}")
+
+# ── USD helpers ────────────────────────────────────────────────────────────────
+def bind(prim, mat):
+    UsdShade.MaterialBindingAPI(prim).Bind(mat)
+
+def pbr_mat(path, rgb, metallic=0.0, roughness=0.7):
+    mat = UsdShade.Material.Define(stage, path)
+    sh  = UsdShade.Shader.Define(stage, path + "/S")
+    sh.CreateIdAttr("UsdPreviewSurface")
+    sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+    sh.CreateInput("metallic",     Sdf.ValueTypeNames.Float).Set(metallic)
+    sh.CreateInput("roughness",    Sdf.ValueTypeNames.Float).Set(roughness)
+    mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+    return mat
+
+_used = set()
+def upath(base):
+    p, i = base, 0
+    while p in _used: i += 1; p = f"{base}_{i}"
+    _used.add(p); return p
+
+# ── CESIUM ION ENDPOINT ────────────────────────────────────────────────────────
+def fetch_ion_endpoint(asset_id: int):
+    """Return (tileset_url, access_token, base_url) for a Cesium ion asset."""
+    resp = requests.get(
+        f"https://api.cesium.com/v1/assets/{asset_id}/endpoint",
+        headers={"Authorization": f"Bearer {CESIUM_ION_TOKEN}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    ep = resp.json()
+    url  = ep["url"]
+    base = url.rsplit("/", 1)[0] + "/"
+    return url, ep["accessToken"], base
+
+# ── SATELLITE IMAGERY (Taiwan NLSC aerial orthophoto WMTS) ───────────────────
+# Free public WMTS, no API key. Layer PHOTO2 = latest orthophoto, up to zoom 20.
+# URL: https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/{z}/{y}/{x}
+SAT_ZOOM  = 18   # 0.6 m/px — NLSC supports up to zoom 20
+SAT_CACHE = os.path.join(HERE, "satellite_ground.jpg")
+
+def _deg2tile(lat, lon, z):
+    n  = 1 << z
+    x  = int((lon + 180.0) / 360.0 * n)
+    lr = math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat)))
+    y  = int((1.0 - lr / math.pi) / 2.0 * n)
+    return x, y
+
+def _tile2deg(tx, ty, z):
+    n   = 1 << z
+    lon = tx / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ty / n))))
+    return lat, lon
+
+def fetch_satellite(margin_factor=1.5):
+    """Download Taiwan NLSC aerial orthophoto tiles for the scene area."""
+    d_lat = RADIUS_M * margin_factor / 111_320.0
+    d_lon = RADIUS_M * margin_factor / (111_320.0 * COS_LAT)
+    tx_min, ty_min = _deg2tile(CENTER_LAT + d_lat, CENTER_LON - d_lon, SAT_ZOOM)
+    tx_max, ty_max = _deg2tile(CENTER_LAT - d_lat, CENTER_LON + d_lon, SAT_ZOOM)
+    nw_lat, nw_lon = _tile2deg(tx_min,     ty_min,     SAT_ZOOM)
+    se_lat, se_lon = _tile2deg(tx_max + 1, ty_max + 1, SAT_ZOOM)
+
+    bounds = dict(nw_lat=nw_lat, nw_lon=nw_lon, se_lat=se_lat, se_lon=se_lon)
+    if os.path.exists(SAT_CACHE):
+        print(f"[SAT] Using cached {SAT_CACHE}")
+        return SAT_CACHE, bounds
+
+    nx = tx_max - tx_min + 1; ny = ty_max - ty_min + 1
+    print(f"[SAT] Downloading {nx}×{ny} NLSC orthophoto tiles at zoom {SAT_ZOOM} …")
+    TILE   = 256
+    mosaic = Image.new("RGB", (nx * TILE, ny * TILE))
+    sess   = requests.Session()
+    sess.headers.update({"User-Agent": "IsaacSimCesium/1.0"})
+    for tx in range(tx_min, tx_max + 1):
+        for ty in range(ty_min, ty_max + 1):
+            url = (f"https://wmts.nlsc.gov.tw/wmts/PHOTO2/default"
+                   f"/GoogleMapsCompatible/{SAT_ZOOM}/{ty}/{tx}")
+            for attempt in range(3):
+                try:
+                    r = sess.get(url, timeout=15)
+                    r.raise_for_status()
+                    tile = Image.open(_io.BytesIO(r.content)).convert("RGB")
+                    mosaic.paste(tile, ((tx - tx_min) * TILE, (ty - ty_min) * TILE))
+                    break
+                except Exception as e:
+                    if attempt == 2: print(f"  [SAT] skip {tx},{ty}: {e}")
+                    else: time.sleep(0.5)
+            time.sleep(0.03)
+    # RTX renderer caps usable texture size at ~8192; resize if larger
+    MAX_TEX = 8192
+    if mosaic.width > MAX_TEX or mosaic.height > MAX_TEX:
+        scale = MAX_TEX / max(mosaic.width, mosaic.height)
+        new_w, new_h = int(mosaic.width * scale), int(mosaic.height * scale)
+        mosaic = mosaic.resize((new_w, new_h), Image.LANCZOS)
+        print(f"[SAT] Resized to {new_w}×{new_h} for GPU texture limit")
+    mosaic.save(SAT_CACHE, "JPEG", quality=92)
+    print(f"[SAT] Saved {mosaic.width}×{mosaic.height} → {SAT_CACHE}")
+    return SAT_CACHE, bounds
+
+sat_path, sat_bounds = fetch_satellite()
+SAT_NW_LAT = sat_bounds["nw_lat"]; SAT_NW_LON = sat_bounds["nw_lon"]
+SAT_SE_LAT = sat_bounds["se_lat"]; SAT_SE_LON = sat_bounds["se_lon"]
+
+def geo_to_uv(lon_arr, lat_arr):
+    """Map lon/lat arrays to texture UV within the satellite image bounds.
+    USD UsdUVTexture uses OpenGL convention: v=0 = bottom of image.
+    Our JPEG has north at top, so v must be flipped (1 - ...) so north → v=1 (top).
+    """
+    u = (lon_arr - SAT_NW_LON) / (SAT_SE_LON - SAT_NW_LON)
+    v = 1.0 - (SAT_NW_LAT - lat_arr) / (SAT_NW_LAT - SAT_SE_LAT)
+    return np.clip(u, 0, 1), np.clip(v, 0, 1)
+
+# ── CESIUM WORLD TERRAIN ───────────────────────────────────────────────────────
+TERRAIN_LEVEL = 13      # each tile ≈ 2.4 km;  3×3 grid → 7.2 km coverage
+TERRAIN_CACHE_DIR = os.path.join(HERE, "cesium_terrain_cache")
+os.makedirs(TERRAIN_CACHE_DIR, exist_ok=True)
+TERRAIN_TILE_LIST = os.path.join(HERE, "cesium_terrain_list.json")
+
+def _tms_tile_bounds(z, x, y):
+    """Geographic bounds of a TMS tile (y=0 at south)."""
+    nx = 1 << (z + 1); ny = 1 << z
+    west  =  x      / nx * 360.0 - 180.0
+    east  = (x + 1) / nx * 360.0 - 180.0
+    south =  y      / ny * 180.0 -  90.0
+    north = (y + 1) / ny * 180.0 -  90.0
+    return west, south, east, north
+
+def compute_terrain_tile_coords(level):
+    """Return list of (x, y_tms) covering the scene area with a small margin."""
+    nx = 1 << (level + 1)
+    ny = 1 << level
+    margin = RADIUS_M * 1.3
+    d_lat  = margin / 111_320.0
+    d_lon  = margin / (111_320.0 * COS_LAT)
+    x_min = int((CENTER_LON - d_lon + 180) / 360 * nx)
+    x_max = int((CENTER_LON + d_lon + 180) / 360 * nx)
+    # TMS y: south = 0, north = ny-1
+    y_min = int((CENTER_LAT - d_lat + 90) / 180 * ny)
+    y_max = int((CENTER_LAT + d_lat + 90) / 180 * ny)
+    coords = [(x, y) for x in range(x_min, x_max + 1)
+                      for y in range(y_min, y_max + 1)]
+    return coords
+
+def zigzag_decode(n: np.ndarray) -> np.ndarray:
+    return (n >> 1).astype(np.int32) ^ -(n.astype(np.int32) & 1)
+
+def parse_quantized_mesh(data: bytes, west, south, east, north):
+    """
+    Parse Cesium quantized-mesh-1.0.
+    Returns (verts_enu Nx3, faces Mx3, lons Nx1, lats Nx1) or None on failure.
+    Vertex lat/lon returned for UV mapping.
+    """
+    if len(data) < 88:
+        return None
+    # Header: bytes 24-31 = minHeight, maxHeight (float32)
+    min_h, max_h = struct.unpack_from("<ff", data, 24)
+    off = 88
+
+    vertex_count = struct.unpack_from("<I", data, off)[0]; off += 4
+    if vertex_count == 0:
+        return None
+
+    u_raw = np.frombuffer(data, dtype="<u2", count=vertex_count, offset=off).copy(); off += vertex_count * 2
+    v_raw = np.frombuffer(data, dtype="<u2", count=vertex_count, offset=off).copy(); off += vertex_count * 2
+    h_raw = np.frombuffer(data, dtype="<u2", count=vertex_count, offset=off).copy(); off += vertex_count * 2
+
+    # Decode: zigzag then prefix-sum (delta encoding)
+    u = np.cumsum(zigzag_decode(u_raw)).clip(0, 32767).astype(np.float64)
+    v = np.cumsum(zigzag_decode(v_raw)).clip(0, 32767).astype(np.float64)
+    h = np.cumsum(zigzag_decode(h_raw)).clip(0, 32767).astype(np.float64)
+
+    lon    = west  + u / 32767.0 * (east  - west)
+    lat    = south + v / 32767.0 * (north - south)
+    height = min_h + h / 32767.0 * (max_h - min_h)
+
+    triangle_count = struct.unpack_from("<I", data, off)[0]; off += 4
+    if triangle_count == 0:
+        return None
+
+    idx_size  = 4 if vertex_count > 65536 else 2
+    idx_dtype = "<u4" if vertex_count > 65536 else "<u2"
+    raw_idx   = np.frombuffer(data, dtype=idx_dtype,
+                               count=triangle_count * 3, offset=off).astype(np.int32)
+
+    # High-watermark index decode
+    high = 0
+    indices = np.empty(len(raw_idx), dtype=np.int32)
+    for i, code in enumerate(raw_idx.tolist()):
+        indices[i] = high - code
+        if code == 0:
+            high += 1
+    faces = indices.reshape(-1, 3)
+
+    # ENU
+    x_enu = np.radians(lon - CENTER_LON) * R_EARTH * COS_LAT
+    y_enu = np.radians(lat - CENTER_LAT) * R_EARTH
+    verts_enu = np.column_stack([x_enu, y_enu, height])
+
+    return verts_enu, faces, lon, lat
+
+def fetch_terrain_tiles():
+    """Return list of dicts: {url, x, y_tms, bounds, cache_path}."""
+    if os.path.exists(TERRAIN_TILE_LIST):
+        with open(TERRAIN_TILE_LIST) as f:
+            cached = json.load(f)
+        print(f"[TERRAIN] Using cached tile list ({len(cached['tiles'])} tiles)")
+        return cached["tiles"], None   # token fetched separately
+
+    print("[TERRAIN] Fetching Cesium World Terrain endpoint …")
+    tileset_url, access_token, base_url = fetch_ion_endpoint(CESIUM_TERRAIN_ASSET)
+
+    # layer.json tells us the tile URL template
+    layer_url = base_url + "layer.json"
+    r = requests.get(layer_url, params={"access_token": access_token}, timeout=30)
+    if r.ok:
+        layer = r.json()
+        tile_template = layer.get("tiles", ["{z}/{x}/{y}.terrain"])[0]
+        # Resolve relative URLs (e.g. "{z}/{x}/{y}.terrain?v={version}")
+        if tile_template.startswith("//"):
+            tile_template = "https:" + tile_template
+        elif not tile_template.startswith("http"):
+            tile_template = base_url + tile_template
+        # Replace {version} with the version in the base URL path (e.g. "v1.2.0")
+        tile_template = tile_template.replace("{version}", "1.2.0")
+    else:
+        tile_template = base_url + "{z}/{x}/{y}.terrain"
+
+    coords = compute_terrain_tile_coords(TERRAIN_LEVEL)
+    tiles  = []
+    for x, y_tms in coords:
+        west, south, east, north = _tms_tile_bounds(TERRAIN_LEVEL, x, y_tms)
+        url = (tile_template
+               .replace("{z}", str(TERRAIN_LEVEL))
+               .replace("{x}", str(x))
+               .replace("{y}", str(y_tms)))
+        cache_key = f"{TERRAIN_LEVEL}_{x}_{y_tms}.terrain"
+        tiles.append({"url": url, "x": x, "y_tms": y_tms,
+                      "bounds": [west, south, east, north],
+                      "cache": cache_key})
+    with open(TERRAIN_TILE_LIST, "w") as f:
+        json.dump({"tiles": tiles}, f)
+    print(f"[TERRAIN] Computed {len(tiles)} tile URLs (level {TERRAIN_LEVEL})")
+    return tiles, access_token
+
+def download_terrain_tile(tile_info: dict, access_token: str):
+    cache_p = os.path.join(TERRAIN_CACHE_DIR, tile_info["cache"])
+    if os.path.exists(cache_p):
+        with open(cache_p, "rb") as f:
+            return f.read()
+    url = tile_info["url"]
+    r   = requests.get(url, params={"access_token": access_token},
+                        timeout=60, headers={"Accept": "application/vnd.quantized-mesh"})
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    with open(cache_p, "wb") as f:
+        f.write(r.content)
+    return r.content
+
+# ── USD TERRAIN MESH with satellite texture ────────────────────────────────────
+def make_terrain_mesh(prim_path, verts_enu, faces, lons, lats, img_path):
+    u_tex, v_tex = geo_to_uv(lons, lats)
+    uvs  = Vt.Vec2fArray([Gf.Vec2f(float(u), float(v)) for u, v in zip(u_tex, v_tex)])
+    pts  = Vt.Vec3fArray([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts_enu])
+    flat_idx = [int(i) for f in faces for i in f]
+
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+    mesh.CreateFaceVertexIndicesAttr(flat_idx)
+    mesh.CreateSubdivisionSchemeAttr("none")
+    st_pv = UsdGeom.PrimvarsAPI(mesh.GetPrim()).CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+    st_pv.Set(uvs)
+    UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+
+    mp  = prim_path + "/SatMat"
+    mat = UsdShade.Material.Define(stage, mp)
+    pbr = UsdShade.Shader.Define(stage, mp + "/PBR")
+    pbr.CreateIdAttr("UsdPreviewSurface")
+    pbr.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.90)
+    pbr.CreateInput("metallic",  Sdf.ValueTypeNames.Float).Set(0.0)
+    tex = UsdShade.Shader.Define(stage, mp + "/Tex")
+    tex.CreateIdAttr("UsdUVTexture")
+    tex.CreateInput("file",             Sdf.ValueTypeNames.Asset).Set(img_path)
+    tex.CreateInput("wrapS",            Sdf.ValueTypeNames.Token).Set("clamp")
+    tex.CreateInput("wrapT",            Sdf.ValueTypeNames.Token).Set("clamp")
+    tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+    st_r = UsdShade.Shader.Define(stage, mp + "/STReader")
+    st_r.CreateIdAttr("UsdPrimvarReader_float2")
+    st_r.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+        st_r.ConnectableAPI(), "result")
+    pbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+        tex.ConnectableAPI(), "rgb")
+    mat.CreateSurfaceOutput().ConnectToSource(pbr.ConnectableAPI(), "surface")
+    bind(mesh.GetPrim(), mat)
+    return mesh
+
+# ── CESIUM OSM BUILDINGS ───────────────────────────────────────────────────────
+BUILDING_LEVEL    = 12
+BUILDING_TILE_DIR = os.path.join(HERE, "cesium_tile_cache")
+BUILDING_TILE_LIST = os.path.join(HERE, "cesium_tile_list.json")
+os.makedirs(BUILDING_TILE_DIR, exist_ok=True)
+
+# Building type → material colour
+BLD_TYPE_MAT = {
+    "hospital": (0.85, 0.30, 0.30),   # red
+    "clinic":   (0.85, 0.30, 0.30),
+    "school":   (0.90, 0.65, 0.15),   # amber
+    "college":  (0.90, 0.65, 0.15),
+    "university": (0.90, 0.65, 0.15),
+    "kindergarten": (0.90, 0.65, 0.15),
+    "church":   (0.68, 0.38, 0.88),   # purple
+    "temple":   (0.68, 0.38, 0.88),
+    "mosque":   (0.68, 0.38, 0.88),
+    "shrine":   (0.68, 0.38, 0.88),
+    "retail":   (0.88, 0.82, 0.18),   # yellow
+    "shop":     (0.88, 0.82, 0.18),
+    "commercial": (0.30, 0.58, 0.88), # steel-blue
+    "office":   (0.30, 0.58, 0.88),
+    "hotel":    (0.30, 0.58, 0.88),
+    "government": (0.30, 0.58, 0.88),
+    "industrial": (0.55, 0.50, 0.42), # grey-brown
+    "warehouse": (0.55, 0.50, 0.42),
+    "factory":  (0.55, 0.50, 0.42),
+    "apartments": (0.60, 0.60, 0.68), # blue-grey
+    "dormitory": (0.60, 0.60, 0.68),
+    "house":    (0.80, 0.72, 0.58),   # cream
+    "residential": (0.80, 0.72, 0.58),
+    "yes":      (0.75, 0.73, 0.70),   # light stone
+}
+_DEFAULT_BLD_RGB = (0.75, 0.73, 0.70)
+
+_bld_mats = {}
+def bld_mat(btype):
+    if btype not in _bld_mats:
+        rgb = BLD_TYPE_MAT.get(btype, _DEFAULT_BLD_RGB)
+        _bld_mats[btype] = pbr_mat(f"/Mat/Bld_{btype}", rgb, roughness=0.80)
+    return _bld_mats[btype]
+
+def _read_accessor(accs, bvs, bin_data, idx, dtype, nc):
+    acc = accs[idx]; bv = bvs[acc["bufferView"]]
+    stride = bv.get("byteStride", nc * np.dtype(dtype).itemsize)
+    off    = bv["byteOffset"] + acc.get("byteOffset", 0)
+    n      = acc["count"]; sz = np.dtype(dtype).itemsize
+    if stride == nc * sz:
+        return np.frombuffer(bin_data[off: off + n * stride],
+                             dtype=dtype).reshape(n, nc)
+    return np.vstack([np.frombuffer(
+        bin_data[off + i * stride: off + i * stride + nc * sz], dtype=dtype)
+        for i in range(n)])
+
+def parse_b3dm_buildings(data: bytes):
+    """Parse B3DM tile → list of {verts_enu, faces, type}."""
+    if len(data) < 28 or data[:4] != b"b3dm":
+        return []
+    ft_jl, ft_bl, bt_jl, bt_bl = struct.unpack_from("<IIII", data, 12)
+    bt_raw = data[28 + ft_jl + ft_bl: 28 + ft_jl + ft_bl + bt_jl]
+    glb    = data[28 + ft_jl + ft_bl + bt_jl + bt_bl:]
+    if len(glb) < 12 or glb[:4] != b"glTF":
+        return []
+
+    # Batch-table hierarchy → _BATCHID → building type
+    bid_to_type = {}
+    if bt_jl > 0:
+        try:
+            hier = json.loads(bt_raw).get("extensions", {}).get(
+                "3DTILES_batch_table_hierarchy", {})
+            cls_map   = {c["name"]: c for c in hier.get("classes", [])}
+            class_ids = hier.get("classIds", [])
+            parent_ids = hier.get("parentIds", [])
+            bld_inst   = cls_map.get("Building", {}).get("instances", {})
+            bld_types  = bld_inst.get("building", [])
+            bi = 0
+            for i, cid in enumerate(class_ids):
+                if cid == 0:
+                    bid_to_type[i] = bld_types[bi] if bi < len(bld_types) else "yes"
+                    bi += 1
+                elif cid == 2:
+                    p = parent_ids[i] if i < len(parent_ids) else -1
+                    bid_to_type[i] = bid_to_type.get(p, "yes")
+        except Exception:
+            pass
+
+    json_len = struct.unpack_from("<I", glb, 12)[0]
+    gltf     = json.loads(glb[20: 20 + json_len])
+    bin_off  = 20 + json_len
+    if bin_off % 4: bin_off += 4 - (bin_off % 4)
+    bin_data = bytes(glb[bin_off + 8: bin_off + 8 + struct.unpack_from("<I", glb, bin_off)[0]])
+    bvs  = gltf.get("bufferViews", [])
+    accs = gltf.get("accessors",   [])
+
+    node_mat = np.eye(4)
+    for node in gltf.get("nodes", []):
+        if "mesh" in node and "matrix" in node:
+            node_mat = np.array(node["matrix"], dtype=np.float64).reshape(4, 4).T
+            break
+
+    all_ecef = []; all_bids = []; all_faces = []; voff = 0
+    for mesh in gltf.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            attrs   = prim.get("attributes", {})
+            pos_idx = attrs.get("POSITION"); bid_idx = attrs.get("_BATCHID")
+            tri_idx = prim.get("indices")
+            if pos_idx is None: continue
+            nv  = accs[pos_idx]["count"]
+            raw = _read_accessor(accs, bvs, bin_data, pos_idx, np.float32, 3).astype(np.float64)
+            gw  = (node_mat @ np.hstack([raw, np.ones((nv, 1))]).T).T[:, :3]
+            # glTF Y-up → ECEF Z-up
+            all_ecef.append(np.column_stack([gw[:, 0], -gw[:, 2], gw[:, 1]]))
+            bids = (_read_accessor(accs, bvs, bin_data, bid_idx, np.float32, 1)
+                    .flatten().astype(np.int32)
+                    if bid_idx is not None else np.zeros(nv, np.int32))
+            all_bids.append(bids)
+            if tri_idx is not None:
+                fmt = np.uint16 if accs[tri_idx]["componentType"] == 5123 else np.uint32
+                ia  = _read_accessor(accs, bvs, bin_data, tri_idx, fmt, 1).flatten().astype(np.int32)
+                all_faces.append(ia.reshape(-1, 3) + voff)
+            voff += nv
+
+    if not all_ecef:
+        return []
+    verts_ecef = np.vstack(all_ecef)
+    batch_ids  = np.concatenate(all_bids)
+    faces_all  = np.vstack(all_faces) if all_faces else np.empty((0, 3), np.int32)
+
+    lat_d, lon_d, alt_m = ecef_to_geodetic_vec(verts_ecef)
+    x_enu = np.radians(lon_d - CENTER_LON) * R_EARTH * COS_LAT
+    y_enu = np.radians(lat_d - CENTER_LAT) * R_EARTH
+    verts_enu = np.column_stack([x_enu, y_enu, alt_m])
+
+    buildings = []
+    for bid in np.unique(batch_ids):
+        vm = batch_ids == bid; vi = np.where(vm)[0]
+        v_remap = np.full(len(verts_enu), -1, np.int32)
+        v_remap[vi] = np.arange(len(vi), dtype=np.int32)
+        fm = np.all(vm[faces_all], axis=1)
+        if not fm.any(): continue
+        buildings.append({
+            "verts_enu": verts_enu[vi],
+            "faces":     v_remap[faces_all[fm]],
+            "type":      bid_to_type.get(int(bid), "yes"),
+        })
+    return buildings
+
+def fetch_building_tiles():
+    """Return (tile_urls, fresh_access_token). Tile URLs cached locally."""
+    print("[CESIUM] Fetching OSM Buildings endpoint …")
+    tileset_url, access_token, base_url = fetch_ion_endpoint(CESIUM_BUILDINGS_ASSET)
+    if os.path.exists(BUILDING_TILE_LIST):
+        with open(BUILDING_TILE_LIST) as f:
+            tiles = json.load(f)["tiles"]
+        print(f"[CESIUM] Using cached building tile list ({len(tiles)} tiles)")
+        return tiles, access_token
+
+    level = BUILDING_LEVEL
+    nx = 1 << (level + 1); ny = 1 << level
+    margin = RADIUS_M * 1.3
+    d_lat  = margin / 111_320.0
+    d_lon  = margin / (111_320.0 * COS_LAT)
+    x_min = int((CENTER_LON - d_lon + 180) / 360 * nx)
+    x_max = int((CENTER_LON + d_lon + 180) / 360 * nx)
+    # CWT: y=0 at north
+    y_min = int((90 - (CENTER_LAT + d_lat)) / 180 * ny)
+    y_max = int((90 - (CENTER_LAT - d_lat)) / 180 * ny)
+    tiles = [f"{base_url}{level}/{x}/{y}.b3dm"
+             for x in range(x_min, x_max + 1)
+             for y in range(y_min, y_max + 1)]
+    print(f"[CESIUM] Computed {len(tiles)} building tile URLs (level {level})")
+    with open(BUILDING_TILE_LIST, "w") as f:
+        json.dump({"tiles": tiles}, f)
+    return tiles, access_token
+
+def download_tile(url, access_token, cache_dir, cache_key):
+    cache_p = os.path.join(cache_dir, cache_key)
+    if os.path.exists(cache_p):
+        with open(cache_p, "rb") as f: return f.read()
+    r = requests.get(url, params={"access_token": access_token}, timeout=60)
+    if r.status_code == 404: return None
+    r.raise_for_status()
+    with open(cache_p, "wb") as f: f.write(r.content)
+    return r.content
+
+# ── LIGHTS ─────────────────────────────────────────────────────────────────────
+sky = UsdLux.DomeLight.Define(stage, "/World/Lights/Sky")
+sky.CreateIntensityAttr(200)
+sky.CreateColorAttr(Gf.Vec3f(0.52, 0.68, 1.0))
+sun = UsdLux.DistantLight.Define(stage, "/World/Lights/Sun")
+sun.CreateIntensityAttr(2500)
+sun.CreateColorAttr(Gf.Vec3f(1.0, 0.97, 0.87))
+UsdGeom.Xformable(sun).AddRotateXYZOp().Set(Gf.Vec3d(-48.0, 0.0, 35.0))
+
+# Keep auto-exposure but clamp range so bright outdoor scenes don't blow out to white
+import carb.settings
+_rs = carb.settings.get_settings()
+_rs.set("/rtx/post/histogram/enabled",     True)
+_rs.set("/rtx/post/histogram/exposureMin", -4.0)   # EV stops
+_rs.set("/rtx/post/histogram/exposureMax",  0.0)   # never boost above 0 EV
+_rs.set("/rtx/post/tonemap/op",             6)     # ACES filmic
+_rs.set("/rtx/post/tonemap/whitePoint",     1.0)
+
+# ── LOAD CESIUM WORLD TERRAIN ─────────────────────────────────────────────────
+print("[TERRAIN] Loading Cesium World Terrain …")
+terrain_tiles, terrain_token = fetch_terrain_tiles()
+
+# If tile list was cached we need a fresh token
+if terrain_token is None:
+    _, terrain_token, _ = fetch_ion_endpoint(CESIUM_TERRAIN_ASSET)
+
+n_terrain_tiles = 0
+centre_elev     = 0.0   # elevation at scene origin, used for camera height
+
+for tile_info in terrain_tiles:
+    bounds = tile_info["bounds"]   # [west, south, east, north]
+    data   = download_terrain_tile(tile_info, terrain_token)
+    if data is None:
+        continue
+
+    result = parse_quantized_mesh(data, *bounds)
+    if result is None:
+        continue
+    verts_enu, faces, lons, lats = result
+
+    # Record elevation at scene origin (closest vertex to centre)
+    if n_terrain_tiles == 0:
+        dists = np.hypot(verts_enu[:, 0], verts_enu[:, 1])
+        centre_elev = float(verts_enu[dists.argmin(), 2])
+
+    prim_path = upath(f"/World/Terrain/T{n_terrain_tiles:04d}")
+    make_terrain_mesh(prim_path, verts_enu, faces, lons, lats, sat_path)
+    n_terrain_tiles += 1
+
+print(f"[TERRAIN] Loaded {n_terrain_tiles} terrain tiles")
+
+# ── LOAD CESIUM OSM BUILDINGS ─────────────────────────────────────────────────
+print("[CESIUM] Loading Cesium OSM Buildings …")
+building_tiles, bld_token = fetch_building_tiles()
+
+n_bld = 0
+for tile_url in building_tiles:
+    parts    = tile_url.split("?")[0].split("/")
+    cache_key = "_".join(parts[-3:])
+    data      = download_tile(tile_url, bld_token, BUILDING_TILE_DIR, cache_key)
+    if data is None:
+        continue
+
+    for bld in parse_b3dm_buildings(data):
+        verts = bld["verts_enu"]
+        faces = bld["faces"]
+        cx    = float(verts[:, 0].mean())
+        cy    = float(verts[:, 1].mean())
+        if math.hypot(cx, cy) > RADIUS_M * 1.5:
+            continue
+
+        # Ground building on terrain elevation at its centroid.
+        # Terrain elevation ≈ the ellipsoidal altitude of the lowest terrain vertex
+        # near the building; we approximate it with the building's own minimum z
+        # adjusted for geoid undulation via the closest terrain vertex lookup.
+        # Simpler: use the minimum vertex z as the ellipsoidal ground and offset
+        # so the floor sits at ≈ centre_elev (works for flat Chiayi plain).
+        terrain_est = centre_elev   # flat-plain approximation
+        z_off = terrain_est - float(verts[:, 2].min())
+        verts = verts.copy(); verts[:, 2] += z_off
+        bld_h = float(verts[:, 2].max() - terrain_est)
+        if bld_h < 0.5: continue
+
+        mat = bld_mat(bld["type"])
+        prim_path = upath(f"/World/Buildings/B{n_bld:05d}")
+        pts      = Vt.Vec3fArray([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
+        flat_idx = [int(i) for f in faces for i in f]
+        mesh = UsdGeom.Mesh.Define(stage, prim_path)
+        mesh.CreatePointsAttr(pts)
+        mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+        mesh.CreateFaceVertexIndicesAttr(flat_idx)
+        mesh.CreateSubdivisionSchemeAttr("none")
+        bind(mesh.GetPrim(), mat)
+        UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+        n_bld += 1
+
+print(f"[CESIUM] Loaded {n_bld} buildings")
+
+# ── VIEWPORT CAMERA ────────────────────────────────────────────────────────────
+cam = UsdGeom.Camera.Define(stage, "/World/Camera")
+cam.CreateFocalLengthAttr(28.0)
+cxf = UsdGeom.Xformable(cam)
+cam_z = centre_elev + 800.0
+cxf.AddTranslateOp().Set(Gf.Vec3d(0.0, -600.0, cam_z))
+cxf.AddRotateXYZOp().Set(Gf.Vec3d(-48.0, 0.0, 0.0))
+try:
+    from omni.kit.viewport.utility import get_active_viewport
+    get_active_viewport().camera_path = "/World/Camera"
+except Exception:
+    pass
+
+# Write geo metadata
+stage.SetMetadata("customLayerData", {
+    "geo:centerLat":   CENTER_LAT,   "geo:centerLon":   CENTER_LON,
+    "geo:radiusM":     RADIUS_M,     "geo:metersPerUnit": 1.0,
+    "geo:upAxis":      "Z",          "geo:xIsEast":     True,
+    "geo:yIsNorth":    True,
+    "geo:source":      "Cesium ion (terrain=asset 1, buildings=asset 96188)",
+})
+with open(os.path.join(HERE, "geo_metadata.json"), "w") as f:
+    json.dump({
+        "center": {"lat": CENTER_LAT, "lon": CENTER_LON},
+        "radius_m": RADIUS_M,
+        "data_sources": {
+            "terrain":   "Cesium World Terrain (asset 1) quantized-mesh-1.0",
+            "imagery":   "Taiwan NLSC PHOTO2 orthophoto zoom-18",
+            "buildings": "Cesium OSM Buildings (asset 96188) 3D Tiles B3DM",
+        },
+    }, f, indent=2)
+
+# ── SIMULATION LOOP ────────────────────────────────────────────────────────────
+print(f"[SCENE] {n_terrain_tiles} terrain tiles | {n_bld} Cesium buildings")
+print(f"[GEO] Camera: lat={to_latlon(0,-600)[0]:.4f}°N  lon={CENTER_LON:.4f}°E  alt={cam_z:.1f} m")
+print("[CESIUM] © Cesium ion | © OpenStreetMap contributors | © 內政部國土測繪中心 (NLSC)")
+print("[SCENE] Running — close the window to exit")
+
+simulation_app.update()
+while simulation_app.is_running():
+    simulation_app.update()
+simulation_app.close()

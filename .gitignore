@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# Simulator caches (large binary/tile data — re-downloadable)
+simulator/cesium_tile_cache/
+simulator/cesium_terrain_cache/
+simulator/cesium_tile_list.json
+simulator/cesium_terrain_list.json
+simulator/elevation_cache.json
+simulator/osm_cache.json
+simulator/satellite_ground.jpg
+
+# Isaac Sim generated files
+simulator/geo_metadata.json
+simulator/*.log
+simulator/__pycache__/
+
+# Model weights (large files — store in DVC or separate release)
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.weights
+**/*.engine
+
+# Dataset files
+**/*.bag
+**/dataset/
+**/data/
+
+# ArduPilot SITL logs
+control/logs/
+control/*.tlog
+control/*.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / credentials
+*.env
+.env*
+*token*
+*secret*
+*credential*
