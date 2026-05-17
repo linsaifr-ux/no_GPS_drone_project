@@ -12,7 +12,8 @@ Build a drone system that can localize itself and detect objects without GPS, us
 no_GPS_drone_project/
 ├── instructions/         # This folder — plans, notes, references
 ├── simulator/            # Isaac Sim environment (Chiayi, Taiwan)
-│   ├── cesium_scene.py   # Main scene: Cesium terrain + OSM buildings + NLSC imagery
+│   ├── cesium_scene.py   # Main scene: terrain + buildings + drone + nadir camera
+│   ├── drone_frames/     # Live output: latest.jpg + latest_meta.json (per step)
 │   └── run_chiayi.sh     # Launch script
 ├── localization/         # AnyLoc — GPS-denied place recognition (TODO)
 ├── detection/            # YOLO — object detection (TODO)
@@ -26,14 +27,26 @@ no_GPS_drone_project/
 
 ### 1. Simulator (`simulator/`)
 
-**Status:** Working
+**Status:** Working — drone + camera added
 
 Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
 - **Imagery:** Taiwan NLSC aerial orthophoto WMTS (PHOTO2, zoom 18, resized to 4096×4096)
 - **Buildings:** Cesium OSM Buildings (asset 96188) — 83 buildings from 4 B3DM tiles
+- **Drone:** `/World/Drone` Xform — starts at scene centre, 50 m AGL; keyboard-controlled
+- **Camera:** `/World/Drone/Camera` — nadir, 640×480, 84°×65° FOV (24 mm, 36×27 mm aperture)
+- **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` written every 5 sim steps via `omni.replicator.core`
 - **Environment:** conda env `isaac_sim_test`, Python 3.12, RTX 2080 Ti
+
+Keyboard controls (window must be focused):
+
+| Key | Action |
+|-----|--------|
+| W / S | Fly north / south (5 m/step) |
+| A / D | Fly west / east |
+| Q / E | Descend / ascend |
+| Z / X | Yaw left / right (1°/step) |
 
 Run:
 ```bash
@@ -42,14 +55,14 @@ cd simulator
 ```
 
 Next steps:
-- Attach a virtual camera prim to the drone agent
-- Publish rendered frames to a ROS2 topic or shared memory for localization and detection
+- Wire `drone_frames/latest.jpg` into AnyLoc and YOLO modules
+- Upgrade frame transport to shared memory when latency matters
 
 ---
 
 ### 2. Localization (`localization/`)
 
-**Status:** TODO
+**Status:** TODO (frame source ready — reads `simulator/drone_frames/latest.jpg`)
 
 Use **AnyLoc** (universal visual place recognition) to estimate the drone's position from camera images without GPS.
 
@@ -59,6 +72,8 @@ Plan:
 3. Refine the estimate using visual odometry between consecutive frames
 4. Output: estimated (lat, lon, altitude) or ENU (x, y, z) position
 
+Frame interface: poll `simulator/drone_frames/latest.jpg` + parse `latest_meta.json` for ground-truth position (used to build the map database and evaluate localization error).
+
 Key references:
 - AnyLoc paper: "AnyLoc: Towards Universal Visual Place Recognition" (IRAL 2024)
 - AnyLoc repo: https://github.com/AnyLoc/AnyLoc
@@ -67,7 +82,7 @@ Key references:
 
 ### 3. Object Detection (`detection/`)
 
-**Status:** TODO
+**Status:** TODO (frame source ready — reads `simulator/drone_frames/latest.jpg`)
 
 Use **YOLOv8** (or YOLOv11) to detect objects of interest from the drone's camera.
 
@@ -76,6 +91,8 @@ Plan:
 2. Run inference on rendered Isaac Sim frames during simulation
 3. Output: bounding boxes + class labels + confidence scores
 4. Pass detections to the control module to trigger flight manoeuvres
+
+Frame interface: same as localization — poll `simulator/drone_frames/latest.jpg`.
 
 ---
 
@@ -126,8 +143,10 @@ AnyLoc               YOLO
 
 | # | Milestone | Status |
 |---|-----------|--------|
+| # | Milestone | Status |
+|---|-----------|--------|
 | 1 | Isaac Sim scene running with Cesium terrain + NLSC imagery | Done |
-| 2 | Virtual drone camera publishing frames in simulation | TODO |
+| 2 | Virtual drone + nadir camera publishing frames in simulation | Done |
 | 3 | AnyLoc database built from simulated views | TODO |
 | 4 | AnyLoc localization working on simulated frames | TODO |
 | 5 | YOLO detection working on simulated frames | TODO |

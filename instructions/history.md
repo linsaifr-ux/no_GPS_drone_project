@@ -72,12 +72,44 @@ no_GPS_drone_project/
 
 ---
 
-## Next session — Milestone 2
+---
 
-Attach a virtual camera prim to a drone agent in Isaac Sim and publish rendered frames so AnyLoc and YOLO can consume them.
+## 2026-05-17 — Drone + nadir camera added (Milestone 2)
+
+### What was done
+
+Added a controllable drone with a downward-looking camera to `simulator/cesium_scene.py`.
+
+**USD prims created:**
+- `/World/Drone` — `Xform` with TranslateOp + RotateZOp (yaw); starts at `centre_elev + 50 m`
+- `/World/Drone/Body` — flat `Cube` (0.4 × 0.4 × 0.1 m), dark-grey material
+- `/World/Drone/Camera` — `Camera` prim, 24 mm focal length, 36×27 mm aperture → 84°×65° FOV, clipping 0.1–5000 m
+
+**Nadir orientation:** In a Z-up stage, the default USD camera looks along its local −Z = world −Z (straight down). No rotation op is needed; yawing the parent `Xform` rotates the image around the nadir axis.
+
+**Frame output (omni.replicator.core):**
+- `rep.create.render_product("/World/Drone/Camera", (640, 480))`
+- RGB annotator captures RGBA → strips alpha → saves as JPEG
+- `simulator/drone_frames/latest.jpg` — overwritten every 5 sim steps
+- `simulator/drone_frames/latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
+
+**Keyboard drone control (carb.input):**
+- W/S = move north/south (Y axis, +5 m/step)
+- A/D = move west/east (X axis)
+- Q/E = descend/ascend (Z axis)
+- Z/X = yaw left/right (1°/step)
+
+**New constants added:**
+- `DRONE_FRAME_DIR`, `DRONE_CAM_W/H = 640/480`, `DRONE_SAVE_EVERY = 5`, `DRONE_SPEED_M = 5.0`
+
+---
+
+## Next session — Milestone 3
+
+Wire the drone camera frames into AnyLoc (localization) and YOLO (object detection).
 
 Tasks:
-- Add a `Camera` prim to the scene in `cesium_scene.py`
-- Mount it on a movable `Xform` prim (the "drone")
-- Render frames to a numpy array or ROS2 topic each simulation step
-- Verify frame output matches expected resolution and FOV
+- Set up AnyLoc in `localization/` to read `drone_frames/latest.jpg` and return a geo estimate
+- Set up YOLO in `detection/` to read the same frame and return bounding boxes
+- Define shared frame interface (file-based now, upgrade to shared memory later)
+- Test end-to-end: fly drone over buildings, verify detections appear

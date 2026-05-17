@@ -26,7 +26,11 @@ CENTER_LON = 120.286135
 RADIUS_M   = 2000.0
 R_EARTH    = 6_371_000.0
 COS_LAT    = math.cos(math.radians(CENTER_LAT))
-HERE       = os.path.dirname(os.path.abspath(__file__))
+HERE             = os.path.dirname(os.path.abspath(__file__))
+DRONE_FRAME_DIR  = os.path.join(HERE, "drone_frames")
+DRONE_CAM_W, DRONE_CAM_H = 640, 480
+DRONE_SAVE_EVERY = 5    # capture a frame every N sim steps
+DRONE_SPEED_M    = 5.0  # keyboard move step (m)
 
 # WGS-84
 _A  = 6_378_137.0
@@ -76,6 +80,8 @@ simulation_app = SimulationApp({
 
 import omni.usd
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
+import carb.input as _ci
+import omni.replicator.core as rep
 
 stage = omni.usd.get_context().get_stage()
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -687,6 +693,47 @@ try:
 except Exception:
     pass
 
+# ── DRONE + DRONE CAMERA ───────────────────────────────────────────────────────
+os.makedirs(DRONE_FRAME_DIR, exist_ok=True)
+
+# Root Xform — starts 50 m AGL at scene centre
+drone_root   = UsdGeom.Xform.Define(stage, "/World/Drone")
+drone_pos_op = drone_root.AddTranslateOp()
+drone_yaw_op = drone_root.AddRotateZOp()          # yaw about world-up (Z)
+drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev + 50.0))
+drone_yaw_op.Set(0.0)
+
+# Body — flat dark-grey box (visual only)
+body = UsdGeom.Cube.Define(stage, "/World/Drone/Body")
+body.CreateSizeAttr(1.0)
+UsdGeom.Xformable(body).AddScaleOp().Set(Gf.Vec3f(0.4, 0.4, 0.1))
+bind(body.GetPrim(), pbr_mat("/Mat/DroneMat", (0.15, 0.15, 0.15), roughness=0.5))
+
+# Nadir camera — in a Z-up stage, default USD camera orientation looks along
+# its local -Z, which equals world -Z (straight down). No rotation needed.
+# 24 mm / 36×27 mm aperture → 84°×65° FOV, 640×480 output.
+drone_cam = UsdGeom.Camera.Define(stage, "/World/Drone/Camera")
+drone_cam.CreateFocalLengthAttr(24.0)
+drone_cam.CreateHorizontalApertureAttr(36.0)
+drone_cam.CreateVerticalApertureAttr(27.0)        # 4:3 matches 640×480
+drone_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 5000.0))
+UsdGeom.Xformable(drone_cam).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.15))
+
+# Replicator render product for the drone camera
+_rp  = rep.create.render_product("/World/Drone/Camera", (DRONE_CAM_W, DRONE_CAM_H))
+_rgb = rep.AnnotatorRegistry.get_annotator("rgb")
+_rgb.attach([_rp])
+
+# Keyboard interface
+_il = _ci.acquire_input_interface()
+_kb = _il.get_keyboard()
+
+def _key(name):
+    return _il.get_keyboard_value(_kb, getattr(_ci.KeyboardInput, name)) > 0.5
+
+print(f"[DRONE] Nadir camera {DRONE_CAM_W}×{DRONE_CAM_H}  →  {DRONE_FRAME_DIR}/")
+print("[DRONE] Keys: W/S=N/S  A/D=W/E  Q/E=up/down  Z/X=yaw")
+
 # Write geo metadata
 stage.SetMetadata("customLayerData", {
     "geo:centerLat":   CENTER_LAT,   "geo:centerLon":   CENTER_LON,
@@ -713,6 +760,47 @@ print("[CESIUM] © Cesium ion | © OpenStreetMap contributors | © 內政部國�
 print("[SCENE] Running — close the window to exit")
 
 simulation_app.update()
+_step = 0
 while simulation_app.is_running():
     simulation_app.update()
+    _step += 1
+
+    # ── Keyboard drone control ────────────────────────────────────────────────
+    pos = drone_pos_op.Get()
+    dx = dy = dz = 0.0
+    if _key("W"): dy += DRONE_SPEED_M
+    if _key("S"): dy -= DRONE_SPEED_M
+    if _key("D"): dx += DRONE_SPEED_M
+    if _key("A"): dx -= DRONE_SPEED_M
+    if _key("E"): dz += DRONE_SPEED_M
+    if _key("Q"): dz -= DRONE_SPEED_M
+    if dx or dy or dz:
+        drone_pos_op.Set(Gf.Vec3d(pos[0] + dx, pos[1] + dy, pos[2] + dz))
+
+    yaw = float(drone_yaw_op.Get())
+    if _key("Z"): drone_yaw_op.Set(yaw + 1.0)
+    if _key("X"): drone_yaw_op.Set(yaw - 1.0)
+
+    # ── Frame capture ─────────────────────────────────────────────────────────
+    if _step % DRONE_SAVE_EVERY == 0:
+        raw = _rgb.get_data()
+        if raw is not None:
+            arr = raw if isinstance(raw, np.ndarray) else raw.get("data")
+            if arr is not None and arr.size > 0:
+                rgb_arr = arr[:, :, :3].astype(np.uint8)
+                Image.fromarray(rgb_arr, "RGB").save(
+                    os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
+                p = drone_pos_op.Get()
+                lat, lon = to_latlon(float(p[0]), float(p[1]))
+                with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
+                    json.dump({
+                        "step":     _step,
+                        "lat":      lat,
+                        "lon":      lon,
+                        "alt_m":    float(p[2]),
+                        "yaw_deg":  float(drone_yaw_op.Get()),
+                        "frame_w":  DRONE_CAM_W,
+                        "frame_h":  DRONE_CAM_H,
+                    }, f)
+
 simulation_app.close()
