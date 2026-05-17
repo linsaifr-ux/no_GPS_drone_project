@@ -26,6 +26,12 @@ simulator/geo_metadata.json
 simulator/*.log
 simulator/__pycache__/
 
+# Drone camera live output (transient — overwritten every 5 sim steps)
+simulator/drone_frames/
+
+# Claude Code local settings
+**/.claude/
+
 # Model weights (large files — store in DVC or separate release)
 **/*.pt
 **/*.pth

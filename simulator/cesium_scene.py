@@ -884,10 +884,15 @@ while simulation_app.is_running():
 
     # ── Frame capture ─────────────────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:
+        rep.orchestrator.step(rt_subframes=1, delta_time=0.0)
         raw = _rgb.get_data()
-        if raw is not None:
+        if raw is None:
+            print(f"[DRONE] step {_step}: get_data() returned None — frame skipped")
+        else:
             arr = raw if isinstance(raw, np.ndarray) else raw.get("data")
-            if arr is not None and arr.size > 0:
+            if arr is None or arr.size == 0:
+                print(f"[DRONE] step {_step}: empty frame — skipped")
+            else:
                 rgb_arr = arr[:, :, :3].astype(np.uint8)
                 Image.fromarray(rgb_arr, "RGB").save(
                     os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
@@ -901,5 +906,7 @@ while simulation_app.is_running():
                         "frame_w": DRONE_CAM_W,
                         "frame_h": DRONE_CAM_H,
                     }, f)
+                if _step == DRONE_SAVE_EVERY:
+                    print(f"[DRONE] Frame capture working — saving to {DRONE_FRAME_DIR}/")
 
 simulation_app.close()

@@ -122,6 +122,21 @@ Added a controllable quadcopter drone with nadir camera, viewport HUD, and camer
 
 ---
 
+---
+
+## 2026-05-18 — Frame capture fix
+
+### Bug fixed
+
+**`_rgb.get_data()` silently returning `None` — no frames saved**
+- Cause: `omni.replicator.core` does not render into the render product automatically during a manual `simulation_app.update()` loop. Without an explicit replicator step, `get_data()` always returns `None` and the save block was silently skipped.
+- Fix: call `rep.orchestrator.step(rt_subframes=1, delta_time=0.0)` immediately before `get_data()` each capture cycle. This forces the RTX renderer to produce one frame into the render product.
+- Added explicit `print` warnings when `get_data()` returns `None` or an empty array, so silent failures are visible in the terminal.
+- Added a one-time confirmation message (`[DRONE] Frame capture working`) on the first successful save.
+- File: `simulator/cesium_scene.py` → frame capture block in simulation loop
+
+---
+
 ## Next session — Milestone 3
 
 Wire the drone camera frames into AnyLoc (localization) and YOLO (object detection).
