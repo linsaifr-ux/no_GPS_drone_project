@@ -34,8 +34,9 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
 - **Imagery:** Taiwan NLSC aerial orthophoto WMTS (PHOTO2, zoom 18, resized to 4096×4096)
 - **Buildings:** Cesium OSM Buildings (asset 96188) — 83 buildings from 4 B3DM tiles
-- **Drone:** `/World/Drone` Xform — starts at scene centre, 50 m AGL; keyboard-controlled
-- **Camera:** `/World/Drone/Camera` — nadir, 640×480, 84°×65° FOV (24 mm, 36×27 mm aperture)
+- **Drone:** `/World/Drone` Xform — starts at scene centre, 50 m AGL; keyboard-controlled; quadcopter model (body + 4 arms + motor pods + propeller discs, ~0.8 m span); orange beacon light for visibility from overview
+- **Camera:** `/World/Drone/Camera` — nadir, 18 mm / 36×27 mm aperture, **90°×73.7° FOV**, 640×480 render product; viewport (Tab) renders at 1920×1080 from same camera — intentionally separate from ML output
+- **HUD:** `omni.ui` overlay (top-left) showing live LAT / LON / ALT MSL / AGL / active camera
 - **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` written every 5 sim steps via `omni.replicator.core`
 - **Environment:** conda env `isaac_sim_test`, Python 3.12, RTX 2080 Ti
 
@@ -43,6 +44,7 @@ Keyboard controls (window must be focused):
 
 | Key | Action |
 |-----|--------|
+| Tab | Toggle viewport: overview ↔ drone nadir view |
 | W / S | Fly north / south (5 m/step) |
 | A / D | Fly west / east |
 | Q / E | Descend / ascend |
@@ -143,10 +145,8 @@ AnyLoc               YOLO
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| # | Milestone | Status |
-|---|-----------|--------|
 | 1 | Isaac Sim scene running with Cesium terrain + NLSC imagery | Done |
-| 2 | Virtual drone + nadir camera publishing frames in simulation | Done |
+| 2 | Quadcopter drone + nadir camera + HUD publishing frames | Done |
 | 3 | AnyLoc database built from simulated views | TODO |
 | 4 | AnyLoc localization working on simulated frames | TODO |
 | 5 | YOLO detection working on simulated frames | TODO |

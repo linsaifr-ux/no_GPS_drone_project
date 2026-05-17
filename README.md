@@ -82,23 +82,38 @@ cd simulator
 
 On first run, tiles are downloaded from Cesium ion and Taiwan NLSC and cached locally. Subsequent runs start immediately from cache.
 
+### HUD
+
+A semi-transparent overlay in the top-left corner of the viewport shows the drone's live position:
+
+```
+  LAT  23.45087°N    LON  120.28614°E
+  ALT  96.3 m MSL    AGL  50.0 m
+  CAM  Overview
+```
+
 ### Drone keyboard controls (simulator window must be focused)
 
 | Key | Action |
 |-----|--------|
+| Tab | Toggle viewport: overview ↔ drone nadir (90°×73.7° FOV) |
 | W / S | Fly north / south (5 m/step) |
 | A / D | Fly west / east |
 | Q / E | Descend / ascend |
 | Z / X | Yaw left / right (1°/step) |
 
+### Drone model
+
+Quadcopter (~0.8 m span): central body, 4 arms at 45° intervals, motor pods and propeller discs at arm tips. An orange beacon light (`SphereLight`, 5000 cd) makes the drone findable from the overview camera.
+
 ### Frame output
 
-Each simulation step (every 5 updates) the drone camera writes:
+Every 5 sim steps the drone camera writes to `simulator/drone_frames/`:
 
-- `simulator/drone_frames/latest.jpg` — 640×480 RGB nadir view
-- `simulator/drone_frames/latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
+- `latest.jpg` — 640×480 RGB nadir view (ML input for AnyLoc and YOLO)
+- `latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
 
-Localization and detection modules consume these files.
+The Tab viewport renders the same camera at 1920×1080 for visual inspection — intentionally a different resolution from the ML output.
 
 ---
 

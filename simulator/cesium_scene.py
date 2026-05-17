@@ -703,17 +703,60 @@ drone_yaw_op = drone_root.AddRotateZOp()          # yaw about world-up (Z)
 drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev + 50.0))
 drone_yaw_op.Set(0.0)
 
-# Body — flat dark-grey box (visual only)
-body = UsdGeom.Cube.Define(stage, "/World/Drone/Body")
-body.CreateSizeAttr(1.0)
-UsdGeom.Xformable(body).AddScaleOp().Set(Gf.Vec3f(0.4, 0.4, 0.1))
-bind(body.GetPrim(), pbr_mat("/Mat/DroneMat", (0.15, 0.15, 0.15), roughness=0.5))
+# Quadcopter: central body + 4 arms + motor pods + propeller discs
+# Overall span ≈ 0.8 m (realistic DJI Phantom class)
+_drone_dark = pbr_mat("/Mat/DroneMat",  (0.12, 0.12, 0.12), roughness=0.5)
+_drone_prop = pbr_mat("/Mat/DroneProp", (0.25, 0.25, 0.28), roughness=0.3)
+
+_qbody = UsdGeom.Cube.Define(stage, "/World/Drone/Body")
+_qbody.CreateSizeAttr(1.0)
+UsdGeom.Xformable(_qbody).AddScaleOp().Set(Gf.Vec3f(0.28, 0.28, 0.08))
+bind(_qbody.GetPrim(), _drone_dark)
+
+_ARM_CR = 0.275   # arm-box centre distance from drone origin (m)
+_ARM_TR = 0.40    # motor-pod centre distance from drone origin (m)
+for _an, _ad in [("NE", 45), ("NW", 135), ("SW", 225), ("SE", 315)]:
+    _r = math.radians(_ad)
+    _cx, _cy = _ARM_CR * math.cos(_r), _ARM_CR * math.sin(_r)
+    _mx, _my = _ARM_TR * math.cos(_r), _ARM_TR * math.sin(_r)
+
+    # Arm — unit cube: scale first, rotate to direction, translate to position
+    _arm = UsdGeom.Cube.Define(stage, f"/World/Drone/Arm_{_an}")
+    _arm.CreateSizeAttr(1.0)
+    _axf = UsdGeom.Xformable(_arm)
+    _axf.AddTranslateOp().Set(Gf.Vec3d(_cx, _cy, 0.0))
+    _axf.AddRotateZOp().Set(float(_ad))
+    _axf.AddScaleOp().Set(Gf.Vec3f(0.25, 0.05, 0.03))
+    bind(_arm.GetPrim(), _drone_dark)
+
+    # Motor pod (upright cylinder)
+    _mot = UsdGeom.Cylinder.Define(stage, f"/World/Drone/Motor_{_an}")
+    _mot.CreateRadiusAttr(0.035)
+    _mot.CreateHeightAttr(0.05)
+    _mot.CreateAxisAttr("Z")
+    UsdGeom.Xformable(_mot).AddTranslateOp().Set(Gf.Vec3d(_mx, _my, 0.0))
+    bind(_mot.GetPrim(), _drone_dark)
+
+    # Propeller disc (flat cylinder above motor)
+    _prop = UsdGeom.Cylinder.Define(stage, f"/World/Drone/Prop_{_an}")
+    _prop.CreateRadiusAttr(0.13)
+    _prop.CreateHeightAttr(0.008)
+    _prop.CreateAxisAttr("Z")
+    UsdGeom.Xformable(_prop).AddTranslateOp().Set(Gf.Vec3d(_mx, _my, 0.03))
+    bind(_prop.GetPrim(), _drone_prop)
+
+# Orange beacon light — renders as a coloured dot from the overview camera
+_beacon = UsdLux.SphereLight.Define(stage, "/World/Drone/Beacon")
+_beacon.CreateIntensityAttr(5000.0)
+_beacon.CreateRadiusAttr(0.05)
+_beacon.CreateColorAttr(Gf.Vec3f(1.0, 0.4, 0.0))
+UsdGeom.Xformable(_beacon).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.15))
 
 # Nadir camera — in a Z-up stage, default USD camera orientation looks along
 # its local -Z, which equals world -Z (straight down). No rotation needed.
-# 24 mm / 36×27 mm aperture → 84°×65° FOV, 640×480 output.
+# 18 mm focal length / 36×27 mm aperture → 90°×73.7° FOV, 640×480 output.
 drone_cam = UsdGeom.Camera.Define(stage, "/World/Drone/Camera")
-drone_cam.CreateFocalLengthAttr(24.0)
+drone_cam.CreateFocalLengthAttr(18.0)             # 18 mm → 90° HFOV, 73.7° VFOV
 drone_cam.CreateHorizontalApertureAttr(36.0)
 drone_cam.CreateVerticalApertureAttr(27.0)        # 4:3 matches 640×480
 drone_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 5000.0))
@@ -724,9 +767,10 @@ _rp  = rep.create.render_product("/World/Drone/Camera", (DRONE_CAM_W, DRONE_CAM_
 _rgb = rep.AnnotatorRegistry.get_annotator("rgb")
 _rgb.attach([_rp])
 
-# Keyboard interface
+# Keyboard interface — keyboard device lives on the app window, not IInput
+import omni.appwindow as _aw
 _il = _ci.acquire_input_interface()
-_kb = _il.get_keyboard()
+_kb = _aw.get_default_app_window().get_keyboard()
 
 def _key(name):
     return _il.get_keyboard_value(_kb, getattr(_ci.KeyboardInput, name)) > 0.5
@@ -754,16 +798,61 @@ with open(os.path.join(HERE, "geo_metadata.json"), "w") as f:
     }, f, indent=2)
 
 # ── SIMULATION LOOP ────────────────────────────────────────────────────────────
+try:
+    from omni.kit.viewport.utility import get_active_viewport
+    _vp = get_active_viewport()
+except Exception:
+    _vp = None
+
+_OVERVIEW_CAM = "/World/Camera"
+_DRONE_CAM    = "/World/Drone/Camera"
+_drone_view   = False
+_tab_was_down = False
+
+# ── HUD overlay (omni.ui window pinned to top-left corner) ────────────────────
+try:
+    import omni.ui as ui
+    _hud = ui.Window(
+        "DroneHUD", width=400, height=78,
+        flags=(ui.WINDOW_FLAGS_NO_TITLE_BAR       |
+               ui.WINDOW_FLAGS_NO_RESIZE           |
+               ui.WINDOW_FLAGS_NO_SCROLLBAR        |
+               ui.WINDOW_FLAGS_NO_FOCUS_ON_APPEARING),
+    )
+    _hud.position_x = 10
+    _hud.position_y = 10
+    _LS = {"color": 0xFFFFFFFF, "font_size": 15}   # white text
+    with _hud.frame:
+        with ui.ZStack():
+            ui.Rectangle(style={"background_color": 0xCC000000, "border_radius": 4})
+            with ui.VStack(spacing=1):
+                ui.Spacer(height=5)
+                _lbl_latlon = ui.Label("  LAT --         LON --",  style=_LS)
+                _lbl_alt    = ui.Label("  ALT -- m MSL   AGL -- m", style=_LS)
+                _lbl_cam    = ui.Label("  CAM  Overview",           style=_LS)
+    _hud_ok = True
+except Exception as _e:
+    print(f"[HUD] omni.ui unavailable: {_e}")
+    _hud_ok = False
+
 print(f"[SCENE] {n_terrain_tiles} terrain tiles | {n_bld} Cesium buildings")
 print(f"[GEO] Camera: lat={to_latlon(0,-600)[0]:.4f}°N  lon={CENTER_LON:.4f}°E  alt={cam_z:.1f} m")
 print("[CESIUM] © Cesium ion | © OpenStreetMap contributors | © 內政部國土測繪中心 (NLSC)")
-print("[SCENE] Running — close the window to exit")
+print("[SCENE] Running — close the window to exit  |  TAB = toggle camera view")
 
 simulation_app.update()
 _step = 0
 while simulation_app.is_running():
     simulation_app.update()
     _step += 1
+
+    # ── Tab: toggle viewport camera ───────────────────────────────────────────
+    tab_down = _key("TAB")
+    if tab_down and not _tab_was_down and _vp is not None:
+        _drone_view = not _drone_view
+        _vp.camera_path = _DRONE_CAM if _drone_view else _OVERVIEW_CAM
+        print(f"[CAM] {'Drone (nadir)' if _drone_view else 'Overview'}")
+    _tab_was_down = tab_down
 
     # ── Keyboard drone control ────────────────────────────────────────────────
     pos = drone_pos_op.Get()
@@ -781,6 +870,18 @@ while simulation_app.is_running():
     if _key("Z"): drone_yaw_op.Set(yaw + 1.0)
     if _key("X"): drone_yaw_op.Set(yaw - 1.0)
 
+    # ── Current drone geo position (shared by HUD + frame capture) ───────────
+    _p   = drone_pos_op.Get()
+    _lat, _lon = to_latlon(float(_p[0]), float(_p[1]))
+    _alt = float(_p[2])
+    _agl = _alt - centre_elev
+
+    # ── HUD update ────────────────────────────────────────────────────────────
+    if _hud_ok:
+        _lbl_latlon.text = f"  LAT  {_lat:.5f}°N    LON  {_lon:.5f}°E"
+        _lbl_alt.text    = f"  ALT  {_alt:.1f} m MSL    AGL  {_agl:.1f} m"
+        _lbl_cam.text    = f"  CAM  {'Drone (nadir)' if _drone_view else 'Overview'}"
+
     # ── Frame capture ─────────────────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:
         raw = _rgb.get_data()
@@ -790,17 +891,15 @@ while simulation_app.is_running():
                 rgb_arr = arr[:, :, :3].astype(np.uint8)
                 Image.fromarray(rgb_arr, "RGB").save(
                     os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
-                p = drone_pos_op.Get()
-                lat, lon = to_latlon(float(p[0]), float(p[1]))
                 with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
                     json.dump({
-                        "step":     _step,
-                        "lat":      lat,
-                        "lon":      lon,
-                        "alt_m":    float(p[2]),
-                        "yaw_deg":  float(drone_yaw_op.Get()),
-                        "frame_w":  DRONE_CAM_W,
-                        "frame_h":  DRONE_CAM_H,
+                        "step":    _step,
+                        "lat":     _lat,
+                        "lon":     _lon,
+                        "alt_m":   _alt,
+                        "yaw_deg": yaw,
+                        "frame_w": DRONE_CAM_W,
+                        "frame_h": DRONE_CAM_H,
                     }, f)
 
 simulation_app.close()

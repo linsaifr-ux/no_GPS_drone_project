@@ -74,33 +74,51 @@ no_GPS_drone_project/
 
 ---
 
-## 2026-05-17 — Drone + nadir camera added (Milestone 2)
+## 2026-05-17 — Drone + camera + HUD (Milestone 2)
 
 ### What was done
 
-Added a controllable drone with a downward-looking camera to `simulator/cesium_scene.py`.
+Added a controllable quadcopter drone with nadir camera, viewport HUD, and camera toggle to `simulator/cesium_scene.py`.
 
-**USD prims created:**
-- `/World/Drone` — `Xform` with TranslateOp + RotateZOp (yaw); starts at `centre_elev + 50 m`
-- `/World/Drone/Body` — flat `Cube` (0.4 × 0.4 × 0.1 m), dark-grey material
-- `/World/Drone/Camera` — `Camera` prim, 24 mm focal length, 36×27 mm aperture → 84°×65° FOV, clipping 0.1–5000 m
+**USD prims — quadcopter model (~0.8 m span):**
+- `/World/Drone` — `Xform` with `TranslateOp` + `RotateZOp` (yaw); starts at `centre_elev + 50 m`
+- `/World/Drone/Body` — flat `Cube` (0.28 × 0.28 × 0.08 m), dark-grey
+- `/World/Drone/Arm_NE/NW/SW/SE` — thin `Cube` arms at 45°/135°/225°/315°, dark-grey
+- `/World/Drone/Motor_NE/…` — upright `Cylinder` pods at arm tips (r=0.035 m)
+- `/World/Drone/Prop_NE/…` — flat `Cylinder` propeller discs above each motor (r=0.13 m)
+- `/World/Drone/Beacon` — `SphereLight` (orange, 5000 cd) — visible as a coloured dot from the overview camera
+- `/World/Drone/Camera` — `Camera` prim, 18 mm focal length, 36×27 mm aperture → **90°×73.7° FOV**, 640×480, clipping 0.1–5000 m
 
-**Nadir orientation:** In a Z-up stage, the default USD camera looks along its local −Z = world −Z (straight down). No rotation op is needed; yawing the parent `Xform` rotates the image around the nadir axis.
+**Nadir orientation:** In a Z-up stage, default USD camera looks along local −Z = world −Z (straight down). No rotation op needed; yawing the parent `Xform` rotates the image around the nadir axis.
 
-**Frame output (omni.replicator.core):**
+**Frame output (`omni.replicator.core`):**
 - `rep.create.render_product("/World/Drone/Camera", (640, 480))`
-- RGB annotator captures RGBA → strips alpha → saves as JPEG
-- `simulator/drone_frames/latest.jpg` — overwritten every 5 sim steps
-- `simulator/drone_frames/latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
+- RGB annotator: RGBA → strip alpha → JPEG → `drone_frames/latest.jpg` every 5 sim steps
+- `drone_frames/latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
+- Viewport (Tab, 1920×1080) and render product (640×480) are **intentionally separate** — same camera and 90° HFOV, different aspect ratio and resolution. Viewport is for visual inspection; render product is the ML input.
 
-**Keyboard drone control (carb.input):**
-- W/S = move north/south (Y axis, +5 m/step)
-- A/D = move west/east (X axis)
-- Q/E = descend/ascend (Z axis)
-- Z/X = yaw left/right (1°/step)
+**HUD overlay (`omni.ui`):**
+- Semi-transparent dark window pinned to top-left corner, always on top
+- Shows live: `LAT` / `LON` (5 dp) · `ALT` (MSL + AGL) · active `CAM` name
+- Updates every sim step; wrapped in try/except so sim still runs if `omni.ui` fails
 
-**New constants added:**
-- `DRONE_FRAME_DIR`, `DRONE_CAM_W/H = 640/480`, `DRONE_SAVE_EVERY = 5`, `DRONE_SPEED_M = 5.0`
+**Keyboard controls (`carb.input` + `omni.appwindow`):**
+- Tab = toggle viewport: overview ↔ drone nadir (edge-detected, one press = one toggle)
+- W/S = N/S · A/D = W/E · Q/E = down/up · Z/X = yaw ±1°/step · all ±5 m/step
+
+---
+
+### Bugs fixed
+
+**1. `carb.input.IInput` has no `get_keyboard()` method**
+- Cause: `get_keyboard()` lives on the app window, not the input interface
+- Fix: `omni.appwindow.get_default_app_window().get_keyboard()`
+- File: `simulator/cesium_scene.py` → keyboard setup block
+
+**2. Camera FOV stated as 84°×65° — wrong**
+- Cause: arithmetic error; 24 mm / 36×27 mm aperture gives 73.7°×58.7°, not 84°×65°
+- Fix: corrected FOV formula `2 × arctan(aperture / (2 × focalLength))` and changed focal length to 18 mm to achieve the desired 90°×73.7°
+- Files: `cesium_scene.py` comment, `project_plan.md`, `README.md`
 
 ---
 
@@ -111,5 +129,5 @@ Wire the drone camera frames into AnyLoc (localization) and YOLO (object detecti
 Tasks:
 - Set up AnyLoc in `localization/` to read `drone_frames/latest.jpg` and return a geo estimate
 - Set up YOLO in `detection/` to read the same frame and return bounding boxes
-- Define shared frame interface (file-based now, upgrade to shared memory later)
+- Define shared frame interface (file-based for now, upgrade to shared memory when latency matters)
 - Test end-to-end: fly drone over buildings, verify detections appear
