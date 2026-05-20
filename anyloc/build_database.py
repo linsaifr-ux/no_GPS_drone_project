@@ -10,7 +10,7 @@ Run once before starting the localizer:
     conda run -n isaac_sim_test python anyloc/build_database.py
 
 Options:
-    --grid-step 200   grid spacing in metres (default 200)
+    --grid-step 50    grid spacing in metres (default 50)
     --agl 50          drone AGL in metres (sets footprint size, default 50)
     --rebuild         overwrite existing database
 """
@@ -203,8 +203,8 @@ def compute_vlad(feats, codebook):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--grid-step', type=float, default=200.0,
-                    help='Grid spacing in metres (default 200)')
+    ap.add_argument('--grid-step', type=float, default=50.0,
+                    help='Grid spacing in metres (default 50)')
     ap.add_argument('--agl', type=float, default=50.0,
                     help='Drone AGL in metres for footprint calculation (default 50)')
     ap.add_argument('--rebuild', action='store_true',

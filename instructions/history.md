@@ -218,8 +218,46 @@ Created `anyloc/` with a working AnyLoc visual localization pipeline and two liv
 
 ---
 
+---
+
+---
+
+## 2026-05-20 — AnyLoc grid densification + VO plan
+
+### What was done
+
+**Grid step reduced 200 m → 50 m (`anyloc/build_database.py`):**
+- Changed `--grid-step` default from 200 to 50
+- Rebuilt database: 2,821 entries (was 172), VLAD dim=49,152 unchanged
+- Expected localisation error: ~15–20 m (was ~65 m)
+- Hard accuracy floor at this AGL: ~50 m grid ≈ camera footprint width (~100 m × 75 m at 50 m AGL); going finer produces overlapping images that are indistinguishable
+
+Accuracy table (for reference):
+
+| Grid step | Entries | Expected error |
+|-----------|---------|----------------|
+| 200 m | 172 | ~65 m |
+| 100 m | ~688 | ~30–40 m |
+| **50 m (current)** | **2,821** | **~15–20 m** |
+| 25 m | ~11,000 | ~8–12 m |
+
+**Visual Odometry (VO) refinement documented in `project_plan.md`:**
+
+Plan for the next accuracy improvement after pure retrieval hits its floor:
+- AnyLoc retrieval gives a coarse fix (±15–20 m) every N frames
+- VO tracks ORB/SIFT keypoints frame-to-frame via optical flow; pixel displacement + AGL + FOV → Δlat, Δlon
+- Position = last AnyLoc fix + accumulated VO delta; re-anchor every ~10 frames
+- Expected combined accuracy: ~5–10 m between fixes, ~1–2 m drift per frame
+
+**Docs and .gitignore updated:**
+- `.gitignore` — added `anyloc/database/` and `anyloc/test_output/`
+- `README.md`, `project_plan.md` — reflect Milestone 3 done, new database size, VO plan
+
+---
+
 ## Next session — Milestone 4 / 5
 
 - Add YOLO detection module in `detection/` (reads same `drone_frames/latest.jpg`)
 - Show detection bounding-box overlay as a third postview window
 - Connect AnyLoc estimate + YOLO detections into `main.py` orchestrator
+- (Future) Implement VO refinement to push accuracy below 10 m

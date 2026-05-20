@@ -45,7 +45,7 @@ no_GPS_drone_project/
 │   ├── build_database.py  # build VLAD database from satellite orthophoto (run once)
 │   ├── localizer.py       # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
 │   ├── run_localizer.py   # live dual postview
-│   └── database/          # 172-entry VLAD database (49152-dim)
+│   └── database/          # 2821-entry VLAD database (49152-dim, 50 m grid)
 ├── detection/             # YOLO — TODO
 ├── control/               # ArduPilot MAVLink — TODO
 └── main.py                # top-level orchestrator — TODO
@@ -129,7 +129,7 @@ Two side-by-side matplotlib windows appear:
 - **Drone Camera** — live `latest.jpg` with ground-truth LAT / LON / ALT / YAW overlay
 - **AnyLoc Match** — satellite crop at the matched database position, re-cropped at the drone's actual AGL; error overlay turns green when error < 200 m
 
-Typical localisation performance (RTX 2080 Ti): ~183 ms per frame, ~65 m error at 50 m AGL.
+Typical localisation performance (RTX 2080 Ti): ~183 ms per frame, ~15–20 m error at 50 m AGL (50 m grid, 2,821 database entries).
 
 Rebuild the database if the scene or camera FOV changes:
 

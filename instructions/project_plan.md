@@ -74,9 +74,20 @@ Next steps:
 Use **AnyLoc** (universal visual place recognition) to estimate the drone's position from camera images without GPS.
 
 Implementation:
-1. **Database** (`build_database.py`): 200 m grid, ±1500 m from scene centre → 172 positions; each position crops the NLSC satellite orthophoto at 50 m AGL → DINOv2 ViT-B/14 patch features → intra-normalised VLAD (k=64, dim=49,152); saved with `torch.save()`
+1. **Database** (`build_database.py`): 50 m grid, ±1500 m from scene centre → 2,821 positions; each position crops the NLSC satellite orthophoto at 50 m AGL → DINOv2 ViT-B/14 patch features → intra-normalised VLAD (k=64, dim=49,152); saved with `torch.save()`
 2. **Inference** (`localizer.py`): `AnyLocLocalizer.localize(img, agl_m)` — extracts VLAD, queries FAISS IndexFlatIP (cosine sim), returns `(est_lat, est_lon, est_alt, match_img, score, db_idx)`. Match image re-cropped from satellite at drone's actual AGL.
 3. **Postview** (`run_localizer.py`): two matplotlib TkAgg windows — `[Drone Camera]` with ground-truth overlay, `[AnyLoc Match]` with estimated position; error text green < 200 m, blue otherwise.
+
+Accuracy vs grid step:
+
+| Grid step | ~Positions | Expected error |
+|-----------|-----------|----------------|
+| 200 m | 172 | ~65 m |
+| 100 m | ~688 | ~30–40 m |
+| **50 m (current)** | **2,821** | **~15–20 m** |
+| 25 m | ~11,000 | ~8–12 m |
+
+Hard floor at ~50 m AGL: camera footprint is ~100 m × 75 m, so grid steps below ~50 m produce overlapping images that are hard to distinguish — retrieval accuracy stops improving.
 
 Key design choices:
 - All intermediate ops in **torch tensors** (no `np.array` calls) due to dual-numpy conflict in `isaac_sim_test` env
@@ -93,6 +104,25 @@ Rebuild database (needed only once, or after scene changes):
 ```bash
 conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 ```
+
+Future improvement — Visual Odometry (VO) refinement:
+
+AnyLoc retrieval gives a coarse fix every N frames; VO estimates frame-to-frame motion to maintain a tight position between fixes.
+
+```
+Frame N:    AnyLoc retrieval → coarse fix (±15–20 m)
+Frame N+1:  VO tracks feature points N→N+1 → Δlat, Δlon from pixel displacement + AGL + FOV
+            position = last_fix + accumulated_delta
+Frame N+K:  AnyLoc retrieval again → re-anchor, reset drift
+```
+
+Implementation plan:
+1. Detect ORB/SIFT keypoints in frame N; track with optical flow (cv2.calcOpticalFlowPyrLK) in frame N+1
+2. From pixel displacement + known AGL + camera FOV → ground-plane Δx (m), Δy (m) → Δlat, Δlon
+3. Accumulate delta until next AnyLoc fix (every ~10 frames) re-anchors and resets drift
+4. Expected combined accuracy: ~5–10 m between fixes, ~1–2 m drift per frame at walking speed
+
+Note: requires textured ground (buildings, roads). Homogeneous fields or water will produce sparse/noisy matches. The Chiayi urban scene has sufficient texture.
 
 Key references:
 - AnyLoc paper: "AnyLoc: Towards Universal Visual Place Recognition" (IRAL 2024)
