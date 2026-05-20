@@ -27,7 +27,10 @@ DB_DIR    = os.path.join(HERE, 'database')
 COS_LAT = math.cos(math.radians(23.450868))
 
 sys.path.insert(0, HERE)
-from localizer import AnyLocLocalizer
+from localizer  import AnyLocLocalizer
+from vo_refiner import VORefiner
+
+ANYLOC_INTERVAL = 10   # run full AnyLoc retrieval every N frames; VO fills in between
 
 
 # ── PIL text overlay (avoids numpy ops) ───────────────────────────────────────
@@ -87,6 +90,17 @@ def main():
                  "           Run build_database.py first.")
 
     loc = AnyLocLocalizer(DB_DIR)
+    vo  = VORefiner()
+
+    # AnyLoc anchor state
+    frame_count  = 0
+    anchor_lat   = None
+    anchor_lon   = None
+    anchor_match = None
+    anchor_score = 0.0
+    anchor_idx   = 0
+    accum_dlat   = 0.0
+    accum_dlon   = 0.0
 
     # Create figure with two side-by-side axes
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.2),
@@ -102,7 +116,7 @@ def main():
     im1 = ax1.imshow(blank)
     im2 = ax2.imshow(blank)
     ax1.set_title('Drone Camera', color='white', fontsize=11, pad=4)
-    ax2.set_title('AnyLoc Match', color='white', fontsize=11, pad=4)
+    ax2.set_title('AnyLoc+VO', color='white', fontsize=11, pad=4)
     plt.ion()
     plt.show()
 
@@ -139,13 +153,39 @@ def main():
             drone_agl = meta.get('agl_m', drone_alt)
             drone_yaw = meta.get('yaw_deg', 0.0)
 
-            # ── AnyLoc inference ──────────────────────────────────────────────
+            frame_count += 1
+            run_anyloc = (frame_count == 1) or (frame_count % ANYLOC_INTERVAL == 0)
+
+            # ── VO update (every frame) ───────────────────────────────────────
+            dlat, dlon, n_vo = vo.update(frame, drone_agl, drone_yaw)
+            if anchor_lat is not None:
+                accum_dlat += dlat
+                accum_dlon += dlon
+
+            # ── AnyLoc retrieval (every ANYLOC_INTERVAL frames) ───────────────
             t0 = time.perf_counter()
-            est_lat, est_lon, est_alt, matched, score, db_idx = loc.localize(
-                frame, agl_m=drone_agl)
+            if run_anyloc:
+                est_lat, est_lon, est_alt, matched, score, db_idx = loc.localize(
+                    frame, agl_m=drone_agl)
+                anchor_lat   = est_lat
+                anchor_lon   = est_lon
+                anchor_match = matched
+                anchor_score = score
+                anchor_idx   = db_idx
+                accum_dlat   = 0.0
+                accum_dlon   = 0.0
+                vo.reset()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-            err_m = geo_dist_m(drone_lat, drone_lon, est_lat, est_lon)
+            # Skip display until first anchor is available
+            if anchor_lat is None:
+                plt.pause(0.15)
+                continue
+
+            final_lat = anchor_lat + accum_dlat
+            final_lon = anchor_lon + accum_dlon
+            err_m     = geo_dist_m(drone_lat, drone_lon, final_lat, final_lon)
+            anchor_age = 0 if run_anyloc else (frame_count % ANYLOC_INTERVAL)
 
             # ── View 1: Drone Camera ──────────────────────────────────────────
             v1_pil = _pil_overlay(frame.resize((640, 480), Image.LANCZOS), [
@@ -157,19 +197,20 @@ def main():
             ], text_color='white')
             im1.set_data(pil_to_rgb_array(v1_pil))
 
-            # ── View 2: AnyLoc Match ──────────────────────────────────────────
+            # ── View 2: AnyLoc + VO estimate ─────────────────────────────────
             good_match  = err_m < 200
             match_color = '#50ff50' if good_match else '#5050ff'
-            v2_pil = _pil_overlay(matched.resize((640, 480), Image.LANCZOS), [
-                f'ANYLOC MATCH   score {score:.3f}   #{db_idx}',
-                f'LAT   {est_lat:.5f} N',
-                f'LON   {est_lon:.5f} E',
-                f'ALT   {est_alt:.1f} m',
-                f'ERR   {err_m:.0f} m    {elapsed_ms:.0f} ms',
+            mode_tag    = 'ANYLOC' if run_anyloc else f'VO +{anchor_age}f'
+            v2_pil = _pil_overlay(anchor_match.resize((640, 480), Image.LANCZOS), [
+                f'{mode_tag}   score {anchor_score:.3f}   #{anchor_idx}',
+                f'LAT   {final_lat:.5f} N',
+                f'LON   {final_lon:.5f} E',
+                f'ALT   {drone_agl:.1f} m AGL',
+                f'ERR   {err_m:.0f} m    VO pts {n_vo}    {elapsed_ms:.0f} ms',
             ], text_color=match_color)
             im2.set_data(pil_to_rgb_array(v2_pil))
 
-            ax2.set_title(f'AnyLoc Match  —  ERR {err_m:.0f} m',
+            ax2.set_title(f'AnyLoc+VO [{mode_tag}]  —  ERR {err_m:.0f} m',
                           color=match_color, fontsize=11, pad=4)
 
             fig.canvas.draw_idle()

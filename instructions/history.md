@@ -222,7 +222,7 @@ Created `anyloc/` with a working AnyLoc visual localization pipeline and two liv
 
 ---
 
-## 2026-05-20 — AnyLoc grid densification + VO plan
+## 2026-05-20 — AnyLoc grid densification + VO refinement
 
 ### What was done
 
@@ -241,17 +241,35 @@ Accuracy table (for reference):
 | **50 m (current)** | **2,821** | **~15–20 m** |
 | 25 m | ~11,000 | ~8–12 m |
 
-**Visual Odometry (VO) refinement documented in `project_plan.md`:**
+**Visual Odometry (VO) refinement implemented:**
 
-Plan for the next accuracy improvement after pure retrieval hits its floor:
-- AnyLoc retrieval gives a coarse fix (±15–20 m) every N frames
-- VO tracks ORB/SIFT keypoints frame-to-frame via optical flow; pixel displacement + AGL + FOV → Δlat, Δlon
-- Position = last AnyLoc fix + accumulated VO delta; re-anchor every ~10 frames
-- Expected combined accuracy: ~5–10 m between fixes, ~1–2 m drift per frame
+New file `anyloc/vo_refiner.py` — `VORefiner` class using LK optical flow:
+- Detects Shi-Tomasi corner features (`cv2.goodFeaturesToTrack`)
+- Tracks them with Lucas-Kanade optical flow (`cv2.calcOpticalFlowPyrLK`)
+- Median pixel displacement → ground metres → Δlat/Δlon via AGL + FOV + yaw rotation:
+  - `raw_east = -dx_px × m_per_px_x` (feature right → drone moved west)
+  - `raw_north = +dy_px × m_per_px_y` (feature down → drone moved north)
+  - World ENU: `east = raw_east·cos(yaw) + raw_north·sin(yaw)`, `north = -raw_east·sin(yaw) + raw_north·cos(yaw)`
+- `reset()` clears tracked state after each AnyLoc re-anchor
+
+Updated `anyloc/run_localizer.py`:
+- `ANYLOC_INTERVAL = 10` — full AnyLoc retrieval every 10 frames (~2 s at 5-step sim)
+- Between anchors: VO accumulates `accum_dlat / accum_dlon`; final position = anchor + accumulated delta
+- Panel 2 mode tag: `ANYLOC` on anchor frames, `VO +Nf` otherwise; also shows tracked point count
+- Expected combined accuracy: ~5–10 m between anchor fixes
 
 **Docs and .gitignore updated:**
 - `.gitignore` — added `anyloc/database/` and `anyloc/test_output/`
-- `README.md`, `project_plan.md` — reflect Milestone 3 done, new database size, VO plan
+- `README.md`, `project_plan.md` — reflect Milestone 3 done, new database size, VO documented
+
+---
+
+### Bug fixed
+
+**`ok.sum()` hits broken numpy `_core/_methods.py` (numpy 2.x stub)**
+- Cause: `cv2.calcOpticalFlowPyrLK` returns a numpy array `status`; calling `.sum()` on `status.flatten() == 1` triggers numpy's Python-level dispatch in `_core/_methods.py`, which is a numpy 2.x file still present in the env
+- Fix: `sum(ok.tolist())` — `.tolist()` is C-level (safe), `sum()` on a Python list is pure Python
+- File: `anyloc/vo_refiner.py` → `update()`
 
 ---
 
@@ -260,4 +278,3 @@ Plan for the next accuracy improvement after pure retrieval hits its floor:
 - Add YOLO detection module in `detection/` (reads same `drone_frames/latest.jpg`)
 - Show detection bounding-box overlay as a third postview window
 - Connect AnyLoc estimate + YOLO detections into `main.py` orchestrator
-- (Future) Implement VO refinement to push accuracy below 10 m

@@ -18,9 +18,10 @@ no_GPS_drone_project/
 ├── anyloc/               # AnyLoc visual localization — WORKING
 │   ├── build_database.py # Build geo-tagged VLAD database from satellite orthophoto (run once)
 │   ├── localizer.py      # AnyLocLocalizer class (DINOv2 + VLAD + FAISS)
-│   ├── run_localizer.py  # Live dual postview (drone cam + AnyLoc match)
+│   ├── vo_refiner.py     # VORefiner class (LK optical flow, frame-to-frame delta)
+│   ├── run_localizer.py  # Live dual postview with AnyLoc+VO combined estimate
 │   ├── requirements.txt  # Dependency notes
-│   └── database/         # Built database (172 entries, VLAD dim=49152)
+│   └── database/         # Built database (2821 entries, VLAD dim=49152, 50 m grid)
 ├── detection/            # YOLO — object detection (TODO)
 ├── control/              # ArduPilot MAVLink interface (TODO)
 └── main.py               # Top-level orchestrator (TODO)
@@ -69,14 +70,15 @@ Next steps:
 
 ### 2. Localization (`anyloc/`)
 
-**Status:** Working — AnyLoc database built; dual postview running; ~65 m typical error at 50 m AGL
+**Status:** Working — AnyLoc + VO; 2,821-entry database (50 m grid); ~15–20 m anchor error; ~5–10 m between anchors
 
 Use **AnyLoc** (universal visual place recognition) to estimate the drone's position from camera images without GPS.
 
 Implementation:
 1. **Database** (`build_database.py`): 50 m grid, ±1500 m from scene centre → 2,821 positions; each position crops the NLSC satellite orthophoto at 50 m AGL → DINOv2 ViT-B/14 patch features → intra-normalised VLAD (k=64, dim=49,152); saved with `torch.save()`
 2. **Inference** (`localizer.py`): `AnyLocLocalizer.localize(img, agl_m)` — extracts VLAD, queries FAISS IndexFlatIP (cosine sim), returns `(est_lat, est_lon, est_alt, match_img, score, db_idx)`. Match image re-cropped from satellite at drone's actual AGL.
-3. **Postview** (`run_localizer.py`): two matplotlib TkAgg windows — `[Drone Camera]` with ground-truth overlay, `[AnyLoc Match]` with estimated position; error text green < 200 m, blue otherwise.
+3. **VO refinement** (`vo_refiner.py`): `VORefiner` tracks Shi-Tomasi features with LK optical flow every frame; median pixel displacement → Δlat/Δlon via AGL + FOV + yaw rotation. `reset()` clears state after each AnyLoc re-anchor.
+4. **Postview** (`run_localizer.py`): two matplotlib TkAgg windows — `[Drone Camera]` with ground-truth overlay, `[AnyLoc+VO]` with combined estimate; mode tag shows `ANYLOC` on anchor frames and `VO +Nf` between them; error text green < 200 m, blue otherwise.
 
 Accuracy vs grid step:
 
@@ -91,9 +93,11 @@ Hard floor at ~50 m AGL: camera footprint is ~100 m × 75 m, so grid steps below
 
 Key design choices:
 - All intermediate ops in **torch tensors** (no `np.array` calls) due to dual-numpy conflict in `isaac_sim_test` env
+- Numpy reductions (`.sum()`, `.mean()`) replaced with `arr.tolist()` + Python builtins — numpy's `_core/_methods.py` (2.x stub) is broken
 - `faiss.Kmeans` replaces sklearn KMeans (sklearn broken by conda-forge faiss-cpu install)
 - matplotlib TkAgg replaces cv2 GUI (cv2 built headless in this env)
 - PIL ImageDraw for text overlays (avoids numpy ops)
+- `cv2.goodFeaturesToTrack` + `cv2.calcOpticalFlowPyrLK` work fine (C-level, not affected by broken numpy)
 
 Run:
 ```bash
@@ -105,24 +109,21 @@ Rebuild database (needed only once, or after scene changes):
 conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 ```
 
-Future improvement — Visual Odometry (VO) refinement:
-
-AnyLoc retrieval gives a coarse fix every N frames; VO estimates frame-to-frame motion to maintain a tight position between fixes.
+VO + AnyLoc combined pipeline (`ANYLOC_INTERVAL = 10`):
 
 ```
-Frame N:    AnyLoc retrieval → coarse fix (±15–20 m)
-Frame N+1:  VO tracks feature points N→N+1 → Δlat, Δlon from pixel displacement + AGL + FOV
-            position = last_fix + accumulated_delta
-Frame N+K:  AnyLoc retrieval again → re-anchor, reset drift
+Frame 1:    AnyLoc retrieval → anchor fix (±15–20 m); vo.reset()
+Frame 2–9:  VO only → accum_dlat += dlat, accum_dlon += dlon
+            final_pos = anchor + (accum_dlat, accum_dlon)
+Frame 10:   AnyLoc retrieval → new anchor; reset accum; vo.reset()
 ```
 
-Implementation plan:
-1. Detect ORB/SIFT keypoints in frame N; track with optical flow (cv2.calcOpticalFlowPyrLK) in frame N+1
-2. From pixel displacement + known AGL + camera FOV → ground-plane Δx (m), Δy (m) → Δlat, Δlon
-3. Accumulate delta until next AnyLoc fix (every ~10 frames) re-anchors and resets drift
-4. Expected combined accuracy: ~5–10 m between fixes, ~1–2 m drift per frame at walking speed
+Coordinate convention (verify empirically — derived analytically):
+- `raw_east = -dx_px × m_per_px_x`  (feature moved right → drone moved west)
+- `raw_north = +dy_px × m_per_px_y`  (feature moved down → drone moved north)
+- World ENU with yaw: `east = raw_east·cos(yaw) + raw_north·sin(yaw)`
 
-Note: requires textured ground (buildings, roads). Homogeneous fields or water will produce sparse/noisy matches. The Chiayi urban scene has sufficient texture.
+Note: requires textured ground. Homogeneous fields or water produce sparse/noisy matches. The Chiayi urban scene has sufficient texture.
 
 Key references:
 - AnyLoc paper: "AnyLoc: Towards Universal Visual Place Recognition" (IRAL 2024)
