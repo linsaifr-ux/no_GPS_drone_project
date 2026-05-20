@@ -29,6 +29,12 @@ simulator/__pycache__/
 # Drone camera live output (transient — overwritten every 5 sim steps)
 simulator/drone_frames/
 
+# AnyLoc generated database (rebuild with: python anyloc/build_database.py --rebuild)
+anyloc/database/
+
+# AnyLoc test / debug output
+anyloc/test_output/
+
 # Claude Code local settings
 **/.claude/
 

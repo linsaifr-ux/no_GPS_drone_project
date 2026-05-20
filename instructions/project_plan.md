@@ -15,7 +15,12 @@ no_GPS_drone_project/
 │   ├── cesium_scene.py   # Main scene: terrain + buildings + drone + nadir camera
 │   ├── drone_frames/     # Live output: latest.jpg + latest_meta.json (per step)
 │   └── run_chiayi.sh     # Launch script
-├── localization/         # AnyLoc — GPS-denied place recognition (TODO)
+├── anyloc/               # AnyLoc visual localization — WORKING
+│   ├── build_database.py # Build geo-tagged VLAD database from satellite orthophoto (run once)
+│   ├── localizer.py      # AnyLocLocalizer class (DINOv2 + VLAD + FAISS)
+│   ├── run_localizer.py  # Live dual postview (drone cam + AnyLoc match)
+│   ├── requirements.txt  # Dependency notes
+│   └── database/         # Built database (172 entries, VLAD dim=49152)
 ├── detection/            # YOLO — object detection (TODO)
 ├── control/              # ArduPilot MAVLink interface (TODO)
 └── main.py               # Top-level orchestrator (TODO)
@@ -37,7 +42,7 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 - **Drone:** `/World/Drone` Xform — starts at scene centre, 50 m AGL; keyboard-controlled; quadcopter model (body + 4 arms + motor pods + propeller discs, ~0.8 m span); orange beacon light for visibility from overview
 - **Camera:** `/World/Drone/Camera` — nadir, 18 mm / 36×27 mm aperture, **90°×73.7° FOV**, 640×480 render product; viewport (Tab) renders at 1920×1080 from same camera — intentionally separate from ML output
 - **HUD:** `omni.ui` overlay (top-left) showing live LAT / LON / ALT MSL / AGL / active camera
-- **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` written every 5 sim steps via `omni.replicator.core`
+- **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` written every 5 sim steps via `omni.replicator.core`; meta fields: `step`, `lat`, `lon`, `alt_m`, `agl_m`, `centre_elev`, `yaw_deg`, `frame_w`, `frame_h`
 - **Environment:** conda env `isaac_sim_test`, Python 3.12, RTX 2080 Ti
 
 Keyboard controls (window must be focused):
@@ -57,24 +62,37 @@ cd simulator
 ```
 
 Next steps:
-- Wire `drone_frames/latest.jpg` into AnyLoc and YOLO modules
+- Wire YOLO detection into the frame loop
 - Upgrade frame transport to shared memory when latency matters
 
 ---
 
-### 2. Localization (`localization/`)
+### 2. Localization (`anyloc/`)
 
-**Status:** TODO (frame source ready — reads `simulator/drone_frames/latest.jpg`)
+**Status:** Working — AnyLoc database built; dual postview running; ~65 m typical error at 50 m AGL
 
 Use **AnyLoc** (universal visual place recognition) to estimate the drone's position from camera images without GPS.
 
-Plan:
-1. Build a map database from Isaac Sim rendered views (offline, at known positions)
-2. At runtime, query AnyLoc with the live camera frame to retrieve the closest database entry
-3. Refine the estimate using visual odometry between consecutive frames
-4. Output: estimated (lat, lon, altitude) or ENU (x, y, z) position
+Implementation:
+1. **Database** (`build_database.py`): 200 m grid, ±1500 m from scene centre → 172 positions; each position crops the NLSC satellite orthophoto at 50 m AGL → DINOv2 ViT-B/14 patch features → intra-normalised VLAD (k=64, dim=49,152); saved with `torch.save()`
+2. **Inference** (`localizer.py`): `AnyLocLocalizer.localize(img, agl_m)` — extracts VLAD, queries FAISS IndexFlatIP (cosine sim), returns `(est_lat, est_lon, est_alt, match_img, score, db_idx)`. Match image re-cropped from satellite at drone's actual AGL.
+3. **Postview** (`run_localizer.py`): two matplotlib TkAgg windows — `[Drone Camera]` with ground-truth overlay, `[AnyLoc Match]` with estimated position; error text green < 200 m, blue otherwise.
 
-Frame interface: poll `simulator/drone_frames/latest.jpg` + parse `latest_meta.json` for ground-truth position (used to build the map database and evaluate localization error).
+Key design choices:
+- All intermediate ops in **torch tensors** (no `np.array` calls) due to dual-numpy conflict in `isaac_sim_test` env
+- `faiss.Kmeans` replaces sklearn KMeans (sklearn broken by conda-forge faiss-cpu install)
+- matplotlib TkAgg replaces cv2 GUI (cv2 built headless in this env)
+- PIL ImageDraw for text overlays (avoids numpy ops)
+
+Run:
+```bash
+DISPLAY=:2 conda run -n isaac_sim_test python anyloc/run_localizer.py
+```
+
+Rebuild database (needed only once, or after scene changes):
+```bash
+conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+```
 
 Key references:
 - AnyLoc paper: "AnyLoc: Towards Universal Visual Place Recognition" (IRAL 2024)
@@ -147,8 +165,8 @@ AnyLoc               YOLO
 |---|-----------|--------|
 | 1 | Isaac Sim scene running with Cesium terrain + NLSC imagery | Done |
 | 2 | Quadcopter drone + nadir camera + HUD publishing frames | Done |
-| 3 | AnyLoc database built from simulated views | TODO |
-| 4 | AnyLoc localization working on simulated frames | TODO |
+| 3 | AnyLoc database built from simulated views | Done |
+| 4 | AnyLoc localization working on simulated frames + dual postview | Done |
 | 5 | YOLO detection working on simulated frames | TODO |
 | 6 | ArduPilot SITL connected and responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation (localize → detect → control) | TODO |

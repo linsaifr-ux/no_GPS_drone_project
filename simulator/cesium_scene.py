@@ -898,13 +898,15 @@ while simulation_app.is_running():
                     os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
                 with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
                     json.dump({
-                        "step":    _step,
-                        "lat":     _lat,
-                        "lon":     _lon,
-                        "alt_m":   _alt,
-                        "yaw_deg": yaw,
-                        "frame_w": DRONE_CAM_W,
-                        "frame_h": DRONE_CAM_H,
+                        "step":         _step,
+                        "lat":          _lat,
+                        "lon":          _lon,
+                        "alt_m":        _alt,
+                        "agl_m":        _agl,
+                        "centre_elev":  centre_elev,
+                        "yaw_deg":      yaw,
+                        "frame_w":      DRONE_CAM_W,
+                        "frame_h":      DRONE_CAM_H,
                     }, f)
                 if _step == DRONE_SAVE_EVERY:
                     print(f"[DRONE] Frame capture working — saving to {DRONE_FRAME_DIR}/")

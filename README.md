@@ -41,7 +41,11 @@ no_GPS_drone_project/
 │   ├── cesium_scene.py    # main scene: terrain + buildings + drone + camera
 │   ├── drone_frames/      # live output: latest.jpg + latest_meta.json
 │   └── run_chiayi.sh      # launch script
-├── localization/          # AnyLoc — TODO
+├── anyloc/                # AnyLoc visual localization — WORKING
+│   ├── build_database.py  # build VLAD database from satellite orthophoto (run once)
+│   ├── localizer.py       # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
+│   ├── run_localizer.py   # live dual postview
+│   └── database/          # 172-entry VLAD database (49152-dim)
 ├── detection/             # YOLO — TODO
 ├── control/               # ArduPilot MAVLink — TODO
 └── main.py                # top-level orchestrator — TODO
@@ -55,8 +59,8 @@ no_GPS_drone_project/
 |---|-----------|--------|
 | 1 | Isaac Sim scene: Cesium terrain + NLSC imagery + OSM buildings | Done |
 | 2 | Virtual drone + nadir camera publishing frames | Done |
-| 3 | AnyLoc map database built from simulated views | TODO |
-| 4 | AnyLoc localisation working on simulated frames | TODO |
+| 3 | AnyLoc map database built from simulated views | Done |
+| 4 | AnyLoc localisation + dual postview on simulated frames | Done |
 | 5 | YOLO detection working on simulated frames | TODO |
 | 6 | ArduPilot SITL responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
@@ -111,9 +115,27 @@ Quadcopter (~0.8 m span): central body, 4 arms at 45° intervals, motor pods and
 Every 5 sim steps the drone camera writes to `simulator/drone_frames/`:
 
 - `latest.jpg` — 640×480 RGB nadir view (ML input for AnyLoc and YOLO)
-- `latest_meta.json` — `{step, lat, lon, alt_m, yaw_deg, frame_w, frame_h}`
+- `latest_meta.json` — `{step, lat, lon, alt_m, agl_m, centre_elev, yaw_deg, frame_w, frame_h}`
 
 The Tab viewport renders the same camera at 1920×1080 for visual inspection — intentionally a different resolution from the ML output.
+
+### Run the AnyLoc localizer (separate terminal)
+
+```bash
+DISPLAY=:2 conda run -n isaac_sim_test python anyloc/run_localizer.py
+```
+
+Two side-by-side matplotlib windows appear:
+- **Drone Camera** — live `latest.jpg` with ground-truth LAT / LON / ALT / YAW overlay
+- **AnyLoc Match** — satellite crop at the matched database position, re-cropped at the drone's actual AGL; error overlay turns green when error < 200 m
+
+Typical localisation performance (RTX 2080 Ti): ~183 ms per frame, ~65 m error at 50 m AGL.
+
+Rebuild the database if the scene or camera FOV changes:
+
+```bash
+conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+```
 
 ---
 
