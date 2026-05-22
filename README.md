@@ -127,9 +127,11 @@ DISPLAY=:2 conda run -n isaac_sim_test python anyloc/run_localizer.py
 
 Two side-by-side matplotlib windows appear:
 - **Drone Camera** — live `latest.jpg` with ground-truth LAT / LON / ALT / YAW overlay
-- **AnyLoc Match** — satellite crop at the matched database position, re-cropped at the drone's actual AGL; error overlay turns green when error < 200 m
+- **AnyLoc+VO** — satellite crop at the matched position with estimated LAT / LON / ERR overlay; text turns green when error < 200 m; mode tag shows `ANYLOC` on anchor frames and `VO +Nf` between them
 
-Typical localisation performance (RTX 2080 Ti): ~183 ms per frame, ~15–20 m error at 50 m AGL (50 m grid, 2,821 database entries).
+AnyLoc runs every 10 frames; Visual Odometry (LK optical flow) fills in between, accumulating a Δlat/Δlon from the last anchor. After the first anchor is set, each AnyLoc retrieval is geo-constrained to the 200 m window around the VO estimate, preventing jumps to wrong tiles.
+
+Typical localisation performance (RTX 2080 Ti): ~183 ms per AnyLoc frame, ~15–20 m anchor error, ~5–10 m between anchors (50 m grid, 2,821 database entries).
 
 Rebuild the database if the scene or camera FOV changes:
 

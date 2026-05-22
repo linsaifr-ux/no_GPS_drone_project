@@ -165,8 +165,11 @@ def main():
             # ── AnyLoc retrieval (every ANYLOC_INTERVAL frames) ───────────────
             t0 = time.perf_counter()
             if run_anyloc:
+                clat = (anchor_lat + accum_dlat) if anchor_lat is not None else None
+                clon = (anchor_lon + accum_dlon) if anchor_lat is not None else None
                 est_lat, est_lon, est_alt, matched, score, db_idx = loc.localize(
-                    frame, agl_m=drone_agl)
+                    frame, agl_m=drone_agl,
+                    center_lat=clat, center_lon=clon, radius_m=200.0)
                 anchor_lat   = est_lat
                 anchor_lon   = est_lon
                 anchor_match = matched

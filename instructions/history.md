@@ -273,6 +273,23 @@ Updated `anyloc/run_localizer.py`:
 
 ---
 
+## 2026-05-22 — Geo-constrained AnyLoc search
+
+### What was done
+
+**Constrained AnyLoc retrieval (`anyloc/localizer.py`, `anyloc/run_localizer.py`):**
+
+After the first anchor is established, each subsequent AnyLoc retrieval is restricted to database entries within 200 m of the current VO-refined position estimate, rather than searching all 2,821 entries.
+
+- `localize()` now accepts `center_lat`, `center_lon`, `radius_m` optional args
+- When a center is provided: computes Euclidean geo-distance (in metres) from all DB entries to the center using torch tensors; selects entries within `radius_m`; runs cosine similarity search (`vlads[in_range] @ desc`) on the subset (~50 entries at 200 m radius vs 2,821 full)
+- Falls back to full FAISS search if no entries fall within the radius, or on the first frame (no anchor yet)
+- `run_localizer.py` passes `center_lat = anchor_lat + accum_dlat`, `center_lon = anchor_lon + accum_dlon`, `radius_m = 200.0` to each AnyLoc call after the first anchor
+
+**Why 200 m:** 50 m grid → 200 m = 4 grid steps in each direction. Worst-case drone speed ~20 m/s × ~2 s between AnyLoc runs = 40 m displacement; VO captures most of it; 200 m gives ~5× safety margin against residual VO error while covering only ~50 DB entries.
+
+---
+
 ## Next session — Milestone 4 / 5
 
 - Add YOLO detection module in `detection/` (reads same `drone_frames/latest.jpg`)

@@ -76,7 +76,7 @@ Use **AnyLoc** (universal visual place recognition) to estimate the drone's posi
 
 Implementation:
 1. **Database** (`build_database.py`): 50 m grid, ±1500 m from scene centre → 2,821 positions; each position crops the NLSC satellite orthophoto at 50 m AGL → DINOv2 ViT-B/14 patch features → intra-normalised VLAD (k=64, dim=49,152); saved with `torch.save()`
-2. **Inference** (`localizer.py`): `AnyLocLocalizer.localize(img, agl_m)` — extracts VLAD, queries FAISS IndexFlatIP (cosine sim), returns `(est_lat, est_lon, est_alt, match_img, score, db_idx)`. Match image re-cropped from satellite at drone's actual AGL.
+2. **Inference** (`localizer.py`): `AnyLocLocalizer.localize(img, agl_m, center_lat, center_lon, radius_m)` — extracts VLAD, then either (a) geo-filters the database to entries within `radius_m` of `(center_lat, center_lon)` and does a torch inner-product search on the subset, or (b) falls back to full FAISS IndexFlatIP search when no center is given. Returns `(est_lat, est_lon, est_alt, match_img, score, db_idx)`. Match image re-cropped from satellite at drone's actual AGL.
 3. **VO refinement** (`vo_refiner.py`): `VORefiner` tracks Shi-Tomasi features with LK optical flow every frame; median pixel displacement → Δlat/Δlon via AGL + FOV + yaw rotation. `reset()` clears state after each AnyLoc re-anchor.
 4. **Postview** (`run_localizer.py`): two matplotlib TkAgg windows — `[Drone Camera]` with ground-truth overlay, `[AnyLoc+VO]` with combined estimate; mode tag shows `ANYLOC` on anchor frames and `VO +Nf` between them; error text green < 200 m, blue otherwise.
 
@@ -112,11 +112,14 @@ conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 VO + AnyLoc combined pipeline (`ANYLOC_INTERVAL = 10`):
 
 ```
-Frame 1:    AnyLoc retrieval → anchor fix (±15–20 m); vo.reset()
+Frame 1:    AnyLoc full search (2821 entries) → anchor fix (±15–20 m); vo.reset()
 Frame 2–9:  VO only → accum_dlat += dlat, accum_dlon += dlon
             final_pos = anchor + (accum_dlat, accum_dlon)
-Frame 10:   AnyLoc retrieval → new anchor; reset accum; vo.reset()
+Frame 10:   AnyLoc constrained search (≤~50 entries within 200 m of VO estimate)
+            → new anchor; reset accum; vo.reset()
 ```
+
+Constrained search prevents the retrieval from jumping to a wrong tile on the other side of the scene. Falls back to full search if no entries fall within the radius.
 
 Coordinate convention (verify empirically — derived analytically):
 - `raw_east = -dx_px × m_per_px_x`  (feature moved right → drone moved west)

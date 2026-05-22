@@ -192,17 +192,18 @@ class AnyLocLocalizer:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def localize(self, pil_img: Image.Image, agl_m: float = None):
+    def localize(self, pil_img: Image.Image, agl_m: float = None,
+                 center_lat: float = None, center_lon: float = None,
+                 radius_m: float = None):
         """
         Estimate geo position from a single PIL image.
 
         Args:
-            pil_img  PIL image from the drone camera
-            agl_m    drone altitude above ground in metres.  When provided the
-                     match image is re-cropped from the satellite orthophoto at
-                     this altitude so its footprint matches the drone's actual
-                     field of view.  When None the stored 50 m database crop is
-                     used instead.
+            pil_img     PIL image from the drone camera
+            agl_m       drone altitude above ground in metres
+            center_lat  if given, restrict search to DB entries within radius_m
+            center_lon  of (center_lat, center_lon) — pass the VO-refined estimate
+            radius_m    search radius in metres (ignored when center_* is None)
 
         Returns:
             est_lat   float  — estimated latitude
@@ -213,11 +214,23 @@ class AnyLocLocalizer:
             db_idx    int    — index into the database
         """
         feats = self._patch_features(pil_img)
-        desc  = self._vlad(feats).unsqueeze(0).numpy()   # (1, D) for faiss
+        desc  = self._vlad(feats)   # (D,) normalised float32 tensor
 
-        scores, idxs = self._index.search(desc, k=1)
-        idx   = int(idxs[0, 0])
-        score = float(scores[0, 0])
+        if center_lat is not None and center_lon is not None and radius_m is not None:
+            dlat    = (self.lats - center_lat) * 111_320.0
+            dlon    = (self.lons - center_lon) * 111_320.0 * _COS_LAT
+            in_range = ((dlat ** 2 + dlon ** 2) <= radius_m ** 2) \
+                           .nonzero(as_tuple=False).squeeze(1)
+            if len(in_range) == 0:
+                in_range = torch.arange(len(self.lats))
+            sims  = self.vlads[in_range] @ desc   # cosine sim — both L2-normed
+            best  = int(sims.argmax())
+            idx   = int(in_range[best])
+            score = float(sims[best])
+        else:
+            scores_np, idxs_np = self._index.search(desc.unsqueeze(0).numpy(), k=1)
+            idx   = int(idxs_np[0, 0])
+            score = float(scores_np[0, 0])
 
         est_lat = float(self.lats[idx])
         est_lon = float(self.lons[idx])
