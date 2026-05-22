@@ -61,7 +61,7 @@ no_GPS_drone_project/
 | 2 | Virtual drone + nadir camera publishing frames | Done |
 | 3 | AnyLoc map database built from simulated views | Done |
 | 4 | AnyLoc localisation + dual postview on simulated frames | Done |
-| 5 | YOLO detection working on simulated frames | TODO |
+| 5 | YOLO detection working on simulated frames | Done |
 | 6 | ArduPilot SITL responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
 | 8 | Deploy to real hardware | TODO |
@@ -138,6 +138,18 @@ Rebuild the database if the scene or camera FOV changes:
 ```bash
 conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 ```
+
+### Run the YOLO vehicle detector (separate terminal)
+
+```bash
+DISPLAY=:2 conda run -n isaac_sim_test python detection/run_detector.py
+```
+
+A matplotlib window shows the live drone frame with bounding boxes overlaid for detected vehicles (car / motorcycle / bus / truck). Title shows vehicle count, inference time, and current drone geo. Each detection is also printed to the terminal.
+
+Uses YOLOv8n (COCO pretrained). The model weights (~6 MB) are downloaded automatically on first run.
+
+> **Note:** YOLOv8n was trained on horizontal photos, not nadir/aerial views. Detection confidence may be lower for vehicles seen directly from above. Fine-tuning on aerial imagery is the next step when accuracy needs to improve.
 
 ---
 

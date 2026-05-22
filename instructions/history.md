@@ -357,7 +357,36 @@ Without the constraint, a single wrong anchor propagates until the next large-er
 
 ---
 
-## Next session — Milestone 4 / 5
+## 2026-05-22 — YOLO vehicle detection module (Milestone 5)
+
+### What was done
+
+Created `detection/` with a working YOLOv8 vehicle detection pipeline and live postview.
+
+**Files created:**
+- `detection/detector.py` — `YOLODetector` class
+- `detection/run_detector.py` — mtime-polling postview loop
+
+**`YOLODetector` (`detector.py`):**
+- Loads `yolov8n.pt` (ultralytics YOLOv8 nano, COCO pretrained, ~6 MB, auto-downloaded on first run)
+- `detect(pil_img)` — runs inference, filters to COCO vehicle class IDs `{2: car, 3: motorcycle, 5: bus, 7: truck}`, returns list of `{label, conf, x1, y1, x2, y2}` dicts; coordinates extracted via `box.xyxy[0].tolist()` (torch-level, avoids numpy dispatch)
+- `draw(pil_img, detections)` — PIL `ImageDraw` bounding boxes + filled label chips per class colour; returns new PIL RGB image; numpy-safe
+
+**`run_detector.py`:**
+- Same mtime-polling pattern as `run_localizer.py` (polls `drone_frames/latest.jpg` every 50 ms)
+- Single matplotlib TkAgg window; `fig.canvas.draw()` + `flush_events()` for synchronous render
+- Window title: vehicle count + inference time + drone lat/lon; green title when detections present
+- Terminal: one `[YOLO]` line per detected vehicle with label, confidence, bounding box
+
+**Dependency installed:**
+- `ultralytics 8.4.52` installed via `python -m pip install ultralytics` in `isaac_sim_test`
+
+**Known limitation:**
+YOLOv8n was trained on eye-level COCO images. Nadir (top-down) vehicle views differ substantially in appearance and aspect ratio — detection confidence is lower from directly above. Fine-tuning on aerial imagery (DOTA, VisDrone) is needed for production accuracy.
+
+---
+
+## Next session — Milestone 6 / 7
 
 - Add YOLO detection module in `detection/` (reads same `drone_frames/latest.jpg`)
 - Show detection bounding-box overlay as a third postview window

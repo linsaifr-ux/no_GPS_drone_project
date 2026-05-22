@@ -160,17 +160,40 @@ Key references:
 
 ### 3. Object Detection (`detection/`)
 
-**Status:** TODO (frame source ready — reads `simulator/drone_frames/latest.jpg`)
+**Status:** Working — YOLOv8n COCO pretrained; vehicle classes (car / motorcycle / bus / truck); live annotated postview
 
-Use **YOLOv8** (or YOLOv11) to detect objects of interest from the drone's camera.
+Use **YOLOv8** to detect vehicles from the drone's nadir camera.
 
-Plan:
-1. Train or fine-tune YOLO on classes relevant to the mission (people, vehicles, targets)
-2. Run inference on rendered Isaac Sim frames during simulation
-3. Output: bounding boxes + class labels + confidence scores
-4. Pass detections to the control module to trigger flight manoeuvres
+Implementation:
+1. **Detector** (`detector.py`): `YOLODetector` wraps `ultralytics.YOLO`; `detect(pil_img)` filters inference output to COCO vehicle class IDs `{2: car, 3: motorcycle, 5: bus, 7: truck}` and returns a list of `{label, conf, x1, y1, x2, y2}` dicts; `draw(pil_img, detections)` overlays coloured bounding boxes + label chips using PIL `ImageDraw` (numpy-safe).
+2. **Postview** (`run_detector.py`): same mtime-polling pattern as `run_localizer.py`; single matplotlib TkAgg window; title shows vehicle count + inference time + drone geo; each detection printed to terminal.
 
-Frame interface: same as localization — poll `simulator/drone_frames/latest.jpg`.
+COCO vehicle class IDs and display colours:
+
+| Class | ID | Colour |
+|-------|----|--------|
+| car | 2 | red `#ff4444` |
+| motorcycle | 3 | orange `#ff8800` |
+| bus | 5 | purple `#cc44ff` |
+| truck | 7 | yellow `#ffee00` |
+
+Model: `yolov8n.pt` (nano, ~6 MB, COCO pretrained, downloaded on first run). Confidence threshold: 0.35.
+
+Run:
+```bash
+DISPLAY=:2 conda run -n isaac_sim_test python detection/run_detector.py
+```
+
+Key design choices:
+- PIL `ImageDraw` for bounding box / label rendering — avoids numpy ops (same env constraint as localizer)
+- `box.xyxy[0].tolist()` to extract coordinates — stays in torch, avoids broken numpy dispatch
+- PIL image passed directly to `model()` — ultralytics accepts PIL natively, no `np.array()` needed
+
+Known limitation: YOLOv8n was trained on horizontal (eye-level) COCO photos. Nadir/aerial vehicle views differ significantly in aspect ratio and appearance — detection confidence will be lower than in horizontal scenes. Fine-tuning on aerial vehicle imagery is needed for production accuracy.
+
+Next steps:
+- Fine-tune on an aerial vehicle dataset (e.g. DOTA, VisDrone) for nadir detection
+- Feed `{label, conf, bbox, drone_lat, drone_lon}` into `main.py` orchestrator alongside AnyLoc estimate
 
 ---
 
@@ -225,7 +248,7 @@ AnyLoc               YOLO
 | 2 | Quadcopter drone + nadir camera + HUD publishing frames | Done |
 | 3 | AnyLoc database built from simulated views | Done |
 | 4 | AnyLoc localization working on simulated frames + dual postview | Done |
-| 5 | YOLO detection working on simulated frames | TODO |
+| 5 | YOLO detection working on simulated frames | Done |
 | 6 | ArduPilot SITL connected and responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation (localize → detect → control) | TODO |
 | 8 | Deploy to real drone hardware | TODO |
