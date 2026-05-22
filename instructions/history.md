@@ -275,18 +275,85 @@ Updated `anyloc/run_localizer.py`:
 
 ## 2026-05-22 — Geo-constrained AnyLoc search
 
-### What was done
+### Motivation
 
-**Constrained AnyLoc retrieval (`anyloc/localizer.py`, `anyloc/run_localizer.py`):**
+The original AnyLoc retrieval searches all 2,821 database entries every time. Because VLAD descriptors can confuse visually similar tiles (rice paddies, rooftops, road intersections), the top-1 match occasionally jumps hundreds of metres to the wrong tile on the other side of the scene. Once that happens, the VO accumulation starts from the wrong anchor and the error compounds.
 
-After the first anchor is established, each subsequent AnyLoc retrieval is restricted to database entries within 200 m of the current VO-refined position estimate, rather than searching all 2,821 entries.
+The fix: after the first anchor is established, restrict the FAISS / similarity search to only the database entries that are geographically plausible given how far the drone could have moved since the last anchor.
 
-- `localize()` now accepts `center_lat`, `center_lon`, `radius_m` optional args
-- When a center is provided: computes Euclidean geo-distance (in metres) from all DB entries to the center using torch tensors; selects entries within `radius_m`; runs cosine similarity search (`vlads[in_range] @ desc`) on the subset (~50 entries at 200 m radius vs 2,821 full)
-- Falls back to full FAISS search if no entries fall within the radius, or on the first frame (no anchor yet)
-- `run_localizer.py` passes `center_lat = anchor_lat + accum_dlat`, `center_lon = anchor_lon + accum_dlon`, `radius_m = 200.0` to each AnyLoc call after the first anchor
+---
 
-**Why 200 m:** 50 m grid → 200 m = 4 grid steps in each direction. Worst-case drone speed ~20 m/s × ~2 s between AnyLoc runs = 40 m displacement; VO captures most of it; 200 m gives ~5× safety margin against residual VO error while covering only ~50 DB entries.
+### Implementation
+
+**`anyloc/localizer.py` — `AnyLocLocalizer.localize()`**
+
+New optional parameters:
+```
+center_lat  float  — latitude of the search centre (VO-refined estimate)
+center_lon  float  — longitude of the search centre
+radius_m    float  — search radius in metres (default unused = full search)
+```
+
+When all three are provided the method skips the FAISS index and does:
+
+```python
+# 1. Flat-Earth distance from every DB entry to the search centre
+dlat     = (self.lats - center_lat) * 111_320.0          # metres north
+dlon     = (self.lons - center_lon) * 111_320.0 * COS_LAT  # metres east
+in_range = ((dlat**2 + dlon**2) <= radius_m**2)           # boolean mask
+           .nonzero(as_tuple=False).squeeze(1)             # index tensor
+
+# 2. Cosine similarity on the subset (both desc and vlads are L2-normalised)
+sims  = self.vlads[in_range] @ desc   # (M,) — inner product = cosine sim
+best  = int(sims.argmax())
+idx   = int(in_range[best])           # index back into full DB
+score = float(sims[best])
+```
+
+The flat-Earth approximation (`111,320 m per degree lat`, scaled by `cos(lat)` for lon) introduces < 0.1 % error over the 2 km scene radius — negligible.
+
+All operations are pure torch tensors, keeping the numpy-safety rules of the `isaac_sim_test` env (no `np.array`, no numpy reductions). The subset is typically ~50 entries at 200 m radius, down from 2,821 — making this path faster than FAISS even without the index.
+
+If `in_range` is empty (VO drifted badly or first frame), the code falls back to the full FAISS IndexFlatIP search automatically.
+
+**`anyloc/run_localizer.py` — main loop**
+
+On every AnyLoc frame (every 10th frame after the first), the VO-accumulated offset is added to the last anchor to form the search centre:
+
+```python
+clat = (anchor_lat + accum_dlat) if anchor_lat is not None else None
+clon = (anchor_lon + accum_dlon) if anchor_lat is not None else None
+loc.localize(frame, agl_m=drone_agl,
+             center_lat=clat, center_lon=clon, radius_m=200.0)
+```
+
+- Frame 1: `anchor_lat is None` → `clat = None` → full FAISS search (2,821 entries)
+- Frame 10+: `clat` = VO estimate → constrained torch search (~50 entries within 200 m)
+
+---
+
+### Why 200 m radius
+
+| Factor | Value |
+|--------|-------|
+| DB grid spacing | 50 m |
+| Grid steps covered by 200 m radius | 4 in each direction |
+| Entries inside 200 m circle (approx.) | π × (200/50)² ≈ 50 |
+| Max drone speed (sim) | ~20 m/s |
+| Time between AnyLoc runs (10 f @ ~5 fps) | ~2 s |
+| Max real displacement between runs | ~40 m |
+| VO error on 40 m displacement | < 10 m typical |
+| Safety margin (200 m vs 50 m max displacement) | ~4× |
+
+200 m is the smallest radius that is robustly larger than any plausible true displacement + VO error, while still covering only ~2 % of the full database (50 / 2,821).
+
+Going smaller (e.g. 100 m) risks clipping the true position when the drone moves fast or VO drifts. Going larger (e.g. 500 m) reduces the benefit — more wrong tiles enter the candidate set.
+
+---
+
+### Effect on accuracy
+
+Without the constraint, a single wrong anchor propagates until the next large-error AnyLoc run corrects it — but that run is also unconstrained and can jump again. The constrained search makes each AnyLoc run self-correcting: even if the previous anchor was slightly off, the new search centre (anchor + VO) is close enough to the true position that the correct tile is almost always in the 200 m window.
 
 ---
 

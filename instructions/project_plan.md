@@ -119,7 +119,31 @@ Frame 10:   AnyLoc constrained search (≤~50 entries within 200 m of VO estimat
             → new anchor; reset accum; vo.reset()
 ```
 
-Constrained search prevents the retrieval from jumping to a wrong tile on the other side of the scene. Falls back to full search if no entries fall within the radius.
+#### Geo-constrained retrieval technique
+
+**Problem:** unconstrained top-1 VLAD retrieval can jump to a visually similar but geographically distant tile (e.g. two similar-looking road intersections 800 m apart). Once the anchor is wrong, the accumulated VO offset compounds the error until the next AnyLoc run — which is also unconstrained and can jump again.
+
+**Technique:** after the first anchor is established, each AnyLoc retrieval is constrained to a geographic window centred on the current VO-refined position estimate. Only the database entries inside that window are considered candidates.
+
+**Steps:**
+1. Compute the VO-refined estimate: `center = anchor + (accum_dlat, accum_dlon)`
+2. Compute flat-Earth distance from every DB entry to `center`:
+   - `d_north = (lat_i − center_lat) × 111,320 m`
+   - `d_east  = (lon_i − center_lon) × 111,320 m × cos(lat)`
+   - `dist_m  = √(d_north² + d_east²)`
+3. Select the subset `in_range` where `dist_m ≤ radius_m` (typically ~50 entries at 200 m)
+4. Compute cosine similarity on the subset only: `sims = vlads[in_range] @ desc`
+   - Both the query `desc` and stored `vlads` are L2-normalised, so inner product = cosine similarity
+5. Pick `argmax(sims)` → the best matching entry within the window
+
+**Why this works:** VO tracks features between frames and accumulates small Δlat/Δlon increments. Even with ~10 % VO drift, the accumulated error over 10 frames is well under 20 m at typical drone speeds — so the true position is always inside the 200 m window. The wrong-tile failure mode requires the true position to be inside the window but a wrong tile to score higher than the correct one. This is much less likely when the candidate pool is 50 geographically local tiles rather than 2,821 scene-wide tiles, because distant visually-similar tiles are excluded by geometry before any feature comparison.
+
+**Radius choice — 200 m:**
+- DB grid spacing: 50 m → 200 m = 4 grid steps → ~50 candidate entries
+- Max drone displacement in 10 frames (~2 s at 5 fps, 20 m/s): ~40 m
+- Typical VO residual error on 40 m: < 10 m
+- Safety margin: 200 m / 50 m ≈ 4× — robust against fast flight and VO drift
+- Fallback: if `in_range` is empty (VO diverged severely), reverts to full FAISS search
 
 Coordinate convention (verify empirically — derived analytically):
 - `raw_east = -dx_px × m_per_px_x`  (feature moved right → drone moved west)
