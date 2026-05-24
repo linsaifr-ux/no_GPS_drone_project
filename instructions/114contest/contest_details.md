@@ -230,18 +230,26 @@ R = 0   返航失敗
 | 比賽需求 | 本專案現狀 | 差距 |
 |---------|-----------|------|
 | 無GNSS自主導航 | AnyLoc + VO 視覺定位（完成） | 需整合ArduPilot自主飛行 |
-| 民用車輛辨識（初賽，3輛） | YOLOv8n COCO pretrained | COCO有car類別，但需驗證俯視角效果；車頂Logo辨識需額外處理 |
-| 民用車輛辨識（決賽） | 同上 | 同上 |
-| 軍用車輛辨識（悍馬、吉普） | YOLOv8n無此類別 | 需fine-tune或自訂模型 |
-| 油桶辨識 | YOLOv8n無此類別 | 需fine-tune |
-| 兩棲裝甲車辨識 | YOLOv8n無此類別 | 需fine-tune |
+| 民用車輛辨識（初賽，3輛） | `yolov8l_visdrone.pt`（VisDrone航拍訓練） | 已針對俯視航拍訓練；信心度閾值已降至0.30；需實測驗證車頂Logo效果 |
+| 民用車輛辨識（決賽） | 同上；fine-tune pipeline已建立 | 可用`detection/finetune.py`在VisDrone資料+合成資料上繼續fine-tune |
+| 軍用車輛辨識（悍馬、吉普） | 現有模型無此類別 | 需收集航拍軍用車輛訓練資料並fine-tune |
+| 油桶辨識 | 現有模型無此類別 | 需fine-tune |
+| 兩棲裝甲車辨識 | 現有模型無此類別 | 需fine-tune |
 | 目標定位座標輸出 | AnyLoc定位精度 ~15–20m | 定位誤差需 ≤50m 得滿分；現有精度理論上可達εᵢ=10 |
 | 飛行高度回傳 | 已有 agl_m in meta | 需整合至地面站顯示 |
 | HDMI輸出顯示 | matplotlib 視窗 | 需確認可HDMI輸出 |
 
+### 偵測模型現況（2026-05-24）
+
+| 模型 | 訓練資料 | 車輛類別 | 狀態 |
+|------|---------|---------|------|
+| `yolov8l_visdrone.pt` | VisDrone 2019 DET（航拍） | car, van, truck, tricycle, awning-tricycle, bus, motor | **目前使用中** |
+| `yolov8n.pt` | COCO（地面平視） | car, motorcycle, bus, truck | 備用基準 |
+| `detection/runs/topdown_v1/weights/best.pt` | VisDrone + 合成資料（俯視fine-tune） | car, motorcycle, bus, truck | 待訓練 |
+
 ### 關鍵結論
 
-- **初賽（僅民用車輛，3輛）：** YOLOv8n COCO pretrained 的 `car` 類別在俯視角度下可能有效，但需實測驗證。車頂Logo是重要輔助線索。
-- **決賽（4種目標類型）：** 軍用車輛、油桶、裝甲車均不在COCO類別中，必須收集航拍訓練資料並fine-tune模型。
+- **初賽（僅民用車輛，3輛）：** `yolov8l_visdrone.pt` 已針對航拍俯視場景訓練，應顯著優於COCO模型。車頂Logo辨識仍是重要輔助線索。
+- **決賽（4種目標類型）：** 軍用車輛、油桶、裝甲車不在VisDrone類別中，仍需收集航拍訓練資料並fine-tune。fine-tune pipeline已建立（`detection/finetune.py`），需補充標記資料即可啟動訓練。
 - **定位精度：** AnyLoc ~15–20m誤差 → 理論上可達 εᵢ=10（≤50m），接近滿分定位分數。
 - **最大優勢：** 無GNSS視覺定位（AnyLoc + VO）正是本次比賽核心挑戰，本專案已有完整實作。

@@ -22,7 +22,15 @@ no_GPS_drone_project/
 │   ├── run_localizer.py  # Live dual postview with AnyLoc+VO combined estimate
 │   ├── requirements.txt  # Dependency notes
 │   └── database/         # Built database (2821 entries, VLAD dim=49152, 50 m grid)
-├── detection/            # YOLO — object detection (TODO)
+├── detection/            # YOLO — object detection (WORKING)
+│   ├── detector.py       # YOLODetector — auto-detects COCO / VisDrone class maps
+│   ├── run_detector.py   # live mtime-polling postview
+│   ├── label_writer.py   # pure-Python nadir projection for synthetic label export
+│   ├── collect_training_data.py  # Isaac Sim headless synthetic data collector
+│   ├── prepare_dataset.py        # download VisDrone + remap + merge synth
+│   └── finetune.py               # YOLOv8 top-down fine-tuning script
+├── yolov8l_visdrone.pt   # YOLOv8l pre-trained on VisDrone (active model)
+├── yolov8n.pt            # YOLOv8n COCO pretrained (baseline)
 ├── control/              # ArduPilot MAVLink interface (TODO)
 └── main.py               # Top-level orchestrator (TODO)
 ```
@@ -160,39 +168,63 @@ Key references:
 
 ### 3. Object Detection (`detection/`)
 
-**Status:** Working — YOLOv8n COCO pretrained; vehicle classes (car / motorcycle / bus / truck); live annotated postview
+**Status:** Working — `yolov8l_visdrone.pt` (VisDrone-trained); auto class-map; fine-tuning pipeline ready to run
 
 Use **YOLOv8** to detect vehicles from the drone's nadir camera.
 
-Implementation:
-1. **Detector** (`detector.py`): `YOLODetector` wraps `ultralytics.YOLO`; `detect(pil_img)` filters inference output to COCO vehicle class IDs `{2: car, 3: motorcycle, 5: bus, 7: truck}` and returns a list of `{label, conf, x1, y1, x2, y2}` dicts; `draw(pil_img, detections)` overlays coloured bounding boxes + label chips using PIL `ImageDraw` (numpy-safe).
-2. **Postview** (`run_detector.py`): same mtime-polling pattern as `run_localizer.py`; single matplotlib TkAgg window; title shows vehicle count + inference time + drone geo; each detection printed to terminal.
+#### Active model
 
-COCO vehicle class IDs and display colours:
+`yolov8l_visdrone.pt` — YOLOv8-large pre-trained on VisDrone 2019 DET (10 aerial vehicle classes). Confidence threshold: 0.30.
 
-| Class | ID | Colour |
-|-------|----|--------|
-| car | 2 | red `#ff4444` |
-| motorcycle | 3 | orange `#ff8800` |
-| bus | 5 | purple `#cc44ff` |
-| truck | 7 | yellow `#ffee00` |
+#### Implementation
 
-Model: `yolov8n.pt` (nano, ~6 MB, COCO pretrained, downloaded on first run). Confidence threshold: 0.35.
+1. **Detector** (`detector.py`): `YOLODetector` wraps `ultralytics.YOLO`. Class mapping is built automatically at load time from `model.names` via a canonical name dict (`_NAME_TO_LABEL`) — supports both COCO and VisDrone models without code changes. `detect(pil_img)` returns `{label, conf, x1, y1, x2, y2}` dicts; `draw()` overlays coloured boxes via PIL `ImageDraw` (numpy-safe).
+
+2. **Postview** (`run_detector.py`): same mtime-polling pattern as `run_localizer.py`; single matplotlib TkAgg window; title: vehicle count + inference time + drone geo.
+
+VisDrone → canonical class map (active):
+
+| VisDrone class | ID | Canonical label | Colour |
+|----------------|----|-----------------|--------|
+| car | 3 | car | red `#ff4444` |
+| van | 4 | car | red `#ff4444` |
+| truck | 5 | truck | yellow `#ffee00` |
+| tricycle | 6 | motorcycle | orange `#ff8800` |
+| awning-tricycle | 7 | motorcycle | orange `#ff8800` |
+| bus | 8 | bus | purple `#cc44ff` |
+| motor | 9 | motorcycle | orange `#ff8800` |
 
 Run:
 ```bash
 DISPLAY=:2 conda run -n isaac_sim_test python detection/run_detector.py
 ```
 
-Key design choices:
-- PIL `ImageDraw` for bounding box / label rendering — avoids numpy ops (same env constraint as localizer)
-- `box.xyxy[0].tolist()` to extract coordinates — stays in torch, avoids broken numpy dispatch
-- PIL image passed directly to `model()` — ultralytics accepts PIL natively, no `np.array()` needed
+#### Fine-tuning pipeline (top-down specific)
 
-Known limitation: YOLOv8n was trained on horizontal (eye-level) COCO photos. Nadir/aerial vehicle views differ significantly in aspect ratio and appearance — detection confidence will be lower than in horizontal scenes. Fine-tuning on aerial vehicle imagery is needed for production accuracy.
+Four scripts implement the full fine-tuning workflow:
 
-Next steps:
-- Fine-tune on an aerial vehicle dataset (e.g. DOTA, VisDrone) for nadir detection
+| Script | Env | Purpose |
+|--------|-----|---------|
+| `collect_training_data.py` | `isaac_sim_test` (headless) | Fly grid at 30/60/100 m AGL; export JPEG + YOLO labels for 43 vehicles |
+| `prepare_dataset.py` | any ultralytics env | Download VisDrone (auto via ultralytics); remap to 4 classes; merge synth |
+| `finetune.py` | any ultralytics env (GPU) | 100 epochs, `degrees=45`, `scale=0.5`, `mosaic=1.0`, `flipud=0.5` |
+| `label_writer.py` | shared lib | Pure-Python nadir projection; no numpy; safe inside `isaac_sim_test` |
+
+Dataset after `prepare_dataset.py`:
+- Source: VisDrone 2019 DET train (~7k images) + synthetic frames
+- Classes: `[car, motorcycle, bus, truck]` (nc=4)
+- Layout: `detection/dataset/{images,labels}/{train,val}/`
+
+Best weights after training: `detection/runs/topdown_v1/weights/best.pt`
+
+Key design choices (all scripts):
+- PIL `ImageDraw` for bounding box rendering — avoids numpy ops
+- `box.xyxy[0].tolist()` to extract coordinates — stays in torch
+- PIL image passed directly to `model()` — no `np.array()` needed
+- `label_writer.py` uses pure Python math — safe inside `isaac_sim_test`
+- `collect_training_data.py` uses `Image.frombytes()` instead of `.astype()` on the replicator buffer
+
+Next step:
 - Feed `{label, conf, bbox, drone_lat, drone_lon}` into `main.py` orchestrator alongside AnyLoc estimate
 
 ---
@@ -249,6 +281,8 @@ AnyLoc               YOLO
 | 3 | AnyLoc database built from simulated views | Done |
 | 4 | AnyLoc localization working on simulated frames + dual postview | Done |
 | 5 | YOLO detection working on simulated frames | Done |
+| 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
+| 5b | Top-down fine-tuning pipeline (VisDrone + synthetic data) | Ready to run |
 | 6 | ArduPilot SITL connected and responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation (localize → detect → control) | TODO |
 | 8 | Deploy to real drone hardware | TODO |

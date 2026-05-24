@@ -1,13 +1,27 @@
 """
 YOLO vehicle detector — wraps ultralytics YOLOv8 and filters to vehicle classes.
+
+Supports both COCO-trained models and VisDrone-trained models by reading the
+model's own class names and mapping them to four canonical labels:
+  car  motorcycle  bus  truck
 """
 from __future__ import annotations
 
 from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
-# COCO class IDs for vehicles
-_VEHICLE_IDS = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+# Map any known class name → canonical vehicle label.
+# Covers COCO names, VisDrone names, and common fine-tuned variants.
+_NAME_TO_LABEL: dict[str, str] = {
+    'car':             'car',
+    'van':             'car',         # VisDrone
+    'motorcycle':      'motorcycle',  # COCO
+    'motor':           'motorcycle',  # VisDrone
+    'tricycle':        'motorcycle',  # VisDrone
+    'awning-tricycle': 'motorcycle',  # VisDrone
+    'bus':             'bus',
+    'truck':           'truck',
+}
 
 _COLORS = {
     'car':        '#ff4444',
@@ -31,7 +45,15 @@ class YOLODetector:
         print(f"[YOLO] Loading {model_name} …")
         self.model = YOLO(model_name)
         self.conf  = conf
-        print(f"[YOLO] Model ready  conf_threshold={conf}")
+
+        # Build {class_id: canonical_label} from the model's own class names
+        self._filter: dict[int, str] = {
+            cid: _NAME_TO_LABEL[name]
+            for cid, name in self.model.names.items()
+            if name in _NAME_TO_LABEL
+        }
+        print(f"[YOLO] Model ready  classes={list(self._filter.values())}  "
+              f"conf_threshold={conf}")
 
     def detect(self, pil_img: Image.Image) -> list[dict]:
         """
@@ -46,11 +68,11 @@ class YOLODetector:
         out = []
         for box in results.boxes:
             cls_id = int(box.cls[0])
-            if cls_id not in _VEHICLE_IDS:
+            if cls_id not in self._filter:
                 continue
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             out.append({
-                'label': _VEHICLE_IDS[cls_id],
+                'label': self._filter[cls_id],
                 'conf':  float(box.conf[0]),
                 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
             })

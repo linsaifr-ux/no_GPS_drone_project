@@ -19,8 +19,10 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 HERE      = os.path.dirname(os.path.abspath(__file__))
-FRAME_JPG = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest.jpg'))
-META_JSON = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest_meta.json'))
+ROOT      = os.path.abspath(os.path.join(HERE, '..'))
+FRAME_JPG = os.path.join(ROOT, 'simulator', 'drone_frames', 'latest.jpg')
+META_JSON = os.path.join(ROOT, 'simulator', 'drone_frames', 'latest_meta.json')
+MODEL_PT  = os.path.join(ROOT, 'yolov8l_visdrone.pt')
 
 sys.path.insert(0, HERE)
 from detector import YOLODetector
@@ -35,7 +37,7 @@ def pil_to_rgb_array(pil_img, size=(640, 480)):
 
 
 def main():
-    det = YOLODetector(model_name='yolov8n.pt', conf=0.35)
+    det = YOLODetector(model_name=MODEL_PT, conf=0.30)
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 6.4), layout='constrained')
     fig.patch.set_facecolor('#1a1a1a')

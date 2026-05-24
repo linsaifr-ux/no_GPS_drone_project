@@ -118,6 +118,107 @@ def upath(base):
     while p in _used: i += 1; p = f"{base}_{i}"
     _used.add(p); return p
 
+def _box(path, w, l, h, tx=0.0, ty=0.0, tz=0.0, mat=None):
+    """Axis-aligned box: w=X width, l=Y length, h=Z height, center at (tx,ty,tz)."""
+    b = UsdGeom.Cube.Define(stage, path)
+    b.CreateSizeAttr(1.0)
+    xf = UsdGeom.Xformable(b)
+    xf.AddTranslateOp().Set(Gf.Vec3d(tx, ty, tz))
+    xf.AddScaleOp().Set(Gf.Vec3f(w, l, h))
+    if mat:
+        bind(b.GetPrim(), mat)
+    return b
+
+def _cyl(path, r, h, axis="Z", tx=0.0, ty=0.0, tz=0.0, mat=None):
+    """Cylinder with given radius, height, and long-axis direction."""
+    c = UsdGeom.Cylinder.Define(stage, path)
+    c.CreateRadiusAttr(r)
+    c.CreateHeightAttr(h)
+    c.CreateAxisAttr(axis)
+    UsdGeom.Xformable(c).AddTranslateOp().Set(Gf.Vec3d(tx, ty, tz))
+    if mat:
+        bind(c.GetPrim(), mat)
+    return c
+
+
+def make_car(root_path, car_lat, car_lon, yaw_deg=0.0):
+    """
+    Build a white sedan (Toyota Altis class) from USD primitives.
+
+    Coordinate convention (local frame):
+        +Y = car front,  +X = car right,  +Z = up
+        root placed at (car_x, car_y, centre_elev) so wheels touch terrain.
+
+    yaw_deg: compass heading of front (0=N, 90=E, 180=S, 270=W).
+    In this scene X=East, Y=North, Z=Up; front=+Y at yaw=0 → RotateZ(0) is north.
+    Compass to USD RotateZ: usd_rot = -(compass - 0) since rotating CCW from +Y to +X
+    is the same as +yaw in compass. Actually: RotateZ(θ) rotates +X toward +Y by θ.
+    Front is +Y; compass N=0 wants front=+Y → RotateZ(0). Compass E=90 wants front=+X
+    → RotateZ(-90). So usd_rot = -yaw_deg (compass).
+
+    Approximate dimensions (Toyota Altis):
+        Length 4.64 m, Width 1.775 m, Height 1.45 m, Wheelbase 2.70 m
+    """
+    car_x, car_y = to_xy(car_lat, car_lon)
+    car_z = centre_elev   # bottom of car at terrain level
+
+    # ── Materials ─────────────────────────────────────────────────────────────
+    P = root_path
+    m_body  = pbr_mat(P+"/M_Body",  (0.92, 0.92, 0.90), metallic=0.5,  roughness=0.25)
+    m_glass = pbr_mat(P+"/M_Glass", (0.04, 0.06, 0.16), metallic=0.0,  roughness=0.08)
+    m_tire  = pbr_mat(P+"/M_Tire",  (0.07, 0.07, 0.07), metallic=0.0,  roughness=0.95)
+    m_rim   = pbr_mat(P+"/M_Rim",   (0.72, 0.73, 0.78), metallic=0.90, roughness=0.20)
+    m_tail  = pbr_mat(P+"/M_Tail",  (0.88, 0.06, 0.04), metallic=0.1,  roughness=0.25)
+    m_head  = pbr_mat(P+"/M_Head",  (0.95, 0.93, 0.82), metallic=0.2,  roughness=0.12)
+    m_logo  = pbr_mat(P+"/M_Logo",  (0.06, 0.09, 0.22), metallic=0.0,  roughness=0.55)
+    m_under = pbr_mat(P+"/M_Under", (0.10, 0.10, 0.10), metallic=0.0,  roughness=0.90)
+
+    # ── Root xform ────────────────────────────────────────────────────────────
+    car = UsdGeom.Xform.Define(stage, root_path)
+    xf  = UsdGeom.Xformable(car)
+    xf.AddTranslateOp().Set(Gf.Vec3d(car_x, car_y, car_z))
+    xf.AddRotateZOp().Set(float(-yaw_deg))   # compass → USD
+
+    # ── Body ──────────────────────────────────────────────────────────────────
+    #                                W      L      H      cx    cy     cz
+    _box(P+"/Under",    1.50,  4.00,  0.18,   0.0,  0.0,   0.09, m_under)  # chassis floor
+    _box(P+"/Body",     1.775, 4.40,  0.64,   0.0,  0.0,   0.49, m_body)   # lower body / doors
+    _box(P+"/Cabin",    1.62,  2.20,  0.62,   0.0, -0.15,  1.12, m_body)   # greenhouse / roof
+    _box(P+"/Hood",     1.72,  1.10,  0.04,   0.0,  1.62,  0.83, m_body)   # hood top surface
+    _box(P+"/Trunk",    1.72,  0.82,  0.04,   0.0, -1.74,  0.80, m_body)   # trunk lid
+    _box(P+"/BumpF",    1.76,  0.12,  0.44,   0.0,  2.26,  0.25, m_body)   # front bumper
+    _box(P+"/BumpR",    1.76,  0.12,  0.38,   0.0, -2.26,  0.22, m_body)   # rear bumper
+
+    # ── Windows (dark tinted glass) ───────────────────────────────────────────
+    _box(P+"/WinF",  0.05, 1.50, 0.48,   0.0,  1.00,  1.11, m_glass)  # windshield
+    _box(P+"/WinR",  0.05, 1.48, 0.38,   0.0, -0.88,  1.10, m_glass)  # rear window
+    _box(P+"/WinL",  1.58, 0.05, 0.34,  -0.81,-0.15,  1.10, m_glass)  # left side
+    _box(P+"/WinRt", 1.58, 0.05, 0.34,   0.81,-0.15,  1.10, m_glass)  # right side
+
+    # ── Lights ────────────────────────────────────────────────────────────────
+    _box(P+"/HdL",   0.34, 0.08, 0.18,  -0.60, 2.25, 0.68, m_head)   # headlight L
+    _box(P+"/HdR",   0.34, 0.08, 0.18,   0.60, 2.25, 0.68, m_head)   # headlight R
+    _box(P+"/TlL",   0.44, 0.07, 0.16,  -0.55,-2.25, 0.66, m_tail)   # taillight L
+    _box(P+"/TlR",   0.44, 0.07, 0.16,   0.55,-2.25, 0.66, m_tail)   # taillight R
+
+    # ── Wheels — axis=X so the disc lies in the Y-Z plane; front is +Y ───────
+    WR = 0.32   # tire radius
+    WT = 0.22   # tire width
+    RR = 0.20   # rim radius
+    RT = 0.18   # rim width
+    WX = 0.88   # lateral offset from car centreline (half-track ≈ 1.52 m)
+    for sx, fy, tag in [(-WX, 1.35, "FL"), (WX, 1.35, "FR"),
+                         (-WX,-1.35, "RL"), (WX,-1.35, "RR")]:
+        _cyl(P+f"/Tire{tag}", WR, WT, "X", sx, fy, WR, m_tire)
+        _cyl(P+f"/Rim{tag}",  RR, RT, "X", sx, fy, WR, m_rim)
+
+    # ── Contest logo panel on roof centre ─────────────────────────────────────
+    # Represents the UAV Defense Challenge logo placed on the roof for identification.
+    _box(P+"/Logo", 0.40, 0.40, 0.02,  0.0, -0.15, 1.45, m_logo)
+
+    print(f"[CAR] {root_path}  ({car_lat:.6f}N, {car_lon:.6f}E)"
+          f"  ENU=({car_x:.1f}, {car_y:.1f}) m  yaw={yaw_deg}°")
+
 # ── CESIUM ION ENDPOINT ────────────────────────────────────────────────────────
 def fetch_ion_endpoint(asset_id: int):
     """Return (tileset_url, access_token, base_url) for a Cesium ion asset."""
@@ -679,6 +780,10 @@ for tile_url in building_tiles:
         n_bld += 1
 
 print(f"[CESIUM] Loaded {n_bld} buildings")
+
+# ── TARGET VEHICLES ────────────────────────────────────────────────────────────
+make_car("/World/Car_01", 23.452028, 120.283829, yaw_deg=0.0)
+print("[CESIUM] Car placed at 23.452028, 120.283829")
 
 # ── VIEWPORT CAMERA ────────────────────────────────────────────────────────────
 cam = UsdGeom.Camera.Define(stage, "/World/Camera")

@@ -46,7 +46,15 @@ no_GPS_drone_project/
 │   ├── localizer.py       # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
 │   ├── run_localizer.py   # live dual postview
 │   └── database/          # 2821-entry VLAD database (49152-dim, 50 m grid)
-├── detection/             # YOLO — TODO
+├── detection/             # YOLO — WORKING
+│   ├── detector.py        # YOLODetector (auto-detects COCO / VisDrone class maps)
+│   ├── run_detector.py    # live annotated postview
+│   ├── label_writer.py    # nadir projection math for synthetic label generation
+│   ├── collect_training_data.py  # Isaac Sim headless synthetic data collector
+│   ├── prepare_dataset.py # download VisDrone + remap classes + merge synth data
+│   └── finetune.py        # fine-tune YOLOv8 on the top-down dataset
+├── yolov8l_visdrone.pt    # YOLOv8l pre-trained on VisDrone (10 aerial classes)
+├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
 ├── control/               # ArduPilot MAVLink — TODO
 └── main.py                # top-level orchestrator — TODO
 ```
@@ -62,6 +70,8 @@ no_GPS_drone_project/
 | 3 | AnyLoc map database built from simulated views | Done |
 | 4 | AnyLoc localisation + dual postview on simulated frames | Done |
 | 5 | YOLO detection working on simulated frames | Done |
+| 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
+| 5b | Top-down fine-tuning pipeline (VisDrone dataset + synthetic data) | Ready to run |
 | 6 | ArduPilot SITL responding to MAVLink commands | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
 | 8 | Deploy to real hardware | TODO |
@@ -147,9 +157,25 @@ DISPLAY=:2 conda run -n isaac_sim_test python detection/run_detector.py
 
 A matplotlib window shows the live drone frame with bounding boxes overlaid for detected vehicles (car / motorcycle / bus / truck). Title shows vehicle count, inference time, and current drone geo. Each detection is also printed to the terminal.
 
-Uses YOLOv8n (COCO pretrained). The model weights (~6 MB) are downloaded automatically on first run.
+Currently uses **`yolov8l_visdrone.pt`** — a YOLOv8-large model pre-trained on VisDrone 2019 DET (10 aerial vehicle classes). The detector auto-maps VisDrone class names to the four canonical labels (car, motorcycle, bus, truck) at load time, so it also works with COCO-trained models without code changes.
 
-> **Note:** YOLOv8n was trained on horizontal photos, not nadir/aerial views. Detection confidence may be lower for vehicles seen directly from above. Fine-tuning on aerial imagery is the next step when accuracy needs to improve.
+#### Fine-tune for better top-down accuracy
+
+A full fine-tuning pipeline is included. Run in order:
+
+```bash
+# 1. Generate synthetic labeled frames from Isaac Sim (headless, ~10–20 min)
+OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test \
+    python detection/collect_training_data.py
+
+# 2. Download VisDrone + convert to 4-class YOLO format (~30 min download)
+python detection/prepare_dataset.py
+
+# 3. Fine-tune YOLOv8n (GPU recommended, ~2 h for 100 epochs)
+python detection/finetune.py
+```
+
+The best weights are saved to `detection/runs/topdown_v1/weights/best.pt`. Update `run_detector.py` to use them.
 
 ---
 

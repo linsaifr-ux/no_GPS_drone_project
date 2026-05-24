@@ -386,8 +386,58 @@ YOLOv8n was trained on eye-level COCO images. Nadir (top-down) vehicle views dif
 
 ---
 
-## Next session — Milestone 6 / 7
+---
 
-- Add YOLO detection module in `detection/` (reads same `drone_frames/latest.jpg`)
-- Show detection bounding-box overlay as a third postview window
-- Connect AnyLoc estimate + YOLO detections into `main.py` orchestrator
+## 2026-05-23 — Top-down YOLO fine-tuning pipeline
+
+### What was done
+
+Built a complete fine-tuning pipeline for adapting YOLOv8 to nadir (top-down) aerial vehicle detection. The existing `yolov8n.pt` was trained on eye-level COCO photos; this session adds the infrastructure to train on aerial imagery.
+
+**Files created:**
+
+- `detection/label_writer.py` — pure-Python nadir camera projection; given drone ENU position + vehicle position / yaw / class, projects the 4 footprint corners through the camera (fx=fy=320, 640×480) and returns a normalised YOLO bounding box. No numpy — safe inside `isaac_sim_test` env.
+
+- `detection/collect_training_data.py` — Isaac Sim headless synthetic data collector. Builds a flat scene with 43 coloured vehicle boxes (25 cars, 8 motos, 4 buses, 6 trucks at random positions / yaws). Flies a grid at 30 m / 60 m / 100 m AGL with 35 % lateral overlap. At each of ~70 grid positions, captures a frame and writes a YOLO label via `label_writer`. Uses `Image.frombytes("RGBA", ...)` instead of `.astype()` to safely convert the replicator buffer inside the broken-numpy env.
+
+- `detection/prepare_dataset.py` — downloads VisDrone 2019 DET via `ultralytics.data.utils.check_det_dataset("VisDrone.yaml")`; remaps 7 VisDrone classes to 4 targets (`car/motorcycle/bus/truck`); symlinks images and writes YOLO `.txt` labels into `detection/dataset/{images,labels}/{train,val}/`; merges any synthetic data from `detection/dataset/synth/`; writes `data.yaml`.
+
+  VisDrone → canonical map: car(4)→car, van(5)→car, truck(6)→truck, tricycle(7)→moto, awning-tricycle(8)→moto, bus(9)→bus, motor(10)→moto.
+
+- `detection/finetune.py` — loads `yolov8n.pt`, trains 100 epochs with augmentations tuned for nadir aerial: `degrees=45`, `flipud=0.5`, `scale=0.5` (altitude variation), `mosaic=1.0` (small objects), `hsv_v=0.4` (lighting variation). Saves to `detection/runs/topdown_v1/weights/best.pt`.
+
+---
+
+## 2026-05-24 — Switched to yolov8l_visdrone.pt; auto class-map in detector
+
+### What was done
+
+Switched the active detection model from `yolov8n.pt` (COCO) to `yolov8l_visdrone.pt` (YOLOv8-large, pre-trained on VisDrone 2019 DET). This immediately improves aerial vehicle detection without any training.
+
+**`detection/detector.py` — refactored class mapping:**
+
+Replaced the hardcoded COCO class ID dict `{2: 'car', 3: 'motorcycle', ...}` with a name-based lookup built at load time:
+
+```python
+_NAME_TO_LABEL = {
+    'car': 'car', 'van': 'car',
+    'truck': 'truck',
+    'bus': 'bus',
+    'motorcycle': 'motorcycle', 'motor': 'motorcycle',
+    'tricycle': 'motorcycle', 'awning-tricycle': 'motorcycle',
+}
+
+self._filter = {
+    cid: _NAME_TO_LABEL[name]
+    for cid, name in self.model.names.items()
+    if name in _NAME_TO_LABEL
+}
+```
+
+`self._filter` is built from `model.names` so the same `YOLODetector` class works for both COCO and VisDrone models — no code change needed when swapping models.
+
+VisDrone model class map: `{3: car, 4: car, 5: truck, 6: motorcycle, 7: motorcycle, 8: bus, 9: motorcycle}` — 7 aerial vehicle classes covered.
+
+**`detection/run_detector.py`:**
+- Added `MODEL_PT = os.path.join(ROOT, 'yolov8l_visdrone.pt')`
+- Changed `YOLODetector('yolov8n.pt', conf=0.35)` → `YOLODetector(MODEL_PT, conf=0.30)` (lower threshold appropriate for a model already trained on aerial imagery)
