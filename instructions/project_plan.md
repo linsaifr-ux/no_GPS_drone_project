@@ -231,43 +231,129 @@ Next step:
 
 ### 4. Flight Control (`control/`)
 
-**Status:** TODO
+**Status:** In progress — ArduPilot SITL + MAVLink next; IMU fusion after
 
-Interface with **ArduPilot** via MAVLink to command the drone.
+#### Architecture decision (2026-05-27)
 
-Plan:
-1. **Simulation:** ArduPilot SITL (Software In The Loop) — no real hardware needed
-   - Connect MAVLink to SITL over UDP
-   - Use `pymavlink` or `dronekit` to send commands
-2. **Real hardware:** swap SITL connection for serial/UDP to a real flight controller
-3. Behaviours to implement:
-   - Takeoff / land
-   - Waypoint navigation using AnyLoc position estimates
-   - Hover and track a detected object
-   - Return to launch on localization failure
+Build ArduPilot SITL + MAVLink first, then IMU fusion. On real hardware IMU data arrives via MAVLink `HIGHRES_IMU` messages — building the reader against MAVLink now means zero interface changes at deployment. ArduPilot SITL's own sensor models (bias drift, noise, temperature effects) are also more realistic than analytical derivatives from position data.
+
+#### Step 1 — ArduPilot SITL + Isaac Sim JSON bridge (`control/sitl_bridge.py`)
+
+ArduPilot SITL has a **JSON backend** designed for external simulators. Isaac Sim sends the drone physics state each step; SITL runs its sensor pipeline and outputs MAVLink.
+
+```
+Isaac Sim  ──JSON/UDP──►  ArduPilot SITL  ──MAVLink UDP:14550──►  control code
+(physics state)           (sensor models)                          (pymavlink)
+```
+
+Run SITL:
+```bash
+sim_vehicle.py -v ArduCopter --model=JSON --console
+```
+
+`sitl_bridge.py` runs alongside the Isaac Sim loop:
+- Reads drone ENU position, velocity, attitude from `cesium_scene.py` each step
+- Converts ENU → NED (ArduPilot convention: X=North, Y=East, Z=Down)
+- Sends JSON UDP packet to SITL on each sim step:
+
+```json
+{
+  "timestamp": 1234.5,
+  "imu_angular_velocity_rpy": [roll_rate, pitch_rate, yaw_rate],
+  "imu_linear_acceleration_xyz": [ax, ay, az],
+  "imu_temperature": 25.0,
+  "pressure": 101325.0,
+  "position_xyz": [north_m, east_m, -alt_m],
+  "attitude_rpy": [roll, pitch, yaw],
+  "velocity_xyz": [vn, ve, -vz]
+}
+```
+
+#### Step 2 — MAVLink command interface (`control/mavlink_ctrl.py`)
+
+`pymavlink` connects to SITL's MAVLink output (UDP:14550).
+
+Subscribe to:
+- `HEARTBEAT` — connection health
+- `HIGHRES_IMU` — accel (m/s²) + gyro (rad/s) + mag
+- `ATTITUDE` — roll, pitch, yaw, rates
+- `LOCAL_POSITION_NED` — NED position + velocity
+- `GLOBAL_POSITION_INT` — lat/lon/alt
+
+Send:
+- `SET_POSITION_TARGET_LOCAL_NED` — replaces keyboard control for planned paths
+- `MISSION` items — for pre-planned waypoint sequences
+- `COMMAND_LONG` — arming, takeoff, RTL
+
+Planned-path flight replaces the current keyboard Xform control in `cesium_scene.py`. The drone follows MAVLink commands, making the simulation match real deployment behaviour.
+
+#### Step 3 — IMU data via MAVLink (`control/imu_reader.py`)
+
+Reads `HIGHRES_IMU` from the MAVLink stream and publishes alongside `latest_meta.json`:
+
+```python
+imu_fields = {
+    "accel_xyz": [xacc, yacc, zacc],   # m/s² — includes gravity
+    "gyro_xyz":  [xgyro, ygyro, zgyro], # rad/s
+    "timestamp_us": time_usec
+}
+```
+
+This is the same message format a real ArduPilot flight controller sends — no code changes needed at hardware deployment.
+
+#### Step 4 — IMU fusion into localization (`control/imu_fusion.py`)
+
+IMU data is used as a sanity check on AnyLoc anchor updates, not as a primary position estimate:
+
+1. **Anchor validator** — if a new AnyLoc anchor deviates more than `jump_threshold` from the IMU dead-reckoned position, reject the anchor and hold the current VO estimate
+2. **VO quality gate** — if IMU detects high angular velocity or linear acceleration spikes, mark that VO frame as unreliable and skip the accumulation step
+3. **Dead-reckoning fallback** — if both AnyLoc and VO fail (low feature count + bad scores), use IMU double-integration for short bridging intervals
+
+Files to create (in order):
+
+| File | Purpose |
+|------|---------|
+| `control/sitl_bridge.py` | Isaac Sim → ArduPilot SITL JSON/UDP sender |
+| `control/mavlink_ctrl.py` | pymavlink subscriber + command sender |
+| `control/imu_reader.py` | HIGHRES_IMU reader, writes to shared state |
+| `control/imu_fusion.py` | IMU-based anchor validation + VO quality gate |
+
+Real hardware path: swap SITL UDP address for serial/UDP to the real flight controller — no other changes needed.
 
 ---
 
 ## Integration Flow
 
 ```
-Isaac Sim (or real camera)
-        │
-        ▼
-   Camera frame (RGB)
-        │
-   ┌────┴─────────────────┐
-   │                      │
-   ▼                      ▼
-AnyLoc               YOLO
-(position estimate)  (detections)
-   │                      │
-   └────────┬─────────────┘
-            ▼
-       main.py (orchestrator)
-            │
-            ▼
-     ArduPilot (SITL or real)
+Isaac Sim
+    │ physics state (JSON/UDP each step)
+    ▼
+ArduPilot SITL  ──MAVLink UDP:14550──►  control/mavlink_ctrl.py
+    │                                        │
+    │                                   ┌────┴──────────────┐
+    │                                   ▼                   ▼
+    │                            imu_reader.py        command sender
+    │                            (HIGHRES_IMU)        (SET_POSITION_TARGET)
+    │
+    │  drone_frames/latest.jpg + latest_meta.json
+    ▼
+   ┌────────────────────────┐
+   │                        │
+   ▼                        ▼
+AnyLoc + VO             YOLO
+(position estimate)     (detections)
+   │
+   ▼
+imu_fusion.py  ◄── IMU data
+(anchor validator + VO gate)
+   │
+   └────────────────────────┐
+                            ▼
+                       main.py (orchestrator)
+                            │
+                            ▼
+                     MAVLink commands
+                     → ArduPilot SITL / real FC
 ```
 
 ---
@@ -283,6 +369,9 @@ AnyLoc               YOLO
 | 5 | YOLO detection working on simulated frames | Done |
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone + synthetic data) | Ready to run |
-| 6 | ArduPilot SITL connected and responding to MAVLink commands | TODO |
-| 7 | Full pipeline integrated in simulation (localize → detect → control) | TODO |
+| 6a | ArduPilot SITL running + Isaac Sim JSON bridge (physics state → SITL) | TODO |
+| 6b | MAVLink command interface: planned-path flight via SET_POSITION_TARGET | TODO |
+| 6c | IMU data via HIGHRES_IMU MAVLink message feeding localization pipeline | TODO |
+| 6d | IMU fusion: anchor validator + VO quality gate in localization | TODO |
+| 7 | Full pipeline integrated: AnyLoc + VO + IMU → ArduPilot commands | TODO |
 | 8 | Deploy to real drone hardware | TODO |

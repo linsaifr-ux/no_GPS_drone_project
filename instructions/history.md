@@ -441,3 +441,43 @@ VisDrone model class map: `{3: car, 4: car, 5: truck, 6: motorcycle, 7: motorcyc
 **`detection/run_detector.py`:**
 - Added `MODEL_PT = os.path.join(ROOT, 'yolov8l_visdrone.pt')`
 - Changed `YOLODetector('yolov8n.pt', conf=0.35)` → `YOLODetector(MODEL_PT, conf=0.30)` (lower threshold appropriate for a model already trained on aerial imagery)
+
+---
+
+## 2026-05-27 — Architecture decisions: ArduPilot SITL + MAVLink + IMU
+
+### Decisions made
+
+**1. ArduPilot SITL + MAVLink before IMU implementation**
+
+On real hardware, IMU data arrives via MAVLink `HIGHRES_IMU` messages from the flight controller. Building the IMU reader against MAVLink now means zero interface changes at deployment. ArduPilot SITL's sensor pipeline also provides realistic noise, bias drift, and temperature effects that analytical position derivatives cannot replicate.
+
+Build order:
+1. `control/sitl_bridge.py` — Isaac Sim → ArduPilot SITL JSON/UDP physics state bridge
+2. `control/mavlink_ctrl.py` — pymavlink subscriber + `SET_POSITION_TARGET_LOCAL_NED` sender
+3. `control/imu_reader.py` — reads `HIGHRES_IMU` from MAVLink stream
+4. `control/imu_fusion.py` — uses IMU to validate AnyLoc anchors + gate VO quality
+
+**2. Physics-based IMU via ArduPilot SITL JSON backend (not analytical derivatives)**
+
+ArduPilot SITL receives the drone's physics state from Isaac Sim each step (position, velocity, acceleration, attitude in NED), runs its own sensor models, and outputs `HIGHRES_IMU` over MAVLink — the same message format a real ArduPilot FC sends.
+
+**3. IMU role in localization: sanity check on AnyLoc anchors**
+
+Context: the geo-constrained AnyLoc search (200 m window) prevents most bad jumps, but if the constraint window itself drifts (wrong anchor accepted), the system cannot self-correct. IMU dead-reckoning provides an independent position estimate to validate new anchors:
+
+- If new AnyLoc anchor deviates > `jump_threshold` from IMU-predicted position → reject anchor
+- If IMU detects high angular velocity / acceleration spike → skip VO accumulation for that frame
+- If both AnyLoc and VO fail → use IMU dead-reckoning for short bridging intervals
+
+### Architecture
+
+```
+Isaac Sim physics state (JSON/UDP, each step)
+    ↓
+ArduPilot SITL (JSON backend)
+    ↓ MAVLink UDP:14550
+    ├─ HIGHRES_IMU → imu_reader.py → imu_fusion.py (anchor validator + VO gate)
+    ├─ ATTITUDE, LOCAL_POSITION_NED → state estimation
+    └─ accepts SET_POSITION_TARGET_LOCAL_NED (replaces keyboard control)
+```

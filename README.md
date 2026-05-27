@@ -10,22 +10,29 @@ Autonomous drone system that localises itself and detects objects without GPS, v
 ## Pipeline
 
 ```
-Isaac Sim (or real camera)
-        │
-        ▼
-  drone_frames/latest.jpg   (640×480 nadir RGB, ~6 Hz)
-        │
-   ┌────┴──────────────────┐
-   ▼                       ▼
-AnyLoc                  YOLO
-(position estimate)     (bounding boxes)
-   │                       │
-   └───────────┬───────────┘
-               ▼
-          main.py (orchestrator)
-               │
-               ▼
-        ArduPilot (SITL or real)
+Isaac Sim
+    │ physics state (JSON/UDP)
+    ▼
+ArduPilot SITL ──MAVLink──► HIGHRES_IMU → imu_fusion.py (anchor validator)
+    │                    └─► SET_POSITION_TARGET ◄── main.py
+    │
+    │  drone_frames/latest.jpg + latest_meta.json
+    ▼
+ ┌──────────────────────┐
+ ▼                      ▼
+AnyLoc + VO           YOLO
+(position estimate)   (bounding boxes)
+ │
+ ▼
+imu_fusion.py → validated position
+ │
+ └──────────────────────┐
+                        ▼
+                   main.py (orchestrator)
+                        │
+                        ▼
+                 MAVLink commands
+                 → ArduPilot SITL / real FC
 ```
 
 ---
@@ -55,7 +62,11 @@ no_GPS_drone_project/
 │   └── finetune.py        # fine-tune YOLOv8 on the top-down dataset
 ├── yolov8l_visdrone.pt    # YOLOv8l pre-trained on VisDrone (10 aerial classes)
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
-├── control/               # ArduPilot MAVLink — TODO
+├── control/               # ArduPilot MAVLink + IMU fusion — TODO
+│   ├── sitl_bridge.py     #   Isaac Sim → ArduPilot SITL JSON/UDP sender
+│   ├── mavlink_ctrl.py    #   pymavlink subscriber + command sender
+│   ├── imu_reader.py      #   HIGHRES_IMU reader
+│   └── imu_fusion.py      #   anchor validator + VO quality gate
 └── main.py                # top-level orchestrator — TODO
 ```
 
@@ -72,7 +83,10 @@ no_GPS_drone_project/
 | 5 | YOLO detection working on simulated frames | Done |
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone dataset + synthetic data) | Ready to run |
-| 6 | ArduPilot SITL responding to MAVLink commands | TODO |
+| 6a | ArduPilot SITL + Isaac Sim JSON bridge | TODO |
+| 6b | MAVLink command interface: planned-path flight | TODO |
+| 6c | IMU data via HIGHRES_IMU feeding localization | TODO |
+| 6d | IMU fusion: anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
 | 8 | Deploy to real hardware | TODO |
 
