@@ -11,15 +11,15 @@ Autonomous drone system that localises itself and detects objects without GPS, v
 
 ```
 Isaac Sim (cesium_scene.py)
-    │ IMU + baro JSON  ◄──servo PWM──┐
-    ▼                                │
-control/sitl_bridge.py          ArduPilot SITL
-  (UDP server :9002)  ──physics──►  (JSON client)
-                                     │ MAVLink UDP:14550
-                              ┌──────┴──────────────────┐
-                              ▼                         ▼
-                      HIGHRES_IMU                EKF_STATUS_REPORT
-                      → imu_fusion.py            (position valid?)
+    │ physics JSON  ◄──binary servo PWM──┐
+    ▼                                    │
+control/sitl_bridge.py              ArduPilot SITL
+  (UDP server :9002)  ──JSON+\n──►  (JSON client)
+                                         │ MAVLink TCP:5762
+                              ┌──────────┴──────────────────┐
+                              ▼                             ▼
+                      HIGHRES_IMU                  EKF_STATUS_REPORT
+                      → imu_fusion.py              (position valid?)
 
 drone_frames/latest.jpg + latest_meta.json
     │
@@ -65,7 +65,8 @@ no_GPS_drone_project/
 ├── yolov8l_visdrone.pt    # YOLOv8l pre-trained on VisDrone (10 aerial classes)
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
 ├── control/               # ArduPilot MAVLink + IMU fusion
-│   ├── sitl_bridge.py     #   UDP server :9002 — receives servo PWM, replies physics (DONE)
+│   ├── sitl_bridge.py     #   UDP server :9002 — receives binary servo PWM, replies physics JSON (DONE)
+│   ├── stub_bridge.py     #   minimal bridge for testing MAVLink without Isaac Sim
 │   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision_position + flight cmds (DONE 6b-i)
 │   ├── run_mavlink.py     #   live terminal monitor: attitude, NED pos, IMU, EKF flags
 │   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO 6c)
@@ -233,8 +234,17 @@ cd simulator && ./run_chiayi.sh
 ```
 
 The bridge (`control/sitl_bridge.py`) is a UDP server embedded in the Isaac Sim loop.
-ArduPilot sends servo PWM to port 9002; the bridge replies with IMU + baro + attitude each step.
-"No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading.
+ArduPilot sends a **binary** `servo_packet_16` (40 bytes, little-endian, magic=18458) to port 9002;
+the bridge parses it, learns ArduPilot's reply address from the source port, and sends back a
+JSON physics state terminated by `\n` each step.
+"No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading (~2–5 min).
+
+To test MAVLink without Isaac Sim, use the stub bridge instead:
+
+```bash
+# Terminal 2 — stub (static hover at home+5 m, 100 Hz)
+python3 control/stub_bridge.py
+```
 
 ### Monitor MAVLink state (separate terminal)
 
@@ -242,17 +252,23 @@ ArduPilot sends servo PWM to port 9002; the bridge replies with IMU + baro + att
 python3 control/run_mavlink.py
 ```
 
+Connects to SITL on `tcp:localhost:5762` (direct, no mavproxy needed).
 Prints a live rolling line at 10 Hz showing attitude, NED position, IMU accelerations,
-and EKF status flags. Start after SITL is running; it will wait up to 60 s for HEARTBEAT.
+and EKF status flags. Start after SITL + bridge are both running; waits up to 60 s for HEARTBEAT.
 
 ```
     TIME    ROLL°    PCH°    YAW°          N m          E m          D m       Ax      Ay      Az  EKF flags
 -------- ------- ------- -------  --------- --------- ---------  ------- ------- -------  ---------
-  1234.5    0.01   -0.02   90.00       0.12       0.05      -9.87     0.01   -0.01   -9.81  0x003f ATT,VEL,POS_ABS
+  1234.5    0.00    0.00    0.00       0.00       0.00      -5.00     0.00    0.00   -9.81  0x0400 UNINIT
+  1235.0    0.01   -0.02    0.00       0.00       0.00      -5.00     0.01   -0.01   -9.81  0x0001 ATT
+  1240.0    0.01   -0.02   90.00       0.12       0.05      -9.87     0.01   -0.01   -9.81  0x003f ATT,VEL,POS_ABS
 ```
 
-`POS_ABS` in the EKF column means ArduPilot's EKF3 has a valid absolute position fix —
-required before flight commands will be accepted (milestone 6b-iv).
+Expected EKF progression after bridge connects:
+- `UNINIT` (0x0400) — normal at startup; EKF hasn't initialised yet
+- `ATT` — IMU tilt alignment complete (~5–10 s)
+- `ATT,VEL` — horizontal velocity being estimated
+- `ATT,VEL,POS_ABS` — absolute position valid; flight commands accepted (milestone 6b-iv)
 
 ---
 

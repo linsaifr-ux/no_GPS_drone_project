@@ -31,7 +31,11 @@ no_GPS_drone_project/
 │   └── finetune.py               # YOLOv8 top-down fine-tuning script
 ├── yolov8l_visdrone.pt   # YOLOv8l pre-trained on VisDrone (active model)
 ├── yolov8n.pt            # YOLOv8n COCO pretrained (baseline)
-├── control/              # ArduPilot MAVLink interface (TODO)
+├── control/              # ArduPilot MAVLink interface (in progress)
+│   ├── sitl_bridge.py    #   UDP :9002 server — binary servo in, JSON physics out
+│   ├── stub_bridge.py    #   minimal bridge for testing MAVLink without Isaac Sim
+│   ├── mavlink_ctrl.py   #   MAVLinkCtrl class + EKF flag constants
+│   └── run_mavlink.py    #   live terminal monitor
 └── main.py               # Top-level orchestrator (TODO)
 ```
 
@@ -242,35 +246,38 @@ Build ArduPilot SITL + MAVLink first, then IMU fusion. On real hardware IMU data
 **Protocol:** ArduPilot is the JSON **client**; the bridge is the **server**.
 
 ```
-ArduPilot SITL ──servo PWM JSON──► bridge :9002  (UDP server, listens)
-ArduPilot SITL ◄──physics JSON──── bridge        (reply to sender address)
-ArduPilot SITL ──MAVLink UDP:14550──► mavlink_ctrl.py
+ArduPilot SITL ──binary servo_packet_16──► bridge :9002  (UDP server, listens)
+ArduPilot SITL ◄──physics JSON + \n─────── bridge        (reply to sender's ephemeral port)
+ArduPilot SITL ──MAVLink TCP:5762──► mavlink_ctrl.py
 ```
 
 `sitl_bridge.py` is a UDP server embedded in the Isaac Sim simulation loop:
-- Binds to port 9002; waits for ArduPilot to send `{"pwm": [...], "frame_time_us": N}`
-- On receipt, replies with current physics state (IMU + baro + attitude, **no GPS position**)
+- Binds to port 9002; waits for ArduPilot to send a **binary** `servo_packet_16` struct
+  (40 bytes, little-endian: `uint16 magic=18458`, `uint16 frame_rate`, `uint32 frame_count`, `uint16 pwm[16]`)
+- Learns ArduPilot's reply address from the source port of the first valid servo packet
+- Replies with physics state JSON **terminated by `\n`** (required by ArduPilot's `recv_fdm` parser)
 - Computes velocity + acceleration by finite-differencing successive ENU positions
-- Clamps velocity to ±30 m/s and low-pass filters acceleration (EMA α=0.3) to suppress keyboard-jump spikes
+- Clamps velocity to ±30 m/s and low-pass filters acceleration (EMA α=0.3)
 
-Physics state sent each step:
+Physics state sent each step (key names must match ArduPilot's `SIM_JSON` keytable exactly):
 
 ```json
 {
   "timestamp": 1234.5,
-  "imu_angular_velocity_rpy": [0.0, 0.0, yaw_rate],
-  "imu_linear_acceleration_xyz": [sf_bx, sf_by, sf_bz],
-  "imu_temperature": 25.0,
-  "pressure": 101325.0,
-  "pressure_alt": z_abs,
-  "attitude_rpy": [0.0, 0.0, yaw_rad],
-  "rangefinder_distance": agl_m,
-  "rangefinder_type": 1
+  "imu": {
+    "gyro":       [0.0, 0.0, yaw_rate],
+    "accel_body": [sf_bx, sf_by, sf_bz]
+  },
+  "attitude":  [0.0, 0.0, yaw_rad],
+  "velocity":  [vn, ve, vd],
+  "position":  [north, east, down],
+  "rng_1":     agl_m,
+  "battery":   {"voltage": 12.6, "current": 5.0}
 }
 ```
 
-`position_xyz` and `velocity_xyz` are intentionally **omitted** — they would act as a GPS
-substitute in ArduPilot's EKF. Position comes via `VISION_POSITION_ESTIMATE` in step 2 (6b-iii).
+`position` and `velocity` currently act as a GPS substitute in ArduPilot's EKF.
+They are **removed in milestone 6b-ii** once `VISION_POSITION_ESTIMATE` is working.
 
 Build SITL once before first run:
 ```bash
@@ -291,13 +298,13 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
 
 This is the core no-GPS milestone. Four sub-steps must happen in order:
 
-**6b-i  pymavlink connection**
-`pymavlink` connects to SITL MAVLink output (UDP:14550). Subscribe to:
+**6b-i  pymavlink connection** — DONE
+`pymavlink` connects to SITL directly on `tcp:localhost:5762` (no mavproxy needed). Subscribe to:
 `HEARTBEAT`, `HIGHRES_IMU`, `ATTITUDE`, `LOCAL_POSITION_NED`, `EKF_STATUS_REPORT`.
 
 **6b-ii  Disable GPS; strip position from JSON bridge**
 - Set SITL param `GPS_TYPE=0` (disables GPS sensor in ArduPilot)
-- Remove `position_xyz` and `velocity_xyz` from the JSON bridge state packet
+- Remove `"position"` and `"velocity"` from the JSON bridge state packet (currently they act as GPS substitute)
 - ArduPilot EKF3 now runs on IMU + baro only → position drifts until vision arrives
 
 **6b-iii  Feed AnyLoc → ArduPilot EKF3 via `VISION_POSITION_ESTIMATE`**
@@ -343,14 +350,16 @@ IMU data is used as a sanity check on AnyLoc anchor updates, not as a primary po
 2. **VO quality gate** — if IMU detects high angular velocity or linear acceleration spikes, mark that VO frame as unreliable and skip the accumulation step
 3. **Dead-reckoning fallback** — if both AnyLoc and VO fail (low feature count + bad scores), use IMU double-integration for short bridging intervals
 
-Files to create (in order):
+Files status:
 
-| File | Purpose |
-|------|---------|
-| `control/sitl_bridge.py` | Isaac Sim → ArduPilot SITL JSON/UDP sender |
-| `control/mavlink_ctrl.py` | pymavlink subscriber + command sender |
-| `control/imu_reader.py` | HIGHRES_IMU reader, writes to shared state |
-| `control/imu_fusion.py` | IMU-based anchor validation + VO quality gate |
+| File | Status | Purpose |
+|------|--------|---------|
+| `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002 |
+| `control/stub_bridge.py` | Done | Static hover for testing MAVLink without Isaac Sim |
+| `control/mavlink_ctrl.py` | Done (6b-i) | pymavlink subscriber + vision + command stubs |
+| `control/run_mavlink.py` | Done | Live terminal monitor at 10 Hz |
+| `control/imu_reader.py` | TODO (6c) | HIGHRES_IMU reader, writes to shared state |
+| `control/imu_fusion.py` | TODO (6d) | IMU-based anchor validation + VO quality gate |
 
 Real hardware path: swap SITL UDP address for serial/UDP to the real flight controller — no other changes needed.
 
@@ -362,9 +371,9 @@ Real hardware path: swap SITL UDP address for serial/UDP to the real flight cont
 Isaac Sim (cesium_scene.py)
     │
     ▼
-control/sitl_bridge.py  ◄──servo PWM JSON── ArduPilot SITL
-  (UDP server :9002)    ──physics JSON────►  (JSON client)
-                                              │ MAVLink UDP:14550
+control/sitl_bridge.py  ◄──binary servo_packet_16── ArduPilot SITL
+  (UDP server :9002)    ──physics JSON+\n──────►  (JSON client)
+                                                   │ MAVLink TCP:5762
                                               ▼
                                    control/mavlink_ctrl.py
                                    ┌──────────┴────────────┐
@@ -406,8 +415,8 @@ AnyLoc + VO          YOLO         │
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone + synthetic data) | Ready to run |
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro → SITL each step) | Done |
-| 6b-i | pymavlink connection to ArduPilot MAVLink output (UDP:14550) | Done |
-| 6b-ii | Disable GPS in SITL; strip position_xyz from JSON bridge (IMU+baro only) | TODO |
+| 6b-i | pymavlink connection to ArduPilot SITL (tcp:localhost:5762) | Done |
+| 6b-ii | Disable GPS in SITL; strip position/velocity from JSON bridge (IMU+baro only) | TODO |
 | 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
 | 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | TODO |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |

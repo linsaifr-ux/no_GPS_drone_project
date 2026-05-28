@@ -589,8 +589,8 @@ The no-GPS position source is `VISION_POSITION_ESTIMATE` MAVLink messages, sent 
 ### Files created
 
 **`control/mavlink_ctrl.py`** — `MAVLinkCtrl` class:
-- `__init__(connection_str="udp:0.0.0.0:14550")` — pymavlink connection; binds to port
-  14550 and waits for mavproxy/SITL to push packets (standard GCS-style connection)
+- `__init__(connection_str="tcp:localhost:5762")` — connects directly to ArduPilot SITL
+  TCP port 5762 (no mavproxy needed; UDP:14550 was found to not deliver packets reliably)
 - `wait_heartbeat(timeout=60)` — blocking; learns `target_system` / `target_component`
   from first HEARTBEAT, then requests data streams
 - `recv()` — non-blocking drain; updates `_imu`, `_attitude`, `_local_pos`, `_ekf`,
@@ -613,18 +613,60 @@ The no-GPS position source is `VISION_POSITION_ESTIMATE` MAVLink messages, sent 
 
 ### EKF_STATUS_REPORT flag constants (exported from mavlink_ctrl.py)
 
-| Constant | Bit | Meaning |
-|---|---|---|
-| `EKF_ATTITUDE` | 0 | Attitude valid |
-| `EKF_VEL_HORIZ` | 1 | Horizontal velocity valid |
-| `EKF_POS_HORIZ_REL` | 3 | Relative horizontal position valid |
-| `EKF_POS_HORIZ_ABS` | 4 | Absolute horizontal position valid (GPS or vision fused) |
-| `EKF_PRED_POS_HORIZ_ABS` | 9 | Vision position estimate accepted by EKF3 |
+| Constant | Bit | Hex | Meaning |
+|---|---|---|---|
+| `EKF_ATTITUDE` | 0 | 0x0001 | Attitude valid |
+| `EKF_VEL_HORIZ` | 1 | 0x0002 | Horizontal velocity valid |
+| `EKF_POS_HORIZ_REL` | 3 | 0x0008 | Relative horizontal position valid |
+| `EKF_POS_HORIZ_ABS` | 4 | 0x0010 | Absolute horizontal position valid (GPS or vision fused) |
+| `EKF_PRED_POS_HORIZ_ABS` | 9 | 0x0200 | Vision position estimate accepted by EKF3 |
+| `EKF_UNINITIALIZED` | 10 | 0x0400 | EKF has not finished initialising (normal at startup) |
 
 `EKF_POS_HORIZ_ABS` going high is the signal that `VISION_POSITION_ESTIMATE` is being
 fused — needed before 6b-iv flight commands will be accepted.
 
 ### Notes
-- `position_xyz` and `velocity_xyz` remain in the JSON bridge for now (GPS substitute).
+- `"position"` and `"velocity"` are sent in the JSON bridge for now (GPS substitute using correct SIM_JSON key names).
   They are removed in milestone 6b-ii after `VISION_POSITION_ESTIMATE` is working.
-- The bridge's `step()` already returns the latest servo dict; 6b-iv reads PWM from there.
+- The bridge's `step()` returns the latest parsed servo dict; 6b-iv reads PWM from there.
+
+---
+
+## 2026-05-28 — Three SITL bridge bugs fixed; EKF_UNINITIALIZED added
+
+### Root cause of "No JSON sensor message received, resending servos"
+
+Three compounding bugs in `control/sitl_bridge.py` prevented ArduPilot from ever receiving physics replies:
+
+**Bug 1 — Binary servo packets were being parsed as JSON (root cause of _ap_addr never set)**
+
+ArduPilot's `SIM_JSON::output_servos()` sends a C struct `servo_packet_16` (40 bytes, little-endian):
+```c
+struct servo_packet_16 { uint16_t magic=18458; uint16_t frame_rate; uint32_t frame_count; uint16_t pwm[16]; };
+```
+The bridge called `json.loads(data.decode('utf-8'))` on this binary data — always failing.
+With the previous session's `_ap_addr` fix (only set after valid JSON parse), `_ap_addr` was never learned, so no physics replies were ever sent.
+
+Fix: added `_parse_servo_packet()` which uses `struct.unpack("<HHI16H", data)` to parse the binary packet and validates the magic number (18458 for 16-channel, 29569 for 32-channel) before setting `_ap_addr`.
+
+**Bug 2 — Missing `\n` terminator on physics JSON**
+
+ArduPilot's `recv_fdm()` (in `SIM_JSON.cpp`) processes messages by replacing `\n` with `\0` as a delimiter, then uses `memrchr(..., 0, ...)` to locate the last complete message. Without a trailing `\n`, `memrchr` returns `nullptr` and the function returns early without parsing — every physics packet silently discarded.
+
+Fix: append `"\n"` to every physics JSON packet before sending.
+
+**Bug 3 — Wrong JSON key names**
+
+The bridge sent keys like `"imu_angular_velocity_rpy"`, `"velocity_xyz"`, `"attitude_rpy"` which don't exist in ArduPilot's `SIM_JSON` keytable. Required keys are:
+- `"timestamp"` (root, required)
+- `"imu": {"gyro": [...], "accel_body": [...]}` (section required)
+- `"velocity": [vn, ve, vd]` (root, required)
+- `"attitude": [roll, pitch, yaw]` (root, required for either attitude or quaternion)
+
+Fix: rewrote `_build_state()` return dict to use the exact key names from `SIM_JSON.h`.
+
+### Files modified
+
+- `control/sitl_bridge.py` — all three fixes; removed `import json` fallback path for servos; added `struct` import and binary constants; physics send now appends `\n`
+- `control/mavlink_ctrl.py` — added `EKF_UNINITIALIZED = 1 << 10`
+- `control/run_mavlink.py` — `_ekf_label()` now returns `"UNINIT"` for bit 10 instead of `"none"`
