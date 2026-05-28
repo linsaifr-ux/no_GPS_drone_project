@@ -19,18 +19,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from control.mavlink_ctrl import (
     MAVLinkCtrl,
     EKF_ATTITUDE, EKF_VEL_HORIZ, EKF_POS_HORIZ_REL,
-    EKF_POS_HORIZ_ABS, EKF_PRED_POS_HORIZ_ABS,
+    EKF_POS_HORIZ_ABS, EKF_PRED_POS_HORIZ_ABS, EKF_UNINITIALIZED,
 )
 
 _NAN = float("nan")
 
 
 def _ekf_label(flags: int) -> str:
+    if flags & EKF_UNINITIALIZED:
+        return "UNINIT"
     parts = []
-    if flags & EKF_ATTITUDE:       parts.append("ATT")
-    if flags & EKF_VEL_HORIZ:      parts.append("VEL")
-    if flags & EKF_POS_HORIZ_REL:  parts.append("POS_REL")
-    if flags & EKF_POS_HORIZ_ABS:  parts.append("POS_ABS")
+    if flags & EKF_ATTITUDE:           parts.append("ATT")
+    if flags & EKF_VEL_HORIZ:          parts.append("VEL")
+    if flags & EKF_POS_HORIZ_REL:      parts.append("POS_REL")
+    if flags & EKF_POS_HORIZ_ABS:      parts.append("POS_ABS")
     if flags & EKF_PRED_POS_HORIZ_ABS: parts.append("PRED_ABS")
     return ",".join(parts) if parts else "none"
 

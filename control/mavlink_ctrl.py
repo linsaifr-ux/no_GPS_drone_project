@@ -35,6 +35,7 @@ EKF_POS_VERT_AGL       = 1 << 6
 EKF_CONST_POS_MODE     = 1 << 7
 EKF_PRED_POS_HORIZ_REL = 1 << 8
 EKF_PRED_POS_HORIZ_ABS = 1 << 9   # vision estimate accepted by EKF3
+EKF_UNINITIALIZED      = 1 << 10  # EKF has not finished initialising
 
 
 class MAVLinkCtrl:
