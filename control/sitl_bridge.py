@@ -14,7 +14,8 @@ Protocol (ArduPilot is the CLIENT, this bridge is the SERVER):
 
 Start SITL before running the sim (from project root):
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
-      -v ArduCopter --model=JSON --console --map
+      -v ArduCopter --model=JSON --no-rebuild --console --map \
+      --home=23.450868,120.286135,46,0
 
 Coordinate conventions:
   Isaac Sim  (ENU):  X = East,  Y = North, Z = Up
@@ -107,11 +108,20 @@ class SITLBridge:
             try:
                 data, addr = self._sock.recvfrom(4096)
                 self._ap_addr = addr
-                latest_servos = json.loads(data.decode())
-                self._last_pwm = latest_servos.get("pwm")
+                try:
+                    latest_servos = json.loads(data.decode('utf-8'))
+                    self._last_pwm = latest_servos.get("pwm")
+                except UnicodeDecodeError:
+                    # Binary data — log once for diagnosis
+                    if not getattr(self, '_logged_binary', False):
+                        print(f"[SITL] Non-UTF-8 data from {addr} "
+                              f"({len(data)} bytes): {data[:16].hex()}")
+                        self._logged_binary = True
+                except json.JSONDecodeError as e:
+                    if not getattr(self, '_logged_json_err', False):
+                        print(f"[SITL] JSON decode error: {e}  raw: {data[:64]}")
+                        self._logged_json_err = True
             except (BlockingIOError, OSError):
-                break
-            except json.JSONDecodeError:
                 break
 
         if latest_servos is not None and not self._connected:

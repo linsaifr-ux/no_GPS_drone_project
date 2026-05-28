@@ -283,7 +283,8 @@ cd ../..
 Run SITL:
 ```bash
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
-    -v ArduCopter --model=JSON --no-rebuild --console --map
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    --home=23.450868,120.286135,46,0
 ```
 
 #### Step 2 — No-GPS MAVLink integration (`control/mavlink_ctrl.py`)
