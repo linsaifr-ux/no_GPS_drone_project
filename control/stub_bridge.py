@@ -33,7 +33,22 @@ from control.sitl_bridge import SITLBridge
 _HOME_ELEV = 46.0   # metres MSL — matches --home=23.450868,120.286135,46,0
 _HOVER_AGL = 5.0    # metres above ground for "parked" physics state
 
-bridge = SITLBridge(centre_elev=_HOME_ELEV)
+try:
+    bridge = SITLBridge(centre_elev=_HOME_ELEV)
+except OSError as e:
+    if e.errno == 98:  # EADDRINUSE
+        import subprocess
+        try:
+            who = subprocess.check_output(
+                ["fuser", "9002/udp"], stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            who = "unknown"
+        print(f"[stub] ERROR: UDP port 9002 is already in use (pid {who}).")
+        print("[stub] Stop Isaac Sim (cesium_scene.py) first, then re-run stub_bridge.py.")
+        sys.exit(1)
+    raise
+
 print("[stub] Sending static hover state to SITL at 100 Hz. Ctrl-C to stop.")
 print("[stub] Start run_mavlink.py in another terminal to verify connection.")
 
