@@ -5,7 +5,7 @@ ArduPilot SITL JSON bridge.
 Translates Isaac Sim drone state (ENU) into ArduPilot's JSON SITL format (NED).
 
 Protocol (ArduPilot is the CLIENT, this bridge is the SERVER):
-  1. ArduPilot SITL sends servo/PWM JSON  →  bridge port 9002  (our server)
+  1. ArduPilot SITL sends binary servo/PWM packet → bridge port 9002  (our server)
   2. Bridge receives servo data, replies  →  ArduPilot's port  (our response)
   3. ArduPilot receives physics state and advances its EKF
 
@@ -35,7 +35,18 @@ Usage — embed in cesium_scene.py simulation loop:
 import json
 import math
 import socket
+import struct
 import time
+
+# ArduPilot SIM_JSON binary servo packet formats (little-endian)
+# struct servo_packet_16 { uint16_t magic; uint16_t frame_rate; uint32_t frame_count; uint16_t pwm[16]; }
+# struct servo_packet_32 { uint16_t magic; uint16_t frame_rate; uint32_t frame_count; uint16_t pwm[32]; }
+_SERVO16_MAGIC = 18458
+_SERVO32_MAGIC = 29569
+_SERVO16_FMT   = "<HHI16H"
+_SERVO32_FMT   = "<HHI32H"
+_SERVO16_SIZE  = struct.calcsize(_SERVO16_FMT)   # 40 bytes
+_SERVO32_SIZE  = struct.calcsize(_SERVO32_FMT)   # 72 bytes
 
 _GRAVITY   = 9.81    # m/s²
 _MAX_SPEED = 30.0    # m/s — clamp computed velocity to avoid keyboard-jump spikes
@@ -103,24 +114,14 @@ class SITLBridge:
         t = wall_time if wall_time is not None else time.time()
 
         # ── Drain incoming servo packets (non-blocking) ────────────────────
+        # ArduPilot sends BINARY servo_packet_16 / servo_packet_32 (not JSON).
         latest_servos = None
         while True:
             try:
                 data, addr = self._sock.recvfrom(4096)
-                try:
-                    latest_servos = json.loads(data.decode('utf-8'))
-                    self._last_pwm = latest_servos.get("pwm")
-                    self._ap_addr = addr   # only trust sender after valid JSON parse
-                except UnicodeDecodeError:
-                    # Binary data — log once for diagnosis
-                    if not getattr(self, '_logged_binary', False):
-                        print(f"[SITL] Non-UTF-8 data from {addr} "
-                              f"({len(data)} bytes): {data[:16].hex()}")
-                        self._logged_binary = True
-                except json.JSONDecodeError as e:
-                    if not getattr(self, '_logged_json_err', False):
-                        print(f"[SITL] JSON decode error: {e}  raw: {data[:64]}")
-                        self._logged_json_err = True
+                parsed = self._parse_servo_packet(data, addr)
+                if parsed is not None:
+                    latest_servos = parsed
             except (BlockingIOError, OSError):
                 break
 
@@ -134,7 +135,8 @@ class SITLBridge:
         # ── Reply to ArduPilot ─────────────────────────────────────────────
         if self._ap_addr is not None:
             try:
-                self._sock.sendto(json.dumps(state).encode(), self._ap_addr)
+                # ArduPilot's recv_fdm splits messages on '\n' → '\0'; trailing newline is required.
+                self._sock.sendto((json.dumps(state) + "\n").encode(), self._ap_addr)
                 self._n_sent += 1
                 if self._n_sent == 1:
                     print(f"[SITL] First physics reply sent to {self._ap_addr}")
@@ -161,6 +163,34 @@ class SITLBridge:
         self._sock.close()
 
     # ── Internal ───────────────────────────────────────────────────────────────
+
+    def _parse_servo_packet(self, data: bytes, addr) -> dict | None:
+        """
+        Parse ArduPilot's binary servo_packet_16 / servo_packet_32.
+        Returns dict with 'pwm', 'frame_rate', 'frame_count' on success,
+        or None if the data doesn't match either format.
+        Sets _ap_addr only when a valid magic is confirmed.
+        """
+        n = len(data)
+        if n == _SERVO16_SIZE:
+            fields = struct.unpack(_SERVO16_FMT, data)
+            if fields[0] == _SERVO16_MAGIC:
+                self._ap_addr = addr
+                pwm = list(fields[3:])
+                self._last_pwm = pwm
+                return {"pwm": pwm, "frame_rate": fields[1], "frame_count": fields[2]}
+        elif n == _SERVO32_SIZE:
+            fields = struct.unpack(_SERVO32_FMT, data)
+            if fields[0] == _SERVO32_MAGIC:
+                self._ap_addr = addr
+                pwm = list(fields[3:])
+                self._last_pwm = pwm
+                return {"pwm": pwm, "frame_rate": fields[1], "frame_count": fields[2]}
+        # Unrecognised — log once
+        if not getattr(self, '_logged_unknown', False):
+            print(f"[SITL] Unknown packet from {addr} ({n} bytes): {data[:16].hex()}")
+            self._logged_unknown = True
+        return None
 
     def _build_state(self, x_enu: float, y_enu: float, z_abs: float,
                      yaw_deg: float, t: float) -> dict:
@@ -219,27 +249,24 @@ class SITLBridge:
         sf_by  = -sf_ned[0] * sy + sf_ned[1] * cy
         sf_bz  =  sf_ned[2]
 
-        # ── Barometric pressure (ISA) ──────────────────────────────────────
-        pressure = 101325.0 * math.exp(-z_abs / 8500.0)
-
         # ── Save running state ─────────────────────────────────────────────
         self._prev_pos_ned   = pos_ned
         self._prev_vel_ned   = vel_ned
         self._prev_accel_ned = accel_ned
         self._prev_yaw_rad   = yaw_rad
 
+        # Key names must match ArduPilot's SIM_JSON keytable exactly.
+        # "imu" section holds "gyro" and "accel_body"; top-level keys for
+        # "timestamp", "attitude", "velocity", "position", "rng_1", "battery".
         return {
-            "timestamp":                   t - self._start_t,
-            "imu_angular_velocity_rpy":    [0.0, 0.0, yaw_rate],
-            "imu_linear_acceleration_xyz": [sf_bx, sf_by, sf_bz],
-            "imu_temperature":             25.0,
-            "pressure":                    pressure,
-            "pressure_alt":                z_abs,
-            "battery_voltage":             12.6,
-            "battery_current":             5.0,
-            "position_xyz":                [north, east, down],
-            "attitude_rpy":                [0.0, 0.0, yaw_rad],
-            "velocity_xyz":                list(vel_ned),
-            "rangefinder_distance":        max(0.1, agl),
-            "rangefinder_type":            1,
+            "timestamp": t - self._start_t,
+            "imu": {
+                "gyro":       [0.0, 0.0, yaw_rate],
+                "accel_body": [sf_bx, sf_by, sf_bz],
+            },
+            "attitude":  [0.0, 0.0, yaw_rad],
+            "velocity":  list(vel_ned),
+            "position":  [north, east, down],
+            "rng_1":     max(0.1, agl),
+            "battery":   {"voltage": 12.6, "current": 5.0},
         }
