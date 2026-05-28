@@ -107,10 +107,10 @@ class SITLBridge:
         while True:
             try:
                 data, addr = self._sock.recvfrom(4096)
-                self._ap_addr = addr
                 try:
                     latest_servos = json.loads(data.decode('utf-8'))
                     self._last_pwm = latest_servos.get("pwm")
+                    self._ap_addr = addr   # only trust sender after valid JSON parse
                 except UnicodeDecodeError:
                     # Binary data — log once for diagnosis
                     if not getattr(self, '_logged_binary', False):
