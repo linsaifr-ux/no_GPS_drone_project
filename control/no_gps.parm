@@ -1,0 +1,11 @@
+# ArduPilot SITL parameters for no-GPS operation
+# Load with: --add-param-file=control/no_gps.parm
+# Parameters persist in eeprom.bin after first load; --wipe resets them.
+
+GPS_TYPE        0       # disable GPS sensor
+
+EK3_SRC1_POSXY  6       # horizontal position from ExternalNav (VISION_POSITION_ESTIMATE)
+EK3_SRC1_VELXY  0       # no horizontal velocity source
+EK3_SRC1_POSZ   1       # altitude from barometer
+EK3_SRC1_YAW    1       # yaw from compass
+VISO_TYPE       1       # enable MAVLink ExternalNav processing

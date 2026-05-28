@@ -69,6 +69,8 @@ no_GPS_drone_project/
 │   ├── stub_bridge.py     #   minimal bridge for testing MAVLink without Isaac Sim
 │   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision_position + flight cmds (DONE 6b-i)
 │   ├── run_mavlink.py     #   live terminal monitor: attitude, NED pos, IMU, EKF flags
+│   ├── run_vision.py      #   AnyLoc → VISION_POSITION_ESTIMATE → ArduPilot EKF3 (DONE 6b-iii)
+│   ├── no_gps.parm        #   SITL param file: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
 │   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO 6c)
 │   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO 6d)
 ├── third_party/
@@ -92,7 +94,7 @@ no_GPS_drone_project/
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) | Done |
 | 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
 | 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | Done |
-| 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
+| 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | In progress |
 | 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
@@ -224,11 +226,14 @@ cd ../..
 Then start SITL before Isaac Sim:
 
 ```bash
-# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on TCP:5762)
+# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on TCP:5762 + 5763)
+# --out tcp:localhost:5763 opens a second MAVLink port so run_mavlink.py and
+# run_vision.py can connect simultaneously (each TCP port allows one client).
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
     -l 23.450868,120.286135,46,0 \
-    --add-param-file=control/no_gps.parm
+    --add-param-file=control/no_gps.parm \
+    --out tcp:localhost:5763
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh
@@ -246,6 +251,30 @@ To test MAVLink without Isaac Sim, use the stub bridge instead:
 # Terminal 2 — stub (static hover at home+5 m, 100 Hz)
 python3 control/stub_bridge.py
 ```
+
+### Run the AnyLoc → EKF3 vision bridge (separate terminal)
+
+```bash
+python3 control/run_vision.py
+```
+
+Reads `anyloc/latest_estimate.json` (written by `run_localizer.py` each AnyLoc anchor frame),
+converts lat/lon to NED relative to SITL home, and sends `VISION_POSITION_ESTIMATE` to
+ArduPilot at 5 Hz. The 5 Hz resend keeps EKF3 fusion alive between AnyLoc updates.
+
+Uses `tcp:localhost:5763` (not 5762) so it can run alongside `run_mavlink.py` simultaneously —
+each TCP port accepts only one client. Start SITL with `--out tcp:localhost:5763` to open that port.
+
+Requires SITL launched with `--add-param-file=control/no_gps.parm` so that
+`EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` are set.
+
+Watch for:
+```
+[Vision] EKF flags changed → 0x0011  ATT,POS_ABS *** POS_ABS acquired!
+```
+`POS_ABS` (bit 4) means EKF3 has accepted the vision position — flight commands will now work.
+
+---
 
 ### Monitor MAVLink state (separate terminal)
 

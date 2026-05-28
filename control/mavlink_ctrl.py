@@ -153,31 +153,30 @@ class MAVLinkCtrl:
         """
         Send VISION_POSITION_ESTIMATE to ArduPilot EKF3.
 
-        north, east, down : NED position in metres from the EKF origin
-        yaw_rad           : heading (rad, NED / compass convention, CW-positive)
-        covariance        : 21-element upper-triangle of 6×6 pose covariance.
-                            Default: 5 m position std, 0.2 rad orientation std.
-                            Tune once AnyLoc error is characterised.
-
-        TODO (6b-iii): call this from the AnyLoc anchor callback in run_localizer.py
+        north, east, down : NED position in metres from the EKF origin (home)
+        yaw_rad           : heading (rad, NED compass convention, CW-positive)
+        covariance        : 21-element upper-triangle of 6×6 pose covariance [x,y,z,r,p,y].
+                            Default: 20 m horizontal std (AnyLoc ~15–20 m error),
+                            5 m vertical std, 0.3 rad yaw std.
         """
         if covariance is None:
-            pv = 5.0 ** 2    # 5 m position std → 25 m² variance
-            ov = 0.2 ** 2    # 0.2 rad (~11°) orientation std
+            pxy = 20.0 ** 2   # 20 m horizontal std → 400 m² variance
+            pz  =  5.0 ** 2   # 5 m vertical std
+            ov  =  0.3 ** 2   # 0.3 rad (~17°) orientation std
             covariance = [
-                pv, 0,  0,  0,  0,  0,
-                    pv, 0,  0,  0,  0,
-                        pv, 0,  0,  0,
-                            ov, 0,  0,
-                                ov, 0,
-                                    ov,
+                pxy, 0,   0,   0,  0,  0,
+                     pxy, 0,   0,  0,  0,
+                          pz,  0,  0,  0,
+                               ov, 0,  0,
+                                   ov, 0,
+                                       ov,
             ]
-        usec = int(time.time() * 1e6)
         self._mav.mav.vision_position_estimate_send(
-            usec,
-            north, east, down,
-            0.0, 0.0, yaw_rad,
+            int(time.time() * 1e6),   # time_usec
+            float(north), float(east), float(down),
+            0.0, 0.0, float(yaw_rad),
             covariance,
+            0,                         # reset_counter
         )
 
     # ── 6b-iv: Flight commands ─────────────────────────────────────────────────

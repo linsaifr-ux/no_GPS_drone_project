@@ -701,3 +701,76 @@ Expected EKF state: `ATT` (attitude valid) without `VEL_HORIZ` or `POS_ABS`. Hor
 ### Next step
 
 6b-iii: send AnyLoc position estimates to ArduPilot EKF3 via `VISION_POSITION_ESTIMATE` MAVLink messages. This requires setting `EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` in `no_gps.parm`.
+
+---
+
+## 2026-05-28 — 6b-ii velocity fix; multi-client TCP; EKF UNINIT root cause; 6b-iii wired up
+
+### Bug fixed: `"velocity"` incorrectly removed in 6b-ii
+
+Milestone 6b-ii had removed `"velocity"` from the bridge JSON alongside `"position"`. This caused ArduPilot to print "Failed to find key /velocity" and revert to "resending servos".
+
+Root cause: `"velocity"` is `required=true` in ArduPilot's `SIM_JSON.h` keytable — omitting it causes `received_bitmask==0` and the entire packet is rejected. `"position"` is `required=false` and IS a GPS substitute; `"velocity"` is not (with `GPS_TYPE=0` it feeds only SITL's internal physics model and is never fused by EKF3 via GPS).
+
+Fix: added `"velocity": list(vel_ned)` back to `_build_state()` with an explanatory comment.
+
+---
+
+### Bug fixed: only one MAVLink client could connect at a time
+
+Both `run_mavlink.py` and `run_vision.py` connected to `tcp:localhost:5762`. TCP port 5762 accepts one client at a time — the second connection hung waiting for HEARTBEAT forever.
+
+Fix: `run_vision.py` now connects to `tcp:localhost:5763`. SITL must be started with `--out tcp:localhost:5763` to open that port:
+
+```bash
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    -l 23.450868,120.286135,46,0 \
+    --add-param-file=control/no_gps.parm \
+    --out tcp:localhost:5763
+```
+
+| Script | Port | Role |
+|--------|------|------|
+| `run_mavlink.py` | `tcp:localhost:5762` | monitor |
+| `run_vision.py` | `tcp:localhost:5763` | vision sender |
+
+---
+
+### Bug fixed: EKF reset to UNINIT every ~20 seconds
+
+After reaching `ATT,VEL`, EKF flags would drop back to UNINIT (0x0400) approximately every 20 seconds.
+
+Root cause: `EK3_SRC1_POSXY` defaults to **3 (GPS)**. With `GPS_TYPE=0`, EKF3 expects GPS position fusion but never receives any. After its internal timeout (~20 s) it declares the lane unhealthy and resets.
+
+Fix: uncomment EK3 ExtNav params in `control/no_gps.parm`:
+```
+EK3_SRC1_POSXY  6   # horizontal position from ExternalNav
+EK3_SRC1_VELXY  0   # no horizontal velocity source
+EK3_SRC1_POSZ   1   # altitude from barometer
+EK3_SRC1_YAW    1   # yaw from compass
+VISO_TYPE       1   # enable MAVLink ExternalNav processing
+```
+
+With `EK3_SRC1_POSXY=6`, EKF3 expects ExtNav position (from `VISION_POSITION_ESTIMATE`) instead of GPS. Always restart SITL with `--wipe` after changing `no_gps.parm` to flush old `eeprom.bin`.
+
+---
+
+### `run_mavlink.py` display improvements
+
+- **TIME column**: was `time.time() % 10000` (wall clock, never resets). Changed to `time.time() - t0` (seconds since monitor started, resets each run).
+- **EKF label**: added `VEL_V` (bit 2) and `ALT` (bit 5 = `EKF_POS_VERT_ABS`) to `_ekf_label()`.
+
+---
+
+### Milestone 6b-iii: run_vision.py deployed, EK3 params set
+
+`control/run_vision.py` is now wired up and `no_gps.parm` has the full ExtNav params. The pipeline is ready to test end-to-end:
+
+1. SITL with `--out tcp:localhost:5763 --add-param-file=control/no_gps.parm --wipe`
+2. Isaac Sim (`run_chiayi.sh`) or `stub_bridge.py`
+3. `run_localizer.py` (writes `anyloc/latest_estimate.json`)
+4. `run_vision.py` (reads estimate, sends `VISION_POSITION_ESTIMATE` at 5 Hz on port 5763)
+5. `run_mavlink.py` (monitors EKF flags on port 5762)
+
+Watch for `POS_ABS` (0x0010) in EKF flags to confirm EKF3 is fusing the vision position.

@@ -19,10 +19,11 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from PIL import Image, ImageDraw, ImageFont
 
-HERE      = os.path.dirname(os.path.abspath(__file__))
-FRAME_JPG = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest.jpg'))
-META_JSON = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest_meta.json'))
-DB_DIR    = os.path.join(HERE, 'database')
+HERE          = os.path.dirname(os.path.abspath(__file__))
+FRAME_JPG     = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest.jpg'))
+META_JSON     = os.path.abspath(os.path.join(HERE, '..', 'simulator', 'drone_frames', 'latest_meta.json'))
+DB_DIR        = os.path.join(HERE, 'database')
+ESTIMATE_JSON = os.path.join(HERE, 'latest_estimate.json')  # read by control/run_vision.py
 
 COS_LAT = math.cos(math.radians(23.450868))
 
@@ -178,6 +179,21 @@ def main():
                 accum_dlat   = 0.0
                 accum_dlon   = 0.0
                 vo.reset()
+                # Write estimate for control/run_vision.py (atomic rename)
+                _est = {
+                    "timestamp":  time.time(),
+                    "est_lat":    est_lat,
+                    "est_lon":    est_lon,
+                    "alt_msl_m":  drone_alt,
+                    "agl_m":      drone_agl,
+                    "yaw_deg":    drone_yaw,
+                    "score":      float(score),
+                    "error_m":    float(geo_dist_m(drone_lat, drone_lon, est_lat, est_lon)),
+                }
+                _tmp = ESTIMATE_JSON + ".tmp"
+                with open(_tmp, 'w') as _fh:
+                    json.dump(_est, _fh)
+                os.replace(_tmp, ESTIMATE_JSON)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
             # Skip display until first anchor is available
