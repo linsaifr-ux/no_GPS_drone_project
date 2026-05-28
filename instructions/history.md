@@ -774,3 +774,5 @@ With `EK3_SRC1_POSXY=6`, EKF3 expects ExtNav position (from `VISION_POSITION_EST
 5. `run_mavlink.py` (monitors EKF flags on port 5762)
 
 Watch for `POS_ABS` (0x0010) in EKF flags to confirm EKF3 is fusing the vision position.
+
+**Confirmed:** EKF flags reached `ATT,VEL_H,VEL_V,POS_REL,POS_ABS,ALT,PRED_ABS` — all flags healthy, vision position fully fused. Milestone 6b-iii done.

@@ -317,7 +317,7 @@ This is the core no-GPS milestone. Four sub-steps must happen in order:
 - Remove `"position"` from the bridge (optional, GPS substitute) — `"velocity"` stays (required=true, not GPS substitute with GPS_TYPE=0)
 - ArduPilot EKF3 now runs on IMU + baro only → position drifts until vision arrives
 
-**6b-iii  Feed AnyLoc → ArduPilot EKF3 via `VISION_POSITION_ESTIMATE`** — In progress
+**6b-iii  Feed AnyLoc → ArduPilot EKF3 via `VISION_POSITION_ESTIMATE`** — DONE
 - `control/run_vision.py` reads `anyloc/latest_estimate.json` (written by `run_localizer.py` each anchor), converts lat/lon to NED, sends `VISION_POSITION_ESTIMATE` to ArduPilot at 5 Hz
 - `no_gps.parm` params: `EK3_SRC1_POSXY=6` (ExtNav), `VISO_TYPE=1`
 - EKF3 fuses this as the external vision position source — same as Intel T265 / OptiTrack on real hardware
@@ -427,7 +427,7 @@ AnyLoc + VO          YOLO         │
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro → SITL each step) | Done |
 | 6b-i | pymavlink connection to ArduPilot SITL (tcp:localhost:5762) | Done |
 | 6b-ii | Disable GPS in SITL; strip position from JSON bridge (velocity stays — required) | Done |
-| 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | In progress |
+| 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
 | 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | TODO |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate using IMU data | TODO |

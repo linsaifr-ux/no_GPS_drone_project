@@ -94,7 +94,7 @@ no_GPS_drone_project/
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) | Done |
 | 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
 | 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | Done |
-| 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | In progress |
+| 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
 | 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
