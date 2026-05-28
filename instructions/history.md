@@ -670,3 +670,34 @@ Fix: rewrote `_build_state()` return dict to use the exact key names from `SIM_J
 - `control/sitl_bridge.py` — all three fixes; removed `import json` fallback path for servos; added `struct` import and binary constants; physics send now appends `\n`
 - `control/mavlink_ctrl.py` — added `EKF_UNINITIALIZED = 1 << 10`
 - `control/run_mavlink.py` — `_ekf_label()` now returns `"UNINIT"` for bit 10 instead of `"none"`
+
+---
+
+## 2026-05-28 — Milestone 6b-ii: disable GPS, strip position from bridge
+
+### What was done
+
+Removed `"position"` and `"velocity"` from the JSON physics packet and added a SITL parameter file to disable the GPS sensor.
+
+**`control/sitl_bridge.py`** — `_build_state()` no longer includes `"position"` or `"velocity"` in the returned dict. `vel_ned` and `accel_ned` are still computed internally because `accel_body` (the IMU specific force) is derived from them; they just aren't sent to ArduPilot.
+
+**`control/no_gps.parm`** — ArduPilot SITL parameter file:
+```
+GPS_TYPE 0    # disable GPS sensor
+```
+Loaded at SITL startup with `--add-param-file=control/no_gps.parm`. Parameters persist in SITL's `eeprom.bin` after first load.
+
+### Effect on EKF
+
+Without `"position"` and `"velocity"`, ArduPilot EKF3 receives:
+- IMU (`imu.gyro`, `imu.accel_body`) — attitude + short-term dead reckoning
+- Attitude (`"attitude"`) — direct yaw/roll/pitch reference
+- Rangefinder (`"rng_1"`) — altitude AGL
+- Barometer — simulated internally from last-known Aircraft altitude (static after position is dropped)
+- Compass — synthesised from attitude + Earth field model (approx. correct for small area)
+
+Expected EKF state: `ATT` (attitude valid) without `VEL_HORIZ` or `POS_ABS`. Horizontal position will drift — that is the correct no-GPS baseline before 6b-iii adds `VISION_POSITION_ESTIMATE`.
+
+### Next step
+
+6b-iii: send AnyLoc position estimates to ArduPilot EKF3 via `VISION_POSITION_ESTIMATE` MAVLink messages. This requires setting `EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` in `no_gps.parm`.

@@ -91,7 +91,7 @@ no_GPS_drone_project/
 | 5b | Top-down fine-tuning pipeline (VisDrone dataset + synthetic data) | Ready to run |
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) | Done |
 | 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
-| 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | TODO |
+| 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | Done |
 | 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
 | 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
@@ -224,10 +224,11 @@ cd ../..
 Then start SITL before Isaac Sim:
 
 ```bash
-# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on 14550)
+# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on TCP:5762)
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,46,0
+    -l 23.450868,120.286135,46,0 \
+    --add-param-file=control/no_gps.parm
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh

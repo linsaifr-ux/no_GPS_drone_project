@@ -291,7 +291,8 @@ Run SITL:
 ```bash
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,46,0
+    -l 23.450868,120.286135,46,0 \
+    --add-param-file=control/no_gps.parm
 ```
 
 #### Step 2 — No-GPS MAVLink integration (`control/mavlink_ctrl.py`)
@@ -354,7 +355,8 @@ Files status:
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002 |
+| `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002; no GPS |
+| `control/no_gps.parm` | Done | SITL param file: GPS_TYPE=0 |
 | `control/stub_bridge.py` | Done | Static hover for testing MAVLink without Isaac Sim |
 | `control/mavlink_ctrl.py` | Done (6b-i) | pymavlink subscriber + vision + command stubs |
 | `control/run_mavlink.py` | Done | Live terminal monitor at 10 Hz |
@@ -416,7 +418,7 @@ AnyLoc + VO          YOLO         │
 | 5b | Top-down fine-tuning pipeline (VisDrone + synthetic data) | Ready to run |
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro → SITL each step) | Done |
 | 6b-i | pymavlink connection to ArduPilot SITL (tcp:localhost:5762) | Done |
-| 6b-ii | Disable GPS in SITL; strip position/velocity from JSON bridge (IMU+baro only) | TODO |
+| 6b-ii | Disable GPS in SITL; strip position/velocity from JSON bridge (IMU+baro only) | Done |
 | 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
 | 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | TODO |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |

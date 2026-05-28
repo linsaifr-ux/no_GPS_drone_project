@@ -255,9 +255,10 @@ class SITLBridge:
         self._prev_accel_ned = accel_ned
         self._prev_yaw_rad   = yaw_rad
 
-        # Key names must match ArduPilot's SIM_JSON keytable exactly.
-        # "imu" section holds "gyro" and "accel_body"; top-level keys for
-        # "timestamp", "attitude", "velocity", "position", "rng_1", "battery".
+        # 6b-ii: "position" and "velocity" are intentionally omitted.
+        # Sending them would let ArduPilot EKF3 use them as a GPS substitute.
+        # Without them the EKF runs on IMU + baro + compass + rangefinder only.
+        # (vel_ned / accel_ned are still computed above because accel_body needs them.)
         return {
             "timestamp": t - self._start_t,
             "imu": {
@@ -265,8 +266,6 @@ class SITLBridge:
                 "accel_body": [sf_bx, sf_by, sf_bz],
             },
             "attitude":  [0.0, 0.0, yaw_rad],
-            "velocity":  list(vel_ned),
-            "position":  [north, east, down],
             "rng_1":     max(0.1, agl),
             "battery":   {"voltage": 12.6, "current": 5.0},
         }
