@@ -13,7 +13,7 @@ Usage:
   # Terminal 1 — SITL
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
       -v ArduCopter --model=JSON --no-rebuild --console --map \
-      --home=23.450868,120.286135,46,0
+      -l 23.450868,120.286135,46,0
 
   # Terminal 2 — stub bridge (keeps SITL loop alive)
   python3 control/stub_bridge.py
@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control.sitl_bridge import SITLBridge
 
-_HOME_ELEV = 46.0   # metres MSL — matches --home=23.450868,120.286135,46,0
+_HOME_ELEV = 46.0   # metres MSL — matches -l 23.450868,120.286135,46,0
 _HOVER_AGL = 5.0    # metres above ground for "parked" physics state
 
 try:

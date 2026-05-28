@@ -15,7 +15,7 @@ Protocol (ArduPilot is the CLIENT, this bridge is the SERVER):
 Start SITL before running the sim (from project root):
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
       -v ArduCopter --model=JSON --no-rebuild --console --map \
-      --home=23.450868,120.286135,46,0
+      -l 23.450868,120.286135,46,0
 
 Coordinate conventions:
   Isaac Sim  (ENU):  X = East,  Y = North, Z = Up

@@ -226,7 +226,7 @@ Then start SITL before Isaac Sim:
 # Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on 14550)
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    --home=23.450868,120.286135,46,0
+    -l 23.450868,120.286135,46,0
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh
