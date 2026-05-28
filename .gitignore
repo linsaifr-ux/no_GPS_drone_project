@@ -50,10 +50,16 @@ anyloc/test_output/
 **/dataset/
 **/data/
 
+# ArduPilot SITL runtime artefacts (written to project root by sim_vehicle.py)
+eeprom.bin
+mav.tlog
+mav.tlog.raw
+*.tlog
+*.tlog.raw
+*.bin
+
 # ArduPilot SITL logs
 control/logs/
-control/*.tlog
-control/*.bin
 
 # IDE
 .vscode/
@@ -71,6 +77,9 @@ Thumbs.db
 *token*
 *secret*
 *credential*
+
+# Third-party dependencies (cloned separately, not tracked)
+third_party/
 
 #contest ref
 114rule.pdf

@@ -14,7 +14,10 @@ Run:
     DISPLAY=:2 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python cesium_scene.py
 """
 
-import io as _io, json, math, os, struct, time, urllib.parse, urllib.request
+import io as _io, json, math, os, struct, sys, time, urllib.parse, urllib.request
+
+# Project root on path so control/ package is importable from simulator/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import requests
@@ -734,6 +737,14 @@ for tile_info in terrain_tiles:
 
 print(f"[TERRAIN] Loaded {n_terrain_tiles} terrain tiles")
 
+# ── SITL bridge (import after centre_elev is known) ───────────────────────────
+try:
+    from control.sitl_bridge import SITLBridge as _SITLBridge
+    _sitl = _SITLBridge(listen_port=9002, centre_elev=centre_elev)
+except ImportError as _e:
+    print(f"[SITL] Bridge not loaded: {_e}")
+    _sitl = None
+
 # ── LOAD CESIUM OSM BUILDINGS ─────────────────────────────────────────────────
 print("[CESIUM] Loading Cesium OSM Buildings …")
 building_tiles, bld_token = fetch_building_tiles()
@@ -986,6 +997,11 @@ while simulation_app.is_running():
         _lbl_latlon.text = f"  LAT  {_lat:.5f}°N    LON  {_lon:.5f}°E"
         _lbl_alt.text    = f"  ALT  {_alt:.1f} m MSL    AGL  {_agl:.1f} m"
         _lbl_cam.text    = f"  CAM  {'Drone (nadir)' if _drone_view else 'Overview'}"
+
+    # ── SITL bridge — send physics state every step ───────────────────────────
+    if _sitl is not None:
+        _sitl.step(float(_p[0]), float(_p[1]), _alt,
+                   float(drone_yaw_op.Get()), time.time())
 
     # ── Frame capture ─────────────────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:

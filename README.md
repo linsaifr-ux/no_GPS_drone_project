@@ -10,29 +10,31 @@ Autonomous drone system that localises itself and detects objects without GPS, v
 ## Pipeline
 
 ```
-Isaac Sim
-    │ physics state (JSON/UDP)
-    ▼
-ArduPilot SITL ──MAVLink──► HIGHRES_IMU → imu_fusion.py (anchor validator)
-    │                    └─► SET_POSITION_TARGET ◄── main.py
+Isaac Sim (cesium_scene.py)
+    │ IMU + baro JSON  ◄──servo PWM──┐
+    ▼                                │
+control/sitl_bridge.py          ArduPilot SITL
+  (UDP server :9002)  ──physics──►  (JSON client)
+                                     │ MAVLink UDP:14550
+                              ┌──────┴──────────────────┐
+                              ▼                         ▼
+                      HIGHRES_IMU                EKF_STATUS_REPORT
+                      → imu_fusion.py            (position valid?)
+
+drone_frames/latest.jpg + latest_meta.json
     │
-    │  drone_frames/latest.jpg + latest_meta.json
+    ├──► AnyLoc + VO  ──VISION_POSITION_ESTIMATE──► ArduPilot EKF3
+    │    (position estimate)                        (no-GPS fusion)
+    │
+    └──► YOLO (bounding boxes)
+
+imu_fusion.py validates AnyLoc anchors using HIGHRES_IMU
+    │
     ▼
- ┌──────────────────────┐
- ▼                      ▼
-AnyLoc + VO           YOLO
-(position estimate)   (bounding boxes)
- │
- ▼
-imu_fusion.py → validated position
- │
- └──────────────────────┐
-                        ▼
-                   main.py (orchestrator)
-                        │
-                        ▼
-                 MAVLink commands
-                 → ArduPilot SITL / real FC
+main.py (orchestrator)
+    │ SET_POSITION_TARGET_LOCAL_NED
+    ▼
+ArduPilot SITL / real FC
 ```
 
 ---
@@ -62,11 +64,13 @@ no_GPS_drone_project/
 │   └── finetune.py        # fine-tune YOLOv8 on the top-down dataset
 ├── yolov8l_visdrone.pt    # YOLOv8l pre-trained on VisDrone (10 aerial classes)
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
-├── control/               # ArduPilot MAVLink + IMU fusion — TODO
-│   ├── sitl_bridge.py     #   Isaac Sim → ArduPilot SITL JSON/UDP sender
-│   ├── mavlink_ctrl.py    #   pymavlink subscriber + command sender
-│   ├── imu_reader.py      #   HIGHRES_IMU reader
-│   └── imu_fusion.py      #   anchor validator + VO quality gate
+├── control/               # ArduPilot MAVLink + IMU fusion
+│   ├── sitl_bridge.py     #   UDP server :9002 — receives servo PWM, replies physics (DONE)
+│   ├── mavlink_ctrl.py    #   pymavlink: VISION_POSITION_ESTIMATE + flight commands (TODO)
+│   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO)
+│   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO)
+├── third_party/
+│   └── ardupilot/         #   ArduPilot source — built SITL binary at build/sitl/bin/arducopter
 └── main.py                # top-level orchestrator — TODO
 ```
 
@@ -83,10 +87,13 @@ no_GPS_drone_project/
 | 5 | YOLO detection working on simulated frames | Done |
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone dataset + synthetic data) | Ready to run |
-| 6a | ArduPilot SITL + Isaac Sim JSON bridge | TODO |
-| 6b | MAVLink command interface: planned-path flight | TODO |
-| 6c | IMU data via HIGHRES_IMU feeding localization | TODO |
-| 6d | IMU fusion: anchor validator + VO quality gate | TODO |
+| 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) | Done |
+| 6b-i | pymavlink connection to ArduPilot MAVLink output | TODO |
+| 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | TODO |
+| 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
+| 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
+| 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
+| 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -100,6 +107,10 @@ no_GPS_drone_project/
 - conda env `isaac_sim_test`
 - Cesium ion account (token already embedded in `cesium_scene.py`)
 - Display (X11 or virtual framebuffer, e.g. `DISPLAY=:2`)
+- Python 3 system packages: `pexpect`, `mavproxy`, `pymavlink`, `future`
+  ```bash
+  pip3 install --user --break-system-packages pexpect mavproxy pymavlink future
+  ```
 
 ### Run the simulator
 
@@ -190,6 +201,38 @@ python detection/finetune.py
 ```
 
 The best weights are saved to `detection/runs/topdown_v1/weights/best.pt`. Update `run_detector.py` to use them.
+
+---
+
+### Run ArduPilot SITL (separate terminal)
+
+ArduPilot must be built once before first use:
+
+```bash
+# 1. Initialize submodules (one-time, ~5 min)
+cd third_party/ardupilot
+git submodule update --init --depth=1 --recursive
+
+# 2. Build ArduCopter SITL binary (~2 min)
+python3 waf configure --board sitl
+python3 waf copter
+cd ../..
+```
+
+Then start SITL before Isaac Sim:
+
+```bash
+# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on 14550)
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map
+
+# Terminal 2 — Isaac Sim (bridge auto-connects on first step)
+cd simulator && ./run_chiayi.sh
+```
+
+The bridge (`control/sitl_bridge.py`) is a UDP server embedded in the Isaac Sim loop.
+ArduPilot sends servo PWM to port 9002; the bridge replies with IMU + baro + attitude each step.
+"No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading.
 
 ---
 

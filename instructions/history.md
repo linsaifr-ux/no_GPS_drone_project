@@ -481,3 +481,103 @@ ArduPilot SITL (JSON backend)
     ├─ ATTITUDE, LOCAL_POSITION_NED → state estimation
     └─ accepts SET_POSITION_TARGET_LOCAL_NED (replaces keyboard control)
 ```
+
+---
+
+## 2026-05-27 — Milestone 6a: ArduPilot SITL JSON bridge
+
+### What was done
+
+Created `control/sitl_bridge.py` and wired it into `simulator/cesium_scene.py`.
+
+**Files created:**
+- `control/__init__.py` — makes `control/` a Python package
+- `control/sitl_bridge.py` — `SITLBridge` class
+
+**`SITLBridge` class:**
+- Sends drone physics state to ArduPilot SITL JSON backend via UDP (port 9002) every sim step
+- Receives servo/motor outputs from SITL on port 9003 (`recv_servos()`) — used in milestone 6b
+- Takes Isaac Sim ENU state `(x_enu, y_enu, z_abs, yaw_deg)` each step and converts to ArduPilot NED JSON
+
+**Coordinate conversions:**
+- ENU → NED: `north = y_enu`, `east = x_enu`, `down = -(z_abs - centre_elev)`
+- Yaw: Isaac Sim RotateZ CCW-positive → ArduPilot NED CW-positive: `yaw_rad = -radians(yaw_deg)`
+
+**Computed quantities (no physics engine — finite difference):**
+- Velocity NED: `Δpos / Δt`, clamped to ±30 m/s (prevents spikes when keyboard moves 5 m/step)
+- Acceleration NED: `Δvel / Δt`, low-pass filtered (α=0.3 EMA) to smooth keyboard jump artifacts
+- IMU specific force (body frame): `accel_ned - (0, 0, +g)` rotated by yaw into body frame
+  - At hover: `[0, 0, -9.81]` ✓
+- Yaw rate: `Δyaw / Δt` with wrap-to-`[-π, π]`
+- Barometric pressure: ISA approximation `101325 × exp(-alt_msl / 8500)`
+
+**`simulator/cesium_scene.py` changes (3 edits):**
+1. Added `sys` to imports; added `sys.path.insert` so `control/` is importable from `simulator/`
+2. After terrain load (when `centre_elev` is known): `_sitl = SITLBridge(centre_elev=centre_elev)`; wrapped in `try/except ImportError` so sim still runs without the bridge
+3. In simulation loop after HUD update: `_sitl.step(x, y, alt, yaw, time.time())` called every step (not gated to DRONE_SAVE_EVERY)
+
+**Known limitations:**
+- The drone is a scripted Xform — position jumps 5 m per key press. Velocity/acceleration clamp and EMA filter prevent SITL from seeing implausible IMU values, but the motion is not physically realistic. Milestone 6b-iv replaces keyboard control with `SET_POSITION_TARGET_LOCAL_NED` commands from ArduPilot.
+- The JSON bridge currently sends `position_xyz` (ground-truth position from Isaac Sim), which ArduPilot EKF3 treats as a GPS substitute. This is **not** the no-GPS pipeline. Milestone 6b-ii removes `position_xyz` from the bridge and milestone 6b-iii replaces it with AnyLoc estimates sent via `VISION_POSITION_ESTIMATE` MAVLink messages.
+
+**Run order:**
+```bash
+# Terminal 1 — start ArduPilot SITL first
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --console --map
+
+# Terminal 2 — start Isaac Sim (bridge auto-connects on first step)
+cd simulator && ./run_chiayi.sh
+```
+
+---
+
+## 2026-05-28 — ArduPilot SITL build, protocol fix, milestone restructure
+
+### ArduPilot SITL build
+
+`--depth=1` clone does not pull submodules. Required submodules and fixes:
+
+```bash
+# All submodules at once (avoids discovering them one by one as build fails)
+git submodule update --init --depth=1 --recursive   # ~5 min
+
+# Configure and build ArduCopter SITL binary
+python3 waf configure --board sitl
+python3 waf copter   # ~2 min, binary → build/sitl/bin/arducopter
+```
+
+System Python3 dependencies installed for SITL tooling:
+```bash
+pip3 install --user --break-system-packages pexpect mavproxy pymavlink future
+```
+
+### Bug fixed: sitl_bridge.py protocol was backwards
+
+**Original (wrong):** bridge was a UDP client that pushed physics state to port 9002 (as if ArduPilot was listening there).
+
+**Correct:** ArduPilot is the JSON **client** — it sends `{"pwm": [...], "frame_time_us": N}` to the simulator and waits for physics state back. The bridge must be a UDP **server** listening on port 9002, receiving servo packets, and replying with physics state.
+
+Fix: rewrote `SITLBridge` from a push client to a request-response server:
+- `self._sock.bind(("0.0.0.0", 9002))` — server binds
+- Each `step()`: drains incoming servo packets (non-blocking), learns `_ap_addr` from first packet, replies to that address with current physics state
+- `step()` returns the latest servo dict for use in milestone 6b-iv
+
+The message "No JSON sensor message received, resending servos" is ArduPilot's normal retry output while waiting for the simulator — it stops once Isaac Sim is running and the bridge replies.
+
+### Architecture clarification: position_xyz is GPS, not no-GPS
+
+`position_xyz` and `velocity_xyz` in the JSON bridge packet act as a GPS substitute in ArduPilot's EKF3. Sending them defeats the no-GPS goal. They are intentionally omitted from the bridge.
+
+The no-GPS position source is `VISION_POSITION_ESTIMATE` MAVLink messages, sent from `mavlink_ctrl.py` using AnyLoc position estimates. ArduPilot EKF3 fuses this as an external vision source — same mechanism as Intel RealSense T265 or OptiTrack on real hardware.
+
+### Milestone 6b restructured into 4 ordered sub-steps
+
+| Sub-step | What |
+|---|---|
+| 6b-i | pymavlink connection to ArduPilot MAVLink output (UDP:14550) |
+| 6b-ii | Disable GPS (`GPS_TYPE=0`); bridge sends IMU+baro only |
+| 6b-iii | `VISION_POSITION_ESTIMATE` from AnyLoc → ArduPilot EKF3 |
+| 6b-iv | `SET_POSITION_TARGET_LOCAL_NED` flight commands (replaces keyboard) |
+
+6b-iii must precede 6b-iv: ArduPilot refuses position commands until EKF3 has a valid position fix.
