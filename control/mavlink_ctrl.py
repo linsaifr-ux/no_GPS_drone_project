@@ -46,10 +46,13 @@ class MAVLinkCtrl:
     the main sim or localisation loop.
     """
 
-    def __init__(self, connection_str: str = "udp:0.0.0.0:14550",
+    def __init__(self, connection_str: str = "tcp:localhost:5762",
                  source_system: int = 255):
         """
         connection_str : pymavlink connection string
+            "tcp:localhost:5762"  — direct SITL TCP port 2 (default; no mavproxy needed)
+            "tcp:localhost:5760"  — SITL TCP port 1 (mavproxy uses this; avoid conflict)
+            "tcp:localhost:5763"  — SITL TCP port 3 (spare)
         source_system  : GCS MAVLink system ID (must not clash with vehicle = 1)
         """
         self._mav = mavutil.mavlink_connection(

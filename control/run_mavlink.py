@@ -40,9 +40,12 @@ def main():
     ok = ctrl.wait_heartbeat(timeout=60.0)
     if not ok:
         print("\nNo HEARTBEAT received.")
-        print("Is SITL running?  python3 third_party/ardupilot/Tools/autotest/"
-              "sim_vehicle.py -v ArduCopter --model=JSON --no-rebuild "
-              "--console --map --home=23.450868,120.286135,46,0")
+        print("Make sure SITL AND the bridge are both running:")
+        print("  Terminal 1: python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py "
+              "-v ArduCopter --model=JSON --no-rebuild --console --map "
+              "--home=23.450868,120.286135,46,0")
+        print("  Terminal 2: python3 control/stub_bridge.py  "
+              "# (or start Isaac Sim with cesium_scene.py)")
         return
 
     print("\n[MAVLink] Monitoring — Ctrl-C to quit\n")
