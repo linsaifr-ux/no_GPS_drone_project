@@ -581,3 +581,50 @@ The no-GPS position source is `VISION_POSITION_ESTIMATE` MAVLink messages, sent 
 | 6b-iv | `SET_POSITION_TARGET_LOCAL_NED` flight commands (replaces keyboard) |
 
 6b-iii must precede 6b-iv: ArduPilot refuses position commands until EKF3 has a valid position fix.
+
+---
+
+## 2026-05-28 — Milestone 6b-i: pymavlink connection (control/mavlink_ctrl.py)
+
+### Files created
+
+**`control/mavlink_ctrl.py`** — `MAVLinkCtrl` class:
+- `__init__(connection_str="udp:0.0.0.0:14550")` — pymavlink connection; binds to port
+  14550 and waits for mavproxy/SITL to push packets (standard GCS-style connection)
+- `wait_heartbeat(timeout=60)` — blocking; learns `target_system` / `target_component`
+  from first HEARTBEAT, then requests data streams
+- `recv()` — non-blocking drain; updates `_imu`, `_attitude`, `_local_pos`, `_ekf`,
+  `_heartbeat` from incoming MAVLink messages; returns list of type strings received
+- `_request_streams()` — asks ArduPilot for all data streams at 10 Hz via
+  `REQUEST_DATA_STREAM_ALL`; requests `HIGHRES_IMU` separately at 50 Hz via
+  `MAV_CMD_SET_MESSAGE_INTERVAL`
+- Properties: `connected`, `imu`, `attitude`, `local_pos`, `ekf_flags`, `ekf_pos_valid`
+- Stubs for 6b-iii: `send_vision_position(north, east, down, yaw_rad, covariance)`
+  — sends `VISION_POSITION_ESTIMATE`; default covariance 5 m position std, 0.2 rad
+  orientation std (needs tuning once AnyLoc error is characterised)
+- Stubs for 6b-iv: `arm()`, `takeoff(alt_m)`, `set_position_ned(north, east, down, yaw_rad)`
+  — `set_position_ned` uses `SET_POSITION_TARGET_LOCAL_NED` with type_mask
+  `0b111111111000` (position only) or `0b110111111000` (position + yaw)
+
+**`control/run_mavlink.py`** — terminal monitor:
+- Connects, waits for HEARTBEAT, then prints rolling single-line display at 10 Hz:
+  roll/pitch/yaw (degrees), NED position (metres), IMU accelerations (m/s²), EKF flags
+- EKF flags decoded to named labels: ATT, VEL, POS_REL, POS_ABS, PRED_ABS
+
+### EKF_STATUS_REPORT flag constants (exported from mavlink_ctrl.py)
+
+| Constant | Bit | Meaning |
+|---|---|---|
+| `EKF_ATTITUDE` | 0 | Attitude valid |
+| `EKF_VEL_HORIZ` | 1 | Horizontal velocity valid |
+| `EKF_POS_HORIZ_REL` | 3 | Relative horizontal position valid |
+| `EKF_POS_HORIZ_ABS` | 4 | Absolute horizontal position valid (GPS or vision fused) |
+| `EKF_PRED_POS_HORIZ_ABS` | 9 | Vision position estimate accepted by EKF3 |
+
+`EKF_POS_HORIZ_ABS` going high is the signal that `VISION_POSITION_ESTIMATE` is being
+fused — needed before 6b-iv flight commands will be accepted.
+
+### Notes
+- `position_xyz` and `velocity_xyz` remain in the JSON bridge for now (GPS substitute).
+  They are removed in milestone 6b-ii after `VISION_POSITION_ESTIMATE` is working.
+- The bridge's `step()` already returns the latest servo dict; 6b-iv reads PWM from there.

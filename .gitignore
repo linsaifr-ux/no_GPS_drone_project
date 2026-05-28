@@ -57,6 +57,8 @@ mav.tlog.raw
 *.tlog
 *.tlog.raw
 *.bin
+*.parm
+terrain/
 
 # ArduPilot SITL logs
 control/logs/

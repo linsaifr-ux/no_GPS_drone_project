@@ -406,7 +406,7 @@ AnyLoc + VO          YOLO         │
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone + synthetic data) | Ready to run |
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro → SITL each step) | Done |
-| 6b-i | pymavlink connection to ArduPilot MAVLink output (UDP:14550) | TODO |
+| 6b-i | pymavlink connection to ArduPilot MAVLink output (UDP:14550) | Done |
 | 6b-ii | Disable GPS in SITL; strip position_xyz from JSON bridge (IMU+baro only) | TODO |
 | 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
 | 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | TODO |

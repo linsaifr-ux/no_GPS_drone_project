@@ -66,9 +66,10 @@ no_GPS_drone_project/
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
 ├── control/               # ArduPilot MAVLink + IMU fusion
 │   ├── sitl_bridge.py     #   UDP server :9002 — receives servo PWM, replies physics (DONE)
-│   ├── mavlink_ctrl.py    #   pymavlink: VISION_POSITION_ESTIMATE + flight commands (TODO)
-│   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO)
-│   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO)
+│   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision_position + flight cmds (DONE 6b-i)
+│   ├── run_mavlink.py     #   live terminal monitor: attitude, NED pos, IMU, EKF flags
+│   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO 6c)
+│   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO 6d)
 ├── third_party/
 │   └── ardupilot/         #   ArduPilot source — built SITL binary at build/sitl/bin/arducopter
 └── main.py                # top-level orchestrator — TODO
@@ -88,7 +89,7 @@ no_GPS_drone_project/
 | 5a | Switch to VisDrone-trained YOLOv8l; auto class-map in detector | Done |
 | 5b | Top-down fine-tuning pipeline (VisDrone dataset + synthetic data) | Ready to run |
 | 6a | ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) | Done |
-| 6b-i | pymavlink connection to ArduPilot MAVLink output | TODO |
+| 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
 | 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | TODO |
 | 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | TODO |
 | 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
@@ -234,6 +235,24 @@ cd simulator && ./run_chiayi.sh
 The bridge (`control/sitl_bridge.py`) is a UDP server embedded in the Isaac Sim loop.
 ArduPilot sends servo PWM to port 9002; the bridge replies with IMU + baro + attitude each step.
 "No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading.
+
+### Monitor MAVLink state (separate terminal)
+
+```bash
+python3 control/run_mavlink.py
+```
+
+Prints a live rolling line at 10 Hz showing attitude, NED position, IMU accelerations,
+and EKF status flags. Start after SITL is running; it will wait up to 60 s for HEARTBEAT.
+
+```
+    TIME    ROLL°    PCH°    YAW°          N m          E m          D m       Ax      Ay      Az  EKF flags
+-------- ------- ------- -------  --------- --------- ---------  ------- ------- -------  ---------
+  1234.5    0.01   -0.02   90.00       0.12       0.05      -9.87     0.01   -0.01   -9.81  0x003f ATT,VEL,POS_ABS
+```
+
+`POS_ABS` in the EKF column means ArduPilot's EKF3 has a valid absolute position fix —
+required before flight commands will be accepted (milestone 6b-iv).
 
 ---
 
