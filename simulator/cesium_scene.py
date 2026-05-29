@@ -736,6 +736,14 @@ for tile_info in terrain_tiles:
     n_terrain_tiles += 1
 
 print(f"[TERRAIN] Loaded {n_terrain_tiles} terrain tiles")
+print(f"[TERRAIN] centre_elev = {centre_elev:.1f} m MSL  (use this for SITL -l and HOME_ALT_MSL)")
+
+# Write terrain elevation so run_flight.py and SITL can use the real value.
+_home_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "control", "home_elevation.json")
+with open(_home_cfg, "w") as _f:
+    json.dump({"centre_elev_m": centre_elev,
+               "lat": CENTER_LAT, "lon": CENTER_LON}, _f)
 
 # ── SITL bridge (import after centre_elev is known) ───────────────────────────
 try:
@@ -816,7 +824,7 @@ os.makedirs(DRONE_FRAME_DIR, exist_ok=True)
 drone_root   = UsdGeom.Xform.Define(stage, "/World/Drone")
 drone_pos_op = drone_root.AddTranslateOp()
 drone_yaw_op = drone_root.AddRotateZOp()          # yaw about world-up (Z)
-drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev + 50.0))
+drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev if _sitl is not None else centre_elev + 50.0))
 drone_yaw_op.Set(0.0)
 
 # Quadcopter: central body + 4 arms + motor pods + propeller discs
@@ -957,6 +965,31 @@ print("[CESIUM] © Cesium ion | © OpenStreetMap contributors | © 內政部國�
 print("[SCENE] Running — close the window to exit  |  TAB = toggle camera view")
 
 simulation_app.update()
+
+# ── Kinematic drone physics ────────────────────────────────────────────────────
+# ArduPilot PWM (1000–2000 µs) drives the drone position each sim step.
+# Keyboard keys act as an override for manual repositioning.
+#
+# Motor layout assumed (ArduPilot QUAD_X):
+#   index 0 (M1) = front-right,  index 1 (M2) = rear-left
+#   index 2 (M3) = front-left,   index 3 (M4) = rear-right
+# If the drone moves in the wrong direction, flip the sign of _roll_tgt / _pitch_tgt.
+_K_GRAVITY  = 9.81
+_K_MAX_VEL  = 15.0   # m/s velocity clamp
+_K_MAX_TILT = 0.35   # rad (~20°) max tilt from PWM differential
+_K_TILT_TAU = 0.15   # s first-order attitude time constant
+
+_kspawn = drone_pos_op.Get()
+_kx     = float(_kspawn[0])   # ENU east  of home (m)
+_ky     = float(_kspawn[1])   # ENU north of home (m)
+_kz     = float(_kspawn[2])   # altitude MSL (m)
+_kvn    = 0.0                 # velocity north (m/s)
+_kve    = 0.0                 # velocity east  (m/s)
+_kvd    = 0.0                 # velocity NED down (m/s)
+_kroll  = 0.0                 # estimated roll  (rad, positive = right side down)
+_kpitch = 0.0                 # estimated pitch (rad, positive = nose up)
+_kprev_t = None
+
 _step = 0
 while simulation_app.is_running():
     simulation_app.update()
@@ -970,8 +1003,7 @@ while simulation_app.is_running():
         print(f"[CAM] {'Drone (nadir)' if _drone_view else 'Overview'}")
     _tab_was_down = tab_down
 
-    # ── Keyboard drone control ────────────────────────────────────────────────
-    pos = drone_pos_op.Get()
+    # ── Keyboard override (manual repositioning) ─────────────────────────────
     dx = dy = dz = 0.0
     if _key("W"): dy += DRONE_SPEED_M
     if _key("S"): dy -= DRONE_SPEED_M
@@ -979,12 +1011,61 @@ while simulation_app.is_running():
     if _key("A"): dx -= DRONE_SPEED_M
     if _key("E"): dz += DRONE_SPEED_M
     if _key("Q"): dz -= DRONE_SPEED_M
-    if dx or dy or dz:
-        drone_pos_op.Set(Gf.Vec3d(pos[0] + dx, pos[1] + dy, pos[2] + dz))
+    _kb_moved = bool(dx or dy or dz)
+    if _kb_moved:
+        _kx += dx; _ky += dy; _kz += dz
+        _kvn = _kve = _kvd = 0.0   # reset velocity on manual move
+        _kroll = _kpitch = 0.0
+        drone_pos_op.Set(Gf.Vec3d(_kx, _ky, _kz))
 
     yaw = float(drone_yaw_op.Get())
     if _key("Z"): drone_yaw_op.Set(yaw + 1.0)
     if _key("X"): drone_yaw_op.Set(yaw - 1.0)
+
+    # ── PWM kinematic physics ─────────────────────────────────────────────────
+    _t_now   = time.time()
+    _kdt     = min(_t_now - _kprev_t, 0.05) if _kprev_t is not None else 0.0
+    _kprev_t = _t_now
+
+    _kpwm = _sitl.last_pwm if _sitl is not None else None
+    if _kpwm is not None and _kdt > 0 and not _kb_moved:
+        _p4 = [max(0.0, (v - 1000) / 1000.0) for v in _kpwm[:4]]
+        _mean_p  = sum(_p4) / 4.0
+        _kthrust = _mean_p * 2.0 * _K_GRAVITY   # 0 – 2 g
+
+        # Motor differential → target roll/pitch
+        # roll right (+): left motors (M2+M3) > right motors (M1+M4)
+        # pitch up  (+): front motors (M1+M3) > rear  motors (M2+M4)
+        _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
+        _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+
+        # First-order attitude dynamics
+        _ka = _kdt / (_K_TILT_TAU + _kdt)
+        _kroll  += _ka * (_roll_tgt  - _kroll)
+        _kpitch += _ka * (_pitch_tgt - _kpitch)
+
+        # Thrust vector rotated to NED via yaw
+        _kyaw_rad = -math.radians(float(drone_yaw_op.Get()))   # Isaac CCW° → NED CW rad
+        _kcy, _ksy = math.cos(_kyaw_rad), math.sin(_kyaw_rad)
+        _kbfwd = -_kthrust * math.sin(_kpitch)   # body-forward accel (- because pitch up = rearward)
+        _kbrgt =  _kthrust * math.sin(_kroll)    # body-right   accel
+        _kan = _kbfwd * _kcy - _kbrgt * _ksy     # NED north
+        _kae = _kbfwd * _ksy + _kbrgt * _kcy     # NED east
+        _kad = _K_GRAVITY - _kthrust * math.cos(_kroll) * math.cos(_kpitch)  # NED down
+
+        _kvn = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvn + _kan * _kdt))
+        _kve = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kve + _kae * _kdt))
+        _kvd = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvd + _kad * _kdt))
+
+        _ky += _kvn * _kdt   # ENU north = +Y
+        _kx += _kve * _kdt   # ENU east  = +X
+        _kz -= _kvd * _kdt   # NED down → decreasing altitude
+
+        if _kz <= centre_elev:   # ground constraint
+            _kz  = centre_elev
+            _kvd = min(0.0, _kvd)
+
+        drone_pos_op.Set(Gf.Vec3d(_kx, _ky, _kz))
 
     # ── Current drone geo position (shared by HUD + frame capture) ───────────
     _p   = drone_pos_op.Get()
@@ -1001,7 +1082,7 @@ while simulation_app.is_running():
     # ── SITL bridge — send physics state every step ───────────────────────────
     if _sitl is not None:
         _sitl.step(float(_p[0]), float(_p[1]), _alt,
-                   float(drone_yaw_op.Get()), time.time())
+                   float(drone_yaw_op.Get()), _kroll, _kpitch, time.time())
 
     # ── Frame capture ─────────────────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:

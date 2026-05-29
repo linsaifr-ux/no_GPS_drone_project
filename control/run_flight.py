@@ -11,14 +11,24 @@ position is written automatically so EKF3 gets a position fix without the
 full AnyLoc pipeline.
 
 Usage:
-  # Terminal 1 — SITL (no --out tcp:localhost:5763 needed)
+  # Terminal 1 — Isaac Sim first (prints centre_elev, writes control/home_elevation.json)
+  cd simulator && ./run_chiayi.sh
+
+  # Terminal 2 — SITL
+  # FIRST RUN (fresh setup or param change): load params into EEPROM with --wipe,
+  # then type "reboot" in the MAVProxy console so RebootRequired params (VISO_TYPE,
+  # SCHED_LOOP_RATE, FRAME_CLASS, SIM_GPS1_ENABLE) take effect.
+  #
+  #   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+  #       -v ArduCopter --model=JSON --no-rebuild --console --map \
+  #       -l 23.450868,120.286135,<centre_elev>,0 \
+  #       --add-param-file=control/no_gps.parm --wipe
+  #   (wait for "Saved 1 params" in console, then type: reboot)
+  #
+  # SUBSEQUENT RUNS (params already in EEPROM — no --wipe needed):
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
       -v ArduCopter --model=JSON --no-rebuild --console --map \
-      -l 23.450868,120.286135,46,0 \
-      --add-param-file=control/no_gps.parm --wipe
-
-  # Terminal 2 — bridge
-  python3 control/stub_bridge.py   # or: cd simulator && ./run_chiayi.sh
+      -l 23.450868,120.286135,<centre_elev>,0
 
   # Terminal 3 (optional) — AnyLoc localizer
   DISPLAY=:2 conda run -n isaac_sim_test python anyloc/run_localizer.py
@@ -42,7 +52,17 @@ from pymavlink import mavutil
 # ── Home position (must match SITL -l flag) ────────────────────────────────────
 HOME_LAT     = 23.450868
 HOME_LON     = 120.286135
-HOME_ALT_MSL = 46.0
+
+# Read terrain elevation written by cesium_scene.py; fall back to 46 m if not found.
+_HOME_CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "home_elevation.json")
+try:
+    with open(_HOME_CFG) as _f:
+        HOME_ALT_MSL = float(json.load(_f)["centre_elev_m"])
+    print(f"[Flight] HOME_ALT_MSL = {HOME_ALT_MSL:.1f} m (from {_HOME_CFG})")
+except (FileNotFoundError, KeyError):
+    HOME_ALT_MSL = 46.0
+    print(f"[Flight] HOME_ALT_MSL = {HOME_ALT_MSL:.1f} m (default — run Isaac Sim first to set terrain elevation)")
+
 COS_LAT      = math.cos(math.radians(HOME_LAT))
 M_PER_DEG    = 111_320.0
 
@@ -81,8 +101,8 @@ def _write_stub_estimate() -> None:
         "timestamp": time.time(),
         "est_lat":   HOME_LAT,
         "est_lon":   HOME_LON,
-        "alt_msl_m": HOME_ALT_MSL + 5.0,
-        "agl_m":     5.0,
+        "alt_msl_m": HOME_ALT_MSL,
+        "agl_m":     0.0,
         "yaw_deg":   0.0,
         "score":     0.9,
         "error_m":   0.0,
@@ -123,7 +143,14 @@ def _vision_loop(ctrl: MAVLinkCtrl, stop: threading.Event) -> None:
             pass
 
         if current_est is not None:
-            ctrl.send_vision_position(*current_est)
+            n, e, d, yaw_rad = current_est
+            # Use EKF's own altitude (baro-based) for the vision Z component so
+            # there is no vertical discrepancy that would trigger an innovation
+            # gate rejection and kill XY fusion during flight.
+            lp = ctrl.local_pos
+            if lp is not None:
+                d = lp.z
+            ctrl.send_vision_position(n, e, d, yaw_rad)
             n_sent += 1
             if n_sent == 1:
                 print("[Vision] First VISION_POSITION_ESTIMATE sent")
@@ -142,9 +169,17 @@ def main():
         print("[Flight] No HEARTBEAT — is SITL running?")
         return
 
-    # 2 — Ensure estimate file exists, then start vision thread
-    if not os.path.exists(ESTIMATE_JSON):
-        print(f"[Flight] {ESTIMATE_JSON} not found — writing stub at home position")
+    # 2 — Ensure estimate file exists and is fresh, then start vision thread
+    # Treat files older than 10 s as stale (leftover from a previous localizer run).
+    _needs_stub = True
+    if os.path.exists(ESTIMATE_JSON):
+        age = time.time() - os.path.getmtime(ESTIMATE_JSON)
+        if age < 10.0:
+            _needs_stub = False
+        else:
+            print(f"[Flight] {ESTIMATE_JSON} is {age:.0f} s old — overwriting with stub")
+    if _needs_stub:
+        print(f"[Flight] Writing stub estimate at home position")
         _write_stub_estimate()
 
     stop_ev = threading.Event()
@@ -159,6 +194,14 @@ def main():
         stop_ev.set(); ctrl.close(); return
     print("[Flight] EKF POS_ABS ✓")
 
+    # Let VisOdom health window fill: EKF_POS_ABS fires on the first VPE message,
+    # but AP_VisualOdom::healthy() requires a full second of steady messages.
+    # 3 s @ 5 Hz = 15 more VPEs, well above the 1-second health timeout.
+    print("[Flight] Waiting 3 s for VisOdom health …")
+    for _ in range(30):
+        ctrl.recv()
+        time.sleep(0.1)
+
     # 4 — GUIDED mode
     ctrl.set_mode("GUIDED")
     time.sleep(1.0)
@@ -169,12 +212,13 @@ def main():
     ctrl.arm()
     result = ctrl.wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=10.0)
 
-    if result is None:
-        print("[Flight] No ARM ACK — retrying with force …")
+    if result != 0:
+        names = {0:"ACCEPTED",1:"TEMPORARILY_REJECTED",2:"DENIED",3:"UNSUPPORTED",4:"FAILED"}
+        print(f"[Flight] Regular arm {names.get(result, result)} — retrying with force arm …")
         ctrl.arm(force=True)
         result = ctrl.wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=10.0)
 
-    if result != 0:
+    if result is None or result != 0:
         names = {0:"ACCEPTED",1:"TEMPORARILY_REJECTED",2:"DENIED",3:"UNSUPPORTED",4:"FAILED"}
         print(f"[Flight] ARM rejected: {names.get(result, result)}")
         stop_ev.set(); ctrl.close(); return

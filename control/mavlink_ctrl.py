@@ -336,13 +336,14 @@ class MAVLinkCtrl:
             10,  # 10 Hz
             1,   # start
         )
-        # HIGHRES_IMU is not included in any standard stream group — request explicitly
+        # HIGHRES_IMU is not included in any standard stream group — request explicitly.
+        # 40 000 µs = 25 Hz, safely below SCHED_LOOP_RATE=50 to avoid "rate too fast" warning.
         self._mav.mav.command_long_send(
             self._mav.target_system, self._mav.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
             mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU,
-            20000,  # 20 000 µs = 50 Hz
+            40000,  # 40 000 µs = 25 Hz
             0, 0, 0, 0, 0,
         )
-        print("[MAVLink] Requested all streams at 10 Hz, HIGHRES_IMU at 50 Hz")
+        print("[MAVLink] Requested all streams at 10 Hz, HIGHRES_IMU at 25 Hz")

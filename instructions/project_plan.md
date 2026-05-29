@@ -34,7 +34,7 @@ no_GPS_drone_project/
 ├── control/              # ArduPilot MAVLink interface (in progress)
 │   ├── sitl_bridge.py    #   UDP :9002 server — binary servo in, JSON physics out (no GPS)
 │   ├── stub_bridge.py    #   minimal bridge for testing MAVLink without Isaac Sim
-│   ├── no_gps.parm       #   SITL params: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
+│   ├── no_gps.parm       #   SITL params: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1, FS_GPS_ENABLE=0
 │   ├── mavlink_ctrl.py   #   MAVLinkCtrl class + EKF flag constants + vision + command stubs
 │   ├── run_mavlink.py    #   live terminal monitor (port 5762)
 │   └── run_vision.py     #   AnyLoc → VISION_POSITION_ESTIMATE → ArduPilot EKF3 (port 5763)
@@ -260,6 +260,9 @@ ArduPilot SITL ──MAVLink TCP:5762──► mavlink_ctrl.py
 - Replies with physics state JSON **terminated by `\n`** (required by ArduPilot's `recv_fdm` parser)
 - Computes velocity + acceleration by finite-differencing successive ENU positions
 - Clamps velocity to ±30 m/s and low-pass filters acceleration (EMA α=0.3)
+- Gyro body rates `[p, q, r]` via finite difference of roll, pitch, yaw angles (yaw wrapped to `[−π, π]`)
+- IMU specific force rotated to body frame via full 3-axis DCM: R_bn = (R_z(yaw)·R_y(pitch)·R_x(roll))ᵀ — at ground: `[0, 0, −9.81]`
+- `debug_hz` property: set to a positive value to print physics state at that rate (useful to cross-check against `Az` in `run_mavlink.py`)
 
 Physics state sent each step (key names must match ArduPilot's `SIM_JSON` keytable exactly):
 
@@ -267,10 +270,10 @@ Physics state sent each step (key names must match ArduPilot's `SIM_JSON` keytab
 {
   "timestamp": 1234.5,
   "imu": {
-    "gyro":       [0.0, 0.0, yaw_rate],
+    "gyro":       [roll_rate, pitch_rate, yaw_rate],
     "accel_body": [sf_bx, sf_by, sf_bz]
   },
-  "attitude":  [0.0, 0.0, yaw_rad],
+  "attitude":  [roll_rad, pitch_rad, yaw_rad],
   "velocity":  [vn, ve, vd],
   "rng_1":     agl_m,
   "battery":   {"voltage": 12.6, "current": 5.0}
@@ -365,13 +368,13 @@ Files status:
 
 | File | Status | Purpose |
 |------|--------|---------|
-| `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002; no GPS |
-| `control/no_gps.parm` | Done | SITL params: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1 |
-| `control/stub_bridge.py` | Done | Kinematic altitude model (PWM → thrust → AGL), port 9002 |
-| `control/mavlink_ctrl.py` | Done | pymavlink: recv + vision + set_mode + arm + wait helpers |
+| `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002; full gyro p/q/r; full DCM accel; `debug_hz` property |
+| `control/no_gps.parm` | Done | GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1, FS_GPS_ENABLE=0, FENCE_ENABLE=0 |
+| `control/stub_bridge.py` | Done | Kinematic altitude model (PWM → thrust → AGL), port 9002; prints state at 1 Hz |
+| `control/mavlink_ctrl.py` | Done | pymavlink: recv + vision + set_mode + arm + wait helpers; HIGHRES_IMU at 25 Hz |
 | `control/run_mavlink.py` | Done | Live terminal monitor at 10 Hz, port 5762 |
 | `control/run_vision.py` | Done (standalone) | Vision bridge only — use run_flight.py for combined |
-| `control/run_flight.py` | In progress (6b-iv) | Vision thread + flight sequence, single port 5762 |
+| `control/run_flight.py` | In progress (6b-iv) | Vision thread + flight sequence, single port 5762; stale estimate check; 3 s VisOdom wait |
 | `control/imu_reader.py` | TODO (6c) | HIGHRES_IMU reader, writes to shared state |
 | `control/imu_fusion.py` | TODO (6d) | IMU-based anchor validation + VO quality gate |
 

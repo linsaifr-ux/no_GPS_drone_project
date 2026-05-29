@@ -64,7 +64,11 @@ terrain/
 # AnyLoc runtime output (written each anchor frame, read by run_vision.py)
 anyloc/latest_estimate.json
 
-# ArduPilot SITL logs
+# Terrain elevation written by cesium_scene.py on startup (runtime, machine-specific)
+control/home_elevation.json
+
+# ArduPilot SITL logs (written to project root and control/ by sim_vehicle.py)
+logs/
 control/logs/
 
 # IDE

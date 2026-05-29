@@ -227,11 +227,18 @@ cd ../..
 Then start SITL before Isaac Sim:
 
 ```bash
-# Terminal 1 — SITL
+# Terminal 1 — FIRST RUN (or after changing no_gps.parm): flush EEPROM with --wipe
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,46,0 \
+    -l 23.450868,120.286135,<centre_elev>,0 \
     --add-param-file=control/no_gps.parm --wipe
+# Wait for "Saved N params" in MAVProxy console, then type: reboot
+# (VISO_TYPE and SCHED_LOOP_RATE require a second boot to take effect)
+
+# Terminal 1 — SUBSEQUENT RUNS (params already in EEPROM):
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    -l 23.450868,120.286135,<centre_elev>,0
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh
@@ -243,7 +250,11 @@ the bridge parses it, learns ArduPilot's reply address from the source port, and
 JSON physics state terminated by `\n` each step.
 "No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading (~2–5 min).
 
-To test MAVLink without Isaac Sim, use the kinematic stub bridge:
+Key `no_gps.parm` parameters: `GPS_TYPE=0` (disable GPS), `EK3_SRC1_POSXY=6` (ExtNav position from VPE),
+`VISO_TYPE=1` (enable vision odometry driver), `FS_GPS_ENABLE=0` (prevent GPS failsafe GUIDED→LAND after arming),
+`FENCE_ENABLE=0` (prevent geofence blocking flight near origin).
+
+To test MAVLink without Isaac Sim, use the kinematic stub bridge (prints physics state at 1 Hz for cross-checking):
 
 ```bash
 # Terminal 2 — stub (kinematic altitude model, responds to ArduPilot thrust)
@@ -293,8 +304,8 @@ and EKF status flags. Start after SITL + bridge are both running; waits up to 60
 Expected EKF progression after bridge connects:
 - `UNINIT` (0x0400) — normal at startup; EKF hasn't initialised yet
 - `ATT` — IMU tilt alignment complete (~5–10 s)
-- `ATT,VEL` — horizontal velocity being estimated
-- `ATT,VEL,POS_ABS` — absolute position valid; flight commands accepted (milestone 6b-iv)
+- `ATT,VEL_H,VEL_V,ALT` + bit 7 (`CONST_POS_MODE`) — bridge running but no VPE yet; N/E/D show `nan`
+- `ATT,VEL,ALT,POS_ABS` — VPE fused; N/E/D populate; flight commands accepted
 
 ---
 

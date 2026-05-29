@@ -56,6 +56,8 @@ except OSError as e:
         sys.exit(1)
     raise
 
+bridge.debug_hz = 1.0   # print physics state once per second
+
 # ── Kinematic state ────────────────────────────────────────────────────────────
 _x_enu = 0.0           # east  of home (m)
 _y_enu = 0.0           # north of home (m)

@@ -86,11 +86,15 @@ class SITLBridge:
         self._prev_vel_ned   = None
         self._prev_accel_ned = None
         self._prev_yaw_rad   = None
+        self._prev_roll_rad  = None
+        self._prev_pitch_rad = None
         self._prev_t         = None
 
-        self._start_t  = time.time()
-        self._n_sent   = 0
-        self._last_pwm = None   # most recent servo PWM from ArduPilot (for 6b)
+        self._start_t    = time.time()
+        self._n_sent     = 0
+        self._last_pwm   = None   # most recent servo PWM from ArduPilot (for 6b)
+        self._last_debug = 0.0    # wall time of last debug print
+        self._debug_hz   = 0.0    # 0 = disabled; set via debug_hz property
 
         print(f"[SITL] Bridge listening on UDP port {listen_port}  "
               f"(centre_elev={centre_elev:.1f} m MSL)")
@@ -99,7 +103,8 @@ class SITLBridge:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def step(self, x_enu: float, y_enu: float, z_abs: float,
-             yaw_deg: float, wall_time: float | None = None) -> dict | None:
+             yaw_deg: float, roll_rad: float = 0.0, pitch_rad: float = 0.0,
+             wall_time: float | None = None) -> dict | None:
         """
         Called each sim step after drone position is updated.
 
@@ -110,6 +115,8 @@ class SITLBridge:
         x_enu, y_enu : ENU metres from scene centre (East, North)
         z_abs        : absolute altitude in metres MSL
         yaw_deg      : Isaac Sim RotateZ degrees (CCW-positive)
+        roll_rad     : roll angle (rad, positive = right side down, NED convention)
+        pitch_rad    : pitch angle (rad, positive = nose up, NED convention)
         """
         t = wall_time if wall_time is not None else time.time()
 
@@ -130,7 +137,7 @@ class SITLBridge:
             self._connected = True
 
         # ── Build physics state ────────────────────────────────────────────
-        state = self._build_state(x_enu, y_enu, z_abs, yaw_deg, t)
+        state = self._build_state(x_enu, y_enu, z_abs, yaw_deg, roll_rad, pitch_rad, t)
 
         # ── Reply to ArduPilot ─────────────────────────────────────────────
         if self._ap_addr is not None:
@@ -148,6 +155,23 @@ class SITLBridge:
         # ── Save state for next step ───────────────────────────────────────
         self._prev_t = t
 
+        # ── Optional debug print ───────────────────────────────────────────
+        if self._debug_hz > 0 and self._ap_addr is not None:
+            interval = 1.0 / self._debug_hz
+            if t - self._last_debug >= interval:
+                self._last_debug = t
+                s = state
+                g = s["imu"]["gyro"];  a = s["imu"]["accel_body"]
+                v = s["velocity"];     at = s["attitude"]
+                print(
+                    f"[SITL] t={s['timestamp']:7.2f}s"
+                    f"  gyro p={g[0]:+6.3f} q={g[1]:+6.3f} r={g[2]:+6.3f} rad/s"
+                    f"  accel bx={a[0]:+6.2f} by={a[1]:+6.2f} bz={a[2]:+6.2f} m/s²"
+                    f"  vel N={v[0]:+6.2f} E={v[1]:+6.2f} D={v[2]:+6.2f} m/s"
+                    f"  att r={math.degrees(at[0]):+5.1f}° p={math.degrees(at[1]):+5.1f}°"
+                    f"  rng={s['rng_1']:.2f}m"
+                )
+
         return latest_servos
 
     @property
@@ -158,6 +182,14 @@ class SITLBridge:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def debug_hz(self) -> float:
+        return self._debug_hz
+
+    @debug_hz.setter
+    def debug_hz(self, hz: float) -> None:
+        self._debug_hz = hz
 
     def close(self) -> None:
         self._sock.close()
@@ -193,7 +225,7 @@ class SITLBridge:
         return None
 
     def _build_state(self, x_enu: float, y_enu: float, z_abs: float,
-                     yaw_deg: float, t: float) -> dict:
+                     yaw_deg: float, roll_rad: float, pitch_rad: float, t: float) -> dict:
         # ── ENU → NED ──────────────────────────────────────────────────────
         north = y_enu
         east  = x_enu
@@ -232,28 +264,35 @@ class SITLBridge:
         else:
             accel_ned = (0.0, 0.0, 0.0)
 
-        # ── Attitude & yaw rate ────────────────────────────────────────────
+        # ── Attitude & angular rates ───────────────────────────────────────
         yaw_rad = -math.radians(yaw_deg)   # CCW→CW, Isaac Sim→NED
-        yaw_rate = 0.0
+        yaw_rate = pitch_rate = roll_rate = 0.0
         if self._prev_yaw_rad is not None and self._prev_t is not None:
             dt = t - self._prev_t
             if dt > 1e-6:
                 dyaw = (yaw_rad - self._prev_yaw_rad + math.pi) % (2 * math.pi) - math.pi
-                yaw_rate = dyaw / dt
+                yaw_rate   = dyaw / dt
+                roll_rate  = (roll_rad  - self._prev_roll_rad)  / dt
+                pitch_rate = (pitch_rad - self._prev_pitch_rad) / dt
 
-        # ── IMU specific force in body frame ──────────────────────────────
+        # ── IMU specific force in body frame (full 3-axis rotation) ───────
         # sf_ned = accel_ned - gravity_ned;  gravity_ned = (0, 0, +g)
         sf_ned = (accel_ned[0], accel_ned[1], accel_ned[2] - _GRAVITY)
-        cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
-        sf_bx  =  sf_ned[0] * cy + sf_ned[1] * sy
-        sf_by  = -sf_ned[0] * sy + sf_ned[1] * cy
-        sf_bz  =  sf_ned[2]
+        # R_bn = R_nb^T  where  R_nb = R_z(yaw)*R_y(pitch)*R_x(roll)
+        cr, sr = math.cos(roll_rad),  math.sin(roll_rad)
+        cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
+        cy, sy = math.cos(yaw_rad),   math.sin(yaw_rad)
+        sf_bx = sf_ned[0]*(cy*cp)            + sf_ned[1]*(sy*cp)            + sf_ned[2]*(-sp)
+        sf_by = sf_ned[0]*(cy*sp*sr - sy*cr) + sf_ned[1]*(sy*sp*sr + cy*cr) + sf_ned[2]*(cp*sr)
+        sf_bz = sf_ned[0]*(cy*sp*cr + sy*sr) + sf_ned[1]*(sy*sp*cr - cy*sr) + sf_ned[2]*(cp*cr)
 
         # ── Save running state ─────────────────────────────────────────────
         self._prev_pos_ned   = pos_ned
         self._prev_vel_ned   = vel_ned
         self._prev_accel_ned = accel_ned
         self._prev_yaw_rad   = yaw_rad
+        self._prev_roll_rad  = roll_rad
+        self._prev_pitch_rad = pitch_rad
 
         # "velocity" is a required field in ArduPilot's SIM_JSON keytable — omitting it
         # causes the parser to return 0 and reject the packet ("resending servos").
@@ -261,13 +300,15 @@ class SITLBridge:
         # EKF3 via GPS fusion, so it is not a GPS substitute.
         #
         # "position" is optional (required=false) and IS a GPS substitute — kept out.
+        # NOTE: "position" (NED metres) is intentionally omitted — it acts as a GPS
+        # substitute in SIM_JSON even with GPS_TYPE=0, which disrupts EKF3 ExtNav fusion.
         return {
             "timestamp": t - self._start_t,
             "imu": {
-                "gyro":       [0.0, 0.0, yaw_rate],
+                "gyro":       [roll_rate, pitch_rate, yaw_rate],
                 "accel_body": [sf_bx, sf_by, sf_bz],
             },
-            "attitude":  [0.0, 0.0, yaw_rad],
+            "attitude":  [roll_rad, pitch_rad, yaw_rad],
             "velocity":  list(vel_ned),
             "rng_1":     max(0.1, agl),
             "battery":   {"voltage": 12.6, "current": 5.0},

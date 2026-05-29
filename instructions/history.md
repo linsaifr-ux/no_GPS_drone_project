@@ -779,6 +779,69 @@ Watch for `POS_ABS` (0x0010) in EKF flags to confirm EKF3 is fusing the vision p
 
 ---
 
+## 2026-05-29 — 6b-iv bug fixes: GPS failsafe, physics accuracy, stale estimate, debug tooling
+
+### Bugs fixed
+
+**1. GPS failsafe silently switches GUIDED→LAND after arming**
+
+Root cause: `FS_GPS_ENABLE` is enabled by default. After force-arming with GPS bad fix, the failsafe fires within seconds and changes GUIDED → LAND. The TAKEOFF command arrives in LAND mode and is ignored — drone stays on the ground. Motors output landing throttle (~30 %), below hover threshold (~50 % mean PWM), so the kinematic model produces no upward thrust.
+
+Fix: added to `control/no_gps.parm`:
+```
+FS_GPS_ENABLE   0   # prevent GPS failsafe GUIDED→LAND switch after arming
+FENCE_ENABLE    0   # prevent geofence blocking flight near origin
+```
+
+**2. ARM rejected with FAILED (result=4) but force-arm not triggered**
+
+Original code only triggered force-arm when `wait_command_ack` returned `None` (timeout). A `FAILED` result (4) returned immediately and bypassed force-arm entirely.
+
+Fix: changed condition from `if result is None` to `if result != 0` — triggers force-arm on any non-zero MAV_RESULT (TEMPORARILY_REJECTED, DENIED, UNSUPPORTED, FAILED).
+
+**3. EKF initialises at wrong position — stale estimate file**
+
+Cause: `anyloc/latest_estimate.json` left over from a previous AnyLoc run. Old check was `if not os.path.exists(...)` — a 30-minute-old file would init EKF at (350 m N, 1352 m E) from home.
+
+Fix: added age check — if file older than 10 seconds, overwrite with stub at home position.
+
+**4. VisOdom not healthy at arm time**
+
+`EKF_POS_ABS` fires on the very first VPE message, but `AP_VisualOdom::healthy()` requires a continuous 1-second window of VPE messages. Without waiting, the VisOdom pre-arm health check could still block arming.
+
+Fix: added 3-second settle wait after EKF_POS_ABS — 3 s @ 5 Hz = 15 VPEs, well above the 1-second health window.
+
+**5. HIGHRES_IMU "rate too fast" warning**
+
+Requested 50 Hz equals `SCHED_LOOP_RATE` limit. ArduPilot logged a warning and may silently cap it.
+
+Fix: reduced to 25 Hz (40 000 µs interval) in `mavlink_ctrl.py`.
+
+**6. Gyro missing roll/pitch rates**
+
+`sitl_bridge.py` sent `[0, 0, yaw_rate]` as the gyro vector. When the drone tilted, the EKF saw attitude changing (from the `attitude` field) but gyro showed no rotation — innovation mismatch, degraded EKF attitude tracking.
+
+Fix: added `_prev_roll_rad` and `_prev_pitch_rad` state; compute p and q from finite difference alongside r. Gyro now sends `[roll_rate, pitch_rate, yaw_rate]`.
+
+**7. Accel body frame — yaw-only rotation**
+
+IMU specific force was rotated from NED to body using yaw only. At 20° tilt this introduced ≈12 % horizontal force error, causing wrong heading dynamics during autonomous flight.
+
+Fix: full 3-axis DCM: R_bn = (R_z(yaw)·R_y(pitch)·R_x(roll))ᵀ
+
+### Feature added: SITLBridge.debug_hz
+
+New `debug_hz` property prints the physics state being sent at the specified rate. `stub_bridge.py` sets `bridge.debug_hz = 1.0` by default for cross-checking.
+
+Sample output (stationary on ground):
+```
+[SITL] t=   3.12s  gyro p=+0.000 q=+0.000 r=+0.000 rad/s  accel bx=+0.00 by=+0.00 bz=-9.81 m/s²  vel N=+0.00 E=+0.00 D=+0.00 m/s  att r=+0.0° p=+0.0°  rng=0.10m
+```
+
+Cross-check: `accel bz ≈ −9.81` on ground confirms correct specific force sign convention. Compare `accel bz` against `Az` column in `run_mavlink.py` — should match within 0.05 m/s².
+
+---
+
 ## 2026-05-29 — Milestone 6b-iv: flight command pipeline implemented
 
 ### mavlink_ctrl.py — new methods
