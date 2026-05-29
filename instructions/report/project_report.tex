@@ -180,160 +180,148 @@ Localisation accuracy ($\leq$50 m) & 15--20 m anchor error & Meets requirement\\
 
 Figure~\ref{fig:pipeline} shows the full data flow from simulation to flight commands.
 
+% Pipeline figure — all nodes placed at absolute (x,y) coordinates so nothing overlaps.
+%
+% Grid layout (centres):
+%   Columns  A=0  B=5  C=10   (cm)
+%   Rows     R1=0  R2=-2.8  R3=-5.6  R4=-8.4  R5=-11.2   (cm)
+%
+%   A/R1  Isaac Sim       B/R1  SITL Bridge     C/R1  ArduPilot SITL
+%   A/R2  drone_frames    [empty]               C/R2  MAVLink stream
+%   A/R3  AnyLoc + VO     B/R3  YOLOv8          C/R3  MAVLinkCtrl
+%   A/R4  estimate.json   B/R4  Detections      C/R4  IMU Fusion [TODO]
+%   A/R5  Vision Bridge   B/R5  Orchestrator    [empty]
+%
+% Long feedback arrows routed along right margin (x=12) to avoid all nodes.
+%
 \begin{figure}[p]
 \centering
 \begin{tikzpicture}[
   >=Stealth,
-  node distance=0pt,
   block/.style={
-    rectangle, rounded corners=4pt,
-    draw, thick,
-    minimum width=3.6cm, minimum height=0.9cm,
-    align=center, font=\small\bfseries,
-    inner sep=6pt,
+    rectangle, rounded corners=4pt, draw, thick,
+    minimum width=3.4cm, minimum height=1.0cm,
+    align=center, font=\small\bfseries, inner sep=5pt,
   },
-  smallblock/.style={
-    rectangle, rounded corners=3pt,
-    draw, thick,
-    minimum width=2.8cm, minimum height=0.75cm,
-    align=center, font=\footnotesize,
-    inner sep=4pt,
+  data/.style={
+    rectangle, rounded corners=3pt, draw, thick,
+    minimum width=3.4cm, minimum height=0.85cm,
+    align=center, font=\footnotesize, inner sep=4pt,
   },
-  arrow/.style={->, thick},
-  label/.style={font=\scriptsize, midway},
-  groupbox/.style={
-    rectangle, rounded corners=6pt,
-    draw, dashed, thick,
-    inner sep=10pt,
-  },
+  arr/.style={->, thick},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=2pt},
 ]
 
-% ── ROW 1: Simulator ─────────────────────────────────────────────────────────
-\node[block, fill=simblue!18, draw=simblue] (isaacSim) at (0,0)
-  {Isaac Sim\\[-1pt]\scriptsize cesium\_scene.py};
+% ── Node placement ────────────────────────────────────────────────────────────
+%  Columns: A=0, B=5, C=10
+%  Rows:    R0=0, R1=-3.2, R2=-6.2, R3=-9.0, R4=-11.8
 
-\node[block, fill=simblue!10, draw=simblue, right=2.6cm of isaacSim] (bridge)
-  {SITL Bridge\\[-1pt]\scriptsize sitl\_bridge.py\\[-1pt]\scriptsize UDP :9002};
+\node[block, fill=simblue!18, draw=simblue]  (isaacSim)    at ( 0,  0  ) {Isaac Sim\\[2pt]\scriptsize cesium\_scene.py};
+\node[block, fill=simblue!10, draw=simblue!80](bridge)      at ( 5,  0  ) {SITL Bridge\\[2pt]\scriptsize sitl\_bridge.py\\[1pt]\scriptsize UDP :9002};
+\node[block, fill=ardu!18,    draw=ardu]      (ardupilot)   at (10,  0  ) {ArduPilot SITL\\[2pt]\scriptsize JSON backend\\[1pt]\scriptsize EKF3 / TCP :5762/:5763};
 
-\node[block, fill=ardu!18, draw=ardu, right=2.6cm of bridge] (ardupilot)
-  {ArduPilot SITL\\[-1pt]\scriptsize JSON backend\\[-1pt]\scriptsize TCP :5762/:5763};
+\node[data,  fill=simblue!8,  draw=simblue!55](frames)      at ( 0, -3.2) {drone\_frames/\\[1pt]\scriptsize latest.jpg + meta.json\\[1pt]\scriptsize 640\texttimes480, nadir, 90\textdegree};
+\node[data,  fill=ardu!10,    draw=ardu!55]   (mavstate)    at (10, -3.2) {MAVLink stream\\[1pt]\scriptsize ATTITUDE, HIGHRES\_IMU\\[1pt]\scriptsize EKF\_STATUS\_REPORT};
 
-% ── Arrows row 1
-\draw[arrow, simblue] (isaacSim) -- node[above, font=\scriptsize]{physics state} (bridge);
-\draw[arrow, ardu!70] (bridge) -- node[above, font=\scriptsize]{\{JSON+\textbackslash n\}} (ardupilot);
-\draw[arrow, ardu!70, bend right=20] (ardupilot) to
-  node[below, font=\scriptsize]{servo\_packet\_16} (bridge);
+\node[block, fill=locgreen!18,draw=locgreen]  (anyloc)      at ( 0, -6.2) {AnyLoc + VO\\[2pt]\scriptsize run\_localizer.py\\[1pt]\scriptsize DINOv2 + VLAD + FAISS};
+\node[block, fill=detred!18,  draw=detred]    (yolo)        at ( 5, -6.2) {YOLOv8\\[2pt]\scriptsize run\_detector.py\\[1pt]\scriptsize yolov8l\_visdrone.pt};
+\node[block, fill=ardu!18,    draw=ardu]      (mavctrl)     at (10, -6.2) {MAVLinkCtrl\\[2pt]\scriptsize mavlink\_ctrl.py\\[1pt]\scriptsize pymavlink};
 
-% ── ROW 2: Frame output (left)
-\node[smallblock, fill=simblue!8, draw=simblue!60,
-      below=1.8cm of isaacSim] (frames)
-  {drone\_frames/\\[-1pt]latest.jpg + meta.json\\[-1pt]\scriptsize 640×480 @ 90°×73.7° FOV};
+\node[data,  fill=locgreen!10,draw=locgreen!55](estimate)   at ( 0, -9.0) {latest\_estimate.json\\[1pt]\scriptsize lat, lon, alt\_msl\\[1pt]\scriptsize yaw, error\_m};
+\node[data,  fill=detred!10,  draw=detred!55] (detections)  at ( 5, -9.0) {Detections\\[1pt]\scriptsize \{label, conf, bbox\}\\[1pt]\scriptsize est\_lat, est\_lon};
+\node[data,  fill=gray!14,    draw=gray!50]   (imuFusion)   at (10, -9.0) {IMU Fusion\\[1pt]\scriptsize imu\_fusion.py \textrm{[TODO]}\\[1pt]\scriptsize anchor validator + VO gate};
 
-\draw[arrow, simblue!60] (isaacSim) -- node[right, font=\scriptsize]{every 5 steps} (frames);
+\node[block, fill=locgreen!14,draw=locgreen!80](visionBridge)at( 0,-11.8) {Vision Bridge\\[2pt]\scriptsize run\_vision.py\\[1pt]\scriptsize TCP :5763 @ 5 Hz};
+\node[block, fill=ctrlgold!20,draw=ctrlgold]  (orchestrator)at ( 5,-11.8) {Orchestrator\\[2pt]\scriptsize main.py \textrm{[TODO]}};
 
-% ── ROW 2: MAVLink state (right)
-\node[smallblock, fill=ardu!10, draw=ardu!60,
-      below=1.8cm of ardupilot] (mavstate)
-  {MAVLink stream\\[-1pt]\scriptsize ATTITUDE, HIGHRES\_IMU\\[-1pt]LOCAL\_POS\_NED\\[-1pt]EKF\_STATUS\_REPORT};
-
-\draw[arrow, ardu!60] (ardupilot) -- (mavstate);
-
-% ── ROW 3: AnyLoc + VO (left)
-\node[block, fill=locgreen!18, draw=locgreen,
-      below=2.0cm of frames] (anyloc)
-  {AnyLoc + VO\\[-1pt]\scriptsize run\_localizer.py\\[-1pt]\scriptsize DINOv2 + VLAD + FAISS};
-
-\draw[arrow, locgreen!70] (frames) -- node[right, font=\scriptsize]{PIL image} (anyloc);
-
-% ── ROW 3: YOLO (right-ish)
-\node[block, fill=detred!18, draw=detred,
-      right=1.0cm of anyloc] (yolo)
-  {YOLOv8\\[-1pt]\scriptsize run\_detector.py\\[-1pt]\scriptsize yolov8l\_visdrone.pt};
-
-\draw[arrow, detred!70] (frames) -| node[left, font=\scriptsize, near end]{PIL image} (yolo);
-
-% ── ROW 3: MAVLink ctrl (right)
-\node[block, fill=ardu!18, draw=ardu,
-      below=2.0cm of mavstate] (mavctrl)
-  {MAVLinkCtrl\\[-1pt]\scriptsize mavlink\_ctrl.py\\[-1pt]\scriptsize pymavlink};
-
-\draw[arrow, ardu!60] (mavstate) -- (mavctrl);
-
-% ── AnyLoc outputs
-\node[smallblock, fill=locgreen!10, draw=locgreen!60,
-      below=1.6cm of anyloc] (estimate)
-  {latest\_estimate.json\\[-1pt]\scriptsize lat, lon, alt\_msl\\[-1pt]yaw, timestamp, error\_m};
-
-\draw[arrow, locgreen!70] (anyloc) -- node[right, font=\scriptsize]{anchor fix} (estimate);
-
-% ── Vision bridge
-\node[block, fill=locgreen!12, draw=locgreen!80,
-      right=0.9cm of estimate] (visionBridge)
-  {Vision Bridge\\[-1pt]\scriptsize run\_vision.py\\[-1pt]\scriptsize TCP :5763  @ 5 Hz};
-
-\draw[arrow, locgreen!70] (estimate) -- (visionBridge);
-
-% ── Vision \ensuremath{\to} ArduPilot EKF3
-\draw[arrow, thick, locgreen] (visionBridge.north east) to[out=60, in=-110]
-  node[right, font=\scriptsize, xshift=2pt]{VISION\_POSITION\_ESTIMATE} (ardupilot.south);
-
-% ── YOLO output
-\node[smallblock, fill=detred!10, draw=detred!60,
-      below=1.6cm of yolo] (detections)
-  {Detections\\[-1pt]\scriptsize \{label, conf, bbox,\\[-1pt]est\_lat, est\_lon\}};
-
-\draw[arrow, detred!70] (yolo) -- (detections);
-
-% ── IMU fusion (future)
-\node[smallblock, fill=gray!15, draw=gray!50,
-      below=1.6cm of mavctrl] (imuFusion)
-  {IMU Fusion\\[-1pt]\scriptsize imu\_fusion.py  [TODO]\\[-1pt]anchor validator + VO gate};
-
-\draw[arrow, gray!70] (mavctrl) -- node[right, font=\scriptsize]{HIGHRES\_IMU} (imuFusion);
-\draw[arrow, dashed, gray!60] (imuFusion.west) to[out=180, in=-60]
-  node[left, font=\scriptsize]{quality gate} (anyloc.south);
-
-% ── Orchestrator
-\node[block, fill=ctrlgold!20, draw=ctrlgold,
-      below=1.6cm of estimate] (orchestrator)
-  {Orchestrator\\[-1pt]\scriptsize main.py  [TODO]};
-
-\draw[arrow, locgreen!50] (estimate) |- (orchestrator);
-\draw[arrow, detred!50] (detections) |- (orchestrator);
-
-% ── Flight commands
-\draw[arrow, thick, ctrlgold] (orchestrator.east) to[out=0, in=-170]
-  node[below, font=\scriptsize]{SET\_POSITION\_TARGET\_LOCAL\_NED} (ardupilot.south west);
-
-% ── Group boxes
+% ── Layer backgrounds ─────────────────────────────────────────────────────────
 \begin{pgfonlayer}{background}
-  \node[groupbox, draw=simblue!50, fill=simblue!4,
-        fit=(isaacSim)(bridge)(frames),
-        label={[font=\small\bfseries,text=simblue]above:Simulation Layer}] {};
-
-  \node[groupbox, draw=locgreen!60, fill=locgreen!4,
-        fit=(anyloc)(yolo)(estimate)(detections)(visionBridge),
-        label={[font=\small\bfseries,text=locgreen]above left:Perception Layer}] {};
-
-  \node[groupbox, draw=ardu!50, fill=ardu!4,
-        fit=(ardupilot)(mavstate)(mavctrl)(imuFusion),
-        label={[font=\small\bfseries,text=ardu]above right:Flight Control Layer}] {};
+  % Simulation: row 0 only, cols A+B
+  \fill[simblue!6,  rounded corners=6pt] (-2.1, 1.10) rectangle (7.3,-1.6);
+  \draw[simblue!50, rounded corners=6pt, dashed, thick] (-2.1, 1.10) rectangle (7.3,-1.6);
+  % Perception: rows 1-4, cols A+B
+  \fill[locgreen!5, rounded corners=6pt] (-2.1,-1.8 ) rectangle (7.3,-12.7);
+  \draw[locgreen!60,rounded corners=6pt, dashed, thick] (-2.1,-1.8 ) rectangle (7.3,-12.7);
+  % Flight control: rows 0-3, col C
+  \fill[ardu!5,     rounded corners=6pt] ( 8.2, 1.10) rectangle (12.2,-10.1);
+  \draw[ardu!50,    rounded corners=6pt, dashed, thick] ( 8.2, 1.10) rectangle (12.2,-10.1);
 \end{pgfonlayer}
 
-% ── Legend
-\node[anchor=south west, font=\scriptsize, align=left] at (-4.2,-12.8) {
-  \textcolor{simblue}{\rule{1cm}{2pt}} Simulator flow \quad
-  \textcolor{locgreen}{\rule{1cm}{2pt}} Perception flow \quad
-  \textcolor{ardu}{\rule{1cm}{2pt}} MAVLink flow \quad
-  \textcolor{ctrlgold}{\rule{1cm}{2pt}} Command flow \quad
-  \textcolor{gray}{\rule{0.5cm}{1pt}\rule{0.1cm}{0pt}\rule{0.5cm}{1pt}} Future / TODO
+\node[font=\small\bfseries, text=simblue,  fill=white, inner sep=2pt, anchor=north west] at (-2.05, 1.05) {Simulation Layer};
+\node[font=\small\bfseries, text=locgreen, fill=white, inner sep=2pt, anchor=north west] at (-2.05,-1.85) {Perception Layer};
+\node[font=\small\bfseries, text=ardu,     fill=white, inner sep=2pt, anchor=north west] at ( 8.25, 1.05) {Flight Control Layer};
+
+% ═══════════════════════════════════════════════════════════════════════════════
+% ALL ARROWS — Cleanly routed using orthogonal lines and strict coordinates
+% ═══════════════════════════════════════════════════════════════════════════════
+
+% ── Row-0 horizontals ─────────────────────────────────────────────────────────
+\draw[arr, simblue] (isaacSim.east) -- node[lbl,above]{physics state} (bridge.west);
+\draw[arr, ardu!80] (bridge.east) -- node[lbl,above,pos=0.3]{\{JSON+\textbackslash n\}} (ardupilot.west);
+
+% Servo feedback: rise, go left, drop down cleanly
+\draw[arr, ardu!70] (ardupilot.north) -- ++(0,1.25) -| (bridge.north) node[lbl,above,pos=0.25]{\scriptsize servo\_packet\_16};
+
+% ── Column A ──────────────────────────────────────────────────────────────────
+\draw[arr, simblue!70] (isaacSim.south) -- node[lbl, right, pos=0.35]{\scriptsize every 5 steps} (frames.north);
+\draw[arr, locgreen!70] (frames.south) -- node[lbl,right]{\scriptsize PIL image} (anyloc.north);
+\draw[arr, locgreen!70] (anyloc.south) -- node[lbl,right]{\scriptsize anchor fix} (estimate.north);
+\draw[arr, locgreen!70] (estimate.south) -- (visionBridge.north);
+
+% ── Column C ──────────────────────────────────────────────────────────────────
+\draw[arr, ardu!70] (ardupilot.south) -- (mavstate.north);
+\draw[arr, ardu!70] (mavstate.south)  -- (mavctrl.north);
+\draw[arr, ardu!70] (mavctrl.south) -- node[lbl,right]{\scriptsize HIGHRES\_IMU} (imuFusion.north);
+
+% ── Column B ──────────────────────────────────────────────────────────────────
+\draw[arr, detred!70] (yolo.south)       -- (detections.north);
+\draw[arr, detred!70] (detections.south) -- (orchestrator.north);
+
+% ── frames → YOLOv8 ──────────────────────────────────────────────────────────
+% Clean horizontal then vertical drop to avoid messy diagonals
+\draw[arr, detred!70] (frames.east) -| node[lbl,above,pos=0.25]{\scriptsize PIL image} (yolo.north);
+
+% ── estimate → orchestrator ───────────────────────────────────────────────────
+% Route to the top-left of the orchestrator to avoid hitting the visionBridge line
+\draw[arr, locgreen!50] (estimate.east) -| ([xshift=-1.2cm]orchestrator.north);
+
+% ── Vision Bridge → Orchestrator ──────────────────────────────────────────────
+\draw[arr, locgreen!60] (visionBridge.east) -- (orchestrator.west);
+
+% ── Orchestrator → ArduPilot (Gap rail x=7.7) ────────────────────────────────
+% Routes cleanly between the Perception and Flight Control bounding boxes
+\draw[arr, ctrlgold, thick] 
+  (orchestrator.east) -- (7.7, -11.8) -- (7.7, 0) -- (ardupilot.west);
+\node[lbl, rotate=90, text=ctrlgold] at (7.7,-5.9) {\scriptsize SET\_POSITION\_TARGET};
+
+% ── Vision Bridge → ArduPilot (Bottom & far-right rail x=13.5) ────────────────
+% Goes completely under the perception box, then up the far right
+\draw[arr, locgreen, thick] 
+  (visionBridge.south) -- (0, -13.2) -- (13.5, -13.2) -- (13.5, 0) -- (ardupilot.east);
+\node[lbl, rotate=90, text=locgreen] at (13.5,-5.9) {\scriptsize VISION\_POSITION\_ESTIMATE};
+
+% ── IMU Fusion → AnyLoc (Left outer rail x=-2.6) ──────────────────────────────
+% Routes around the left side, crossing the estimate line at a clean 90-degree angle
+\draw[arr, dashed, gray!70, thick] 
+  (imuFusion.south) -- (10, -10.5) -- (-2.6, -10.5) -- (-2.6, -6.2) -- (anyloc.west);
+\node[lbl, rotate=90, text=gray!70] at (-2.6,-8.3) {\scriptsize quality gate [TODO]};
+
+% ── Legend ────────────────────────────────────────────────────────────────────
+\node[anchor=south west, font=\scriptsize, align=left] at (-2.6,-14.5) {%
+  \textcolor{simblue}{\rule{0.8cm}{2pt}}~Simulation\quad
+  \textcolor{locgreen}{\rule{0.8cm}{2pt}}~Perception\quad
+  \textcolor{ardu}{\rule{0.8cm}{2pt}}~MAVLink\quad
+  \textcolor{ctrlgold}{\rule{0.8cm}{2pt}}~Commands\quad
+  \textcolor{gray}{\rule{0.4cm}{1pt}\ \rule{0.4cm}{1pt}}~Future / TODO%
 };
 
 \end{tikzpicture}
-\caption{Full system pipeline. The \textcolor{simblue}{blue layer} handles simulation physics and
-frame capture; the \textcolor{locgreen}{green layer} runs localisation and detection; the
-\textcolor{ardu}{purple layer} manages ArduPilot SITL and flight state; arrows show data flow
-between components. Dashed elements are planned future work.}
+
+\caption{Full system pipeline. Three layers are colour-coded:
+\textcolor{simblue}{blue} (simulation loop), \textcolor{locgreen}{green} (perception --- localisation and detection), and
+\textcolor{ardu}{purple} (flight control --- MAVLink and EKF3).
+Long feedback arrows are routed along the right margin to avoid overlaps.
+Dashed elements are planned future work.}
 \label{fig:pipeline}
 \end{figure}
 
