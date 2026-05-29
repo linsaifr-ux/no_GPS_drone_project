@@ -776,3 +776,50 @@ With `EK3_SRC1_POSXY=6`, EKF3 expects ExtNav position (from `VISION_POSITION_EST
 Watch for `POS_ABS` (0x0010) in EKF flags to confirm EKF3 is fusing the vision position.
 
 **Confirmed:** EKF flags reached `ATT,VEL_H,VEL_V,POS_REL,POS_ABS,ALT,PRED_ABS` — all flags healthy, vision position fully fused. Milestone 6b-iii done.
+
+---
+
+## 2026-05-29 — Milestone 6b-iv: flight command pipeline implemented
+
+### mavlink_ctrl.py — new methods
+
+| Method | Purpose |
+|--------|---------|
+| `set_mode(mode_name)` | Set ArduPilot flight mode by name ('GUIDED', 'RTL', 'LAND', …) |
+| `wait_ekf_pos(timeout)` | Block until EKF_POS_HORIZ_ABS is set |
+| `wait_command_ack(cmd_id, timeout)` | Block until COMMAND_ACK for cmd_id; returns MAV_RESULT |
+| `wait_altitude(target_agl, tolerance, timeout)` | Block until LOCAL_POSITION_NED.z ≈ -target_agl |
+| `wait_position(n, e, d, radius, timeout)` | Block until drone is within radius m of NED target |
+| `is_armed` | True when HEARTBEAT base_mode has MAV_MODE_FLAG_SAFETY_ARMED |
+
+COMMAND_ACK messages are now tracked in `recv()` via `self._last_ack[cmd_id] = result`.
+Armed status is updated from every HEARTBEAT.
+
+### stub_bridge.py — kinematic altitude model
+
+Replaced static hover with a kinematic simulation:
+- Drone starts on the ground (AGL = 0, z_abs = HOME_ELEV)
+- Each step: `mean_pwm` of 4 motors → `thrust_norm` (0–1) → `thrust_accel` (0–2g)
+- Net vertical acceleration: `GRAVITY - thrust_accel` (NED down)
+- Integrates vertical velocity and altitude at 100 Hz
+- Ground constraint: z_abs ≥ HOME_ELEV, vd clamped to ≤ 0 on contact
+
+This lets ArduPilot arm and take off in SITL without Isaac Sim. Horizontal position stays at origin — full horizontal kinematics require Isaac Sim.
+
+### run_flight.py — merged vision + flight
+
+`run_vision.py` functionality merged into `run_flight.py` as a background thread:
+- Vision thread: polls `anyloc/latest_estimate.json`, sends `VISION_POSITION_ESTIMATE` at 5 Hz
+- Main thread: wait POS_ABS → GUIDED → arm → takeoff → waypoints → RTL → wait disarm
+- Both share one `MAVLinkCtrl` on `tcp:localhost:5762` — no second TCP port needed
+- If `latest_estimate.json` doesn't exist, a stub estimate at home is written automatically
+
+`run_vision.py` kept as standalone alternative for vision-only testing.
+
+SITL command simplified — `--out tcp:localhost:5763` no longer needed:
+```bash
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    -l 23.450868,120.286135,46,0 \
+    --add-param-file=control/no_gps.parm --wipe
+```

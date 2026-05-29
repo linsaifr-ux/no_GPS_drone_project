@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Vision position bridge — AnyLoc → ArduPilot EKF3.
+Vision position bridge — AnyLoc → ArduPilot EKF3 (standalone).
+
+NOTE: run_flight.py now includes this logic in a background thread on the
+same MAVLink connection. Use this file only when you want to test vision
+position fusion WITHOUT running the full flight sequence.
 
 Reads anyloc/latest_estimate.json (written by anyloc/run_localizer.py each
 AnyLoc anchor frame) and sends VISION_POSITION_ESTIMATE to ArduPilot at 5 Hz.

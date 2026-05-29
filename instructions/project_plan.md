@@ -297,12 +297,11 @@ Run SITL:
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
     -l 23.450868,120.286135,46,0 \
-    --add-param-file=control/no_gps.parm \
-    --out tcp:localhost:5763
+    --add-param-file=control/no_gps.parm --wipe
 ```
 
-`--out tcp:localhost:5763` opens a second MAVLink TCP port so `run_mavlink.py` (port 5762) and
-`run_vision.py` (port 5763) can connect simultaneously — each TCP port accepts one client only.
+`run_flight.py` handles both vision and flight commands on a single `tcp:localhost:5762`
+connection — no second TCP port needed.
 
 #### Step 2 — No-GPS MAVLink integration (`control/mavlink_ctrl.py`)
 
@@ -326,11 +325,15 @@ This is the core no-GPS milestone. Four sub-steps must happen in order:
 - Root cause of EKF UNINIT reset (20 s cycle): `EK3_SRC1_POSXY` defaults to 3 (GPS); with `GPS_TYPE=0` EKF times out waiting for GPS and resets. Fix: set `EK3_SRC1_POSXY=6` so EKF expects ExtNav instead
 - Watch for `POS_ABS` (0x0010) in EKF flags — confirms EKF3 accepted the vision position
 
-**6b-iv  Flight commands replace keyboard**
-Send:
-- `SET_POSITION_TARGET_LOCAL_NED` — fly to NED waypoints from planned path
-- `COMMAND_LONG (MAV_CMD_NAV_TAKEOFF)` — arming + takeoff
-- `COMMAND_LONG (MAV_CMD_NAV_RETURN_TO_LAUNCH)` — RTL on localization failure
+**6b-iv  Flight commands replace keyboard** — In progress
+- `control/run_flight.py`: full flight sequence in one process on `tcp:localhost:5762`
+  - Background thread sends `VISION_POSITION_ESTIMATE` at 5 Hz (merged from `run_vision.py`)
+  - Main thread: wait POS_ABS → GUIDED → arm → takeoff → waypoints → RTL
+- `mavlink_ctrl.py` additions: `set_mode()`, `wait_ekf_pos()`, `wait_command_ack()`,
+  `wait_altitude()`, `wait_position()`, `is_armed`
+- `stub_bridge.py` upgraded to kinematic altitude model: starts on ground (AGL=0),
+  integrates thrust from PWM → ArduPilot can arm and take off without Isaac Sim
+- No second TCP port needed — vision and flight share one `MAVLinkCtrl` connection
 
 **Why this order matters:**
 ArduPilot will not accept position commands until EKF3 has a valid position estimate.
@@ -364,10 +367,11 @@ Files status:
 |------|--------|---------|
 | `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002; no GPS |
 | `control/no_gps.parm` | Done | SITL params: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1 |
-| `control/stub_bridge.py` | Done | Static hover for testing MAVLink without Isaac Sim |
-| `control/mavlink_ctrl.py` | Done (6b-i) | pymavlink subscriber + vision + command stubs |
+| `control/stub_bridge.py` | Done | Kinematic altitude model (PWM → thrust → AGL), port 9002 |
+| `control/mavlink_ctrl.py` | Done | pymavlink: recv + vision + set_mode + arm + wait helpers |
 | `control/run_mavlink.py` | Done | Live terminal monitor at 10 Hz, port 5762 |
-| `control/run_vision.py` | Done (6b-iii) | AnyLoc → VISION_POSITION_ESTIMATE at 5 Hz, port 5763 |
+| `control/run_vision.py` | Done (standalone) | Vision bridge only — use run_flight.py for combined |
+| `control/run_flight.py` | In progress (6b-iv) | Vision thread + flight sequence, single port 5762 |
 | `control/imu_reader.py` | TODO (6c) | HIGHRES_IMU reader, writes to shared state |
 | `control/imu_fusion.py` | TODO (6d) | IMU-based anchor validation + VO quality gate |
 
@@ -428,7 +432,7 @@ AnyLoc + VO          YOLO         │
 | 6b-i | pymavlink connection to ArduPilot SITL (tcp:localhost:5762) | Done |
 | 6b-ii | Disable GPS in SITL; strip position from JSON bridge (velocity stays — required) | Done |
 | 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
-| 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | TODO |
+| 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | In progress |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate using IMU data | TODO |
 | 7 | Full pipeline integrated: AnyLoc + VO + IMU → ArduPilot commands | TODO |

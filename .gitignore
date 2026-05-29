@@ -89,3 +89,9 @@ third_party/
 
 #contest ref
 114rule.pdf
+
+# LaTeX build artefacts
+instructions/report/*.aux
+instructions/report/*.log
+instructions/report/*.out
+instructions/report/*.toc

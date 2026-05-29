@@ -2,24 +2,30 @@
 """
 ArduPilot MAVLink controller.
 
-6b-i   (this file):  pymavlink connection, non-blocking receive loop,
-                     HEARTBEAT / HIGHRES_IMU / ATTITUDE /
-                     LOCAL_POSITION_NED / EKF_STATUS_REPORT state.
-6b-iii (TODO):       send_vision_position() — AnyLoc → ArduPilot EKF3
-6b-iv  (TODO):       arm(), takeoff(), set_position_ned() — flight commands
+6b-i    pymavlink connection, non-blocking receive loop,
+        HEARTBEAT / HIGHRES_IMU / ATTITUDE / LOCAL_POSITION_NED / EKF_STATUS_REPORT
+6b-iii  send_vision_position() — AnyLoc → ArduPilot EKF3
+6b-iv   set_mode(), arm(), takeoff(), set_position_ned() — flight commands
+        wait_ekf_pos(), wait_command_ack(), wait_altitude(), wait_position()
 
 Connection string examples
-  "udp:0.0.0.0:14550"   listen for mavproxy output (default, SITL GCS port)
-  "tcp:localhost:5760"   direct SITL TCP output (alternative, no mavproxy)
+  "tcp:localhost:5762"  direct SITL TCP port (default, run_mavlink.py + run_flight.py)
+  "tcp:localhost:5763"  second SITL TCP port (run_vision.py)
 
 Usage:
   ctrl = MAVLinkCtrl()
-  ctrl.wait_heartbeat()          # blocks until ArduPilot sends first heartbeat
-  while True:
-      ctrl.recv()                # non-blocking drain
-      print(ctrl.ekf_flags, ctrl.imu)
+  ctrl.wait_heartbeat()
+  ctrl.wait_ekf_pos()
+  ctrl.set_mode("GUIDED")
+  ctrl.arm()
+  ctrl.wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM)
+  ctrl.takeoff(10.0)
+  ctrl.wait_altitude(10.0)
+  ctrl.set_position_ned(20.0, 0.0, -10.0)
+  ctrl.wait_position(20.0, 0.0, -10.0)
 """
 
+import math
 import time
 
 from pymavlink import mavutil
@@ -70,6 +76,10 @@ class MAVLinkCtrl:
         self._local_pos = None   # LOCAL_POSITION_NED
         self._ekf       = None   # EKF_STATUS_REPORT
 
+        # 6b-iv state
+        self._last_ack  = {}     # cmd_id → MAV_RESULT (populated by COMMAND_ACK)
+        self._armed     = False  # updated from HEARTBEAT base_mode
+
         print(f"[MAVLink] Connecting to {connection_str} …")
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -106,11 +116,16 @@ class MAVLinkCtrl:
             if msg is None:
                 break
             t = msg.get_type()
-            if   t == "HEARTBEAT":          self._heartbeat = msg; self._connected = True
+            if   t == "HEARTBEAT":
+                self._heartbeat = msg
+                self._connected = True
+                self._armed = bool(msg.base_mode &
+                                   mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             elif t == "HIGHRES_IMU":        self._imu       = msg
             elif t == "ATTITUDE":           self._attitude  = msg
             elif t == "LOCAL_POSITION_NED": self._local_pos = msg
             elif t == "EKF_STATUS_REPORT":  self._ekf       = msg
+            elif t == "COMMAND_ACK":        self._last_ack[msg.command] = msg.result
             received.append(t)
         return received
 
@@ -144,6 +159,79 @@ class MAVLinkCtrl:
     def ekf_pos_valid(self) -> bool:
         """True when EKF3 has accepted an absolute position source (GPS or vision)."""
         return bool(self.ekf_flags & EKF_POS_HORIZ_ABS)
+
+    @property
+    def is_armed(self) -> bool:
+        """True when ArduPilot reports motors armed (from HEARTBEAT base_mode)."""
+        return self._armed
+
+    # ── 6b-iv: Blocking helpers ────────────────────────────────────────────────
+
+    def set_mode(self, mode_name: str) -> None:
+        """Set ArduPilot flight mode by name, e.g. 'GUIDED', 'RTL', 'LAND'."""
+        mode_id = self._mav.mode_mapping().get(mode_name)
+        if mode_id is None:
+            raise ValueError(f"Unknown mode '{mode_name}'. "
+                             f"Available: {list(self._mav.mode_mapping().keys())}")
+        self._mav.mav.command_long_send(
+            self._mav.target_system, self._mav.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mode_id,
+            0, 0, 0, 0, 0,
+        )
+        print(f"[MAVLink] SET_MODE {mode_name} (id={mode_id}) sent")
+
+    def wait_ekf_pos(self, timeout: float = 60.0) -> bool:
+        """Block until EKF3 has POS_ABS, or timeout. Returns True on success."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.recv()
+            if self.ekf_pos_valid:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def wait_command_ack(self, cmd_id: int, timeout: float = 10.0) -> int | None:
+        """
+        Block until COMMAND_ACK for cmd_id arrives.
+        Returns MAV_RESULT int (0 = ACCEPTED) or None on timeout.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.recv()
+            if cmd_id in self._last_ack:
+                return self._last_ack.pop(cmd_id)
+            time.sleep(0.05)
+        return None
+
+    def wait_altitude(self, target_agl: float, tolerance: float = 1.0,
+                      timeout: float = 30.0) -> bool:
+        """Block until LOCAL_POSITION_NED.z is within tolerance of -target_agl."""
+        target_down = -target_agl
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.recv()
+            if self._local_pos is not None:
+                if abs(self._local_pos.z - target_down) <= tolerance:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def wait_position(self, north: float, east: float, down: float,
+                      radius: float = 2.0, timeout: float = 30.0) -> bool:
+        """Block until drone is within radius metres of (north, east, down) NED."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.recv()
+            p = self._local_pos
+            if p is not None:
+                dist = math.sqrt((p.x - north)**2 + (p.y - east)**2 + (p.z - down)**2)
+                if dist <= radius:
+                    return True
+            time.sleep(0.05)
+        return False
 
     # ── 6b-iii: Vision position ────────────────────────────────────────────────
 

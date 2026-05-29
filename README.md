@@ -66,10 +66,11 @@ no_GPS_drone_project/
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
 ├── control/               # ArduPilot MAVLink + IMU fusion
 │   ├── sitl_bridge.py     #   UDP server :9002 — receives binary servo PWM, replies physics JSON (DONE)
-│   ├── stub_bridge.py     #   minimal bridge for testing MAVLink without Isaac Sim
-│   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision_position + flight cmds (DONE 6b-i)
+│   ├── stub_bridge.py     #   kinematic drone stub for testing without Isaac Sim
+│   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision + mode + arm + waypoint helpers
 │   ├── run_mavlink.py     #   live terminal monitor: attitude, NED pos, IMU, EKF flags
-│   ├── run_vision.py      #   AnyLoc → VISION_POSITION_ESTIMATE → ArduPilot EKF3 (DONE 6b-iii)
+│   ├── run_vision.py      #   standalone vision bridge (use run_flight.py for combined operation)
+│   ├── run_flight.py      #   arm → takeoff → waypoints → RTL + vision thread (6b-iv)
 │   ├── no_gps.parm        #   SITL param file: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
 │   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO 6c)
 │   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO 6d)
@@ -95,7 +96,7 @@ no_GPS_drone_project/
 | 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
 | 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | Done |
 | 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
-| 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | TODO |
+| 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | In progress |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
@@ -226,14 +227,11 @@ cd ../..
 Then start SITL before Isaac Sim:
 
 ```bash
-# Terminal 1 — SITL (listens for bridge on port 9002, MAVLink on TCP:5762 + 5763)
-# --out tcp:localhost:5763 opens a second MAVLink port so run_mavlink.py and
-# run_vision.py can connect simultaneously (each TCP port allows one client).
+# Terminal 1 — SITL
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
     -l 23.450868,120.286135,46,0 \
-    --add-param-file=control/no_gps.parm \
-    --out tcp:localhost:5763
+    --add-param-file=control/no_gps.parm --wipe
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh
@@ -245,34 +243,32 @@ the bridge parses it, learns ArduPilot's reply address from the source port, and
 JSON physics state terminated by `\n` each step.
 "No JSON sensor message received, resending servos" is normal until Isaac Sim finishes loading (~2–5 min).
 
-To test MAVLink without Isaac Sim, use the stub bridge instead:
+To test MAVLink without Isaac Sim, use the kinematic stub bridge:
 
 ```bash
-# Terminal 2 — stub (static hover at home+5 m, 100 Hz)
+# Terminal 2 — stub (kinematic altitude model, responds to ArduPilot thrust)
 python3 control/stub_bridge.py
 ```
 
-### Run the AnyLoc → EKF3 vision bridge (separate terminal)
+### Run the flight sequence (separate terminal)
 
 ```bash
-python3 control/run_vision.py
+python3 control/run_flight.py
 ```
 
-Reads `anyloc/latest_estimate.json` (written by `run_localizer.py` each AnyLoc anchor frame),
-converts lat/lon to NED relative to SITL home, and sends `VISION_POSITION_ESTIMATE` to
-ArduPilot at 5 Hz. The 5 Hz resend keeps EKF3 fusion alive between AnyLoc updates.
+Handles vision position and flight commands in one process on a single MAVLink connection
+(`tcp:localhost:5762`). No second TCP port or `run_vision.py` needed.
 
-Uses `tcp:localhost:5763` (not 5762) so it can run alongside `run_mavlink.py` simultaneously —
-each TCP port accepts only one client. Start SITL with `--out tcp:localhost:5763` to open that port.
+Sequence: waits for EKF POS_ABS → GUIDED mode → arm → takeoff → waypoints → RTL.
+
+Vision sending (`VISION_POSITION_ESTIMATE` at 5 Hz) runs in a background thread, feeding
+EKF3 from `anyloc/latest_estimate.json`. If the file doesn't exist a stub estimate at home
+is created automatically so the pipeline works without `run_localizer.py`.
 
 Requires SITL launched with `--add-param-file=control/no_gps.parm` so that
 `EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` are set.
 
-Watch for:
-```
-[Vision] EKF flags changed → 0x0011  ATT,POS_ABS *** POS_ABS acquired!
-```
-`POS_ABS` (bit 4) means EKF3 has accepted the vision position — flight commands will now work.
+`run_vision.py` is kept as a standalone alternative when testing vision fusion without flying.
 
 ---
 
