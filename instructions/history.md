@@ -1022,6 +1022,30 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 
 ---
 
+## 2026-05-31 — flight_commander.py: dead code removed, cleanup fixes
+
+### Bugs fixed
+
+**1. `AltMonitor` class defined but never used**
+
+- Cause: `AltMonitor` (a persistent pymavlink thread exposing live AGL) was created as a planned helper for the VPE thread, but `takeoff()` ended up with its own inline pymavlink connection for altitude polling. The class was left as dead code.
+- Fix: deleted the class entirely (~30 lines).
+- File: `control/flight_commander.py`
+
+**2. Takeoff failure path missing cleanup**
+
+- Cause: when `takeoff()` returns False, the code called `rclpy.shutdown()` and returned, but did not call `stop_ev.set()` or `cmd.destroy_node()`. Every other failure path (MAVROS2 not connected, EKF timeout) calls all three. The VPE daemon thread was left running and the node was not destroyed.
+- Fix: added `stop_ev.set(); cmd.destroy_node()` before `rclpy.shutdown()` in the takeoff failure branch — matching all other failure paths.
+- File: `control/flight_commander.py` → `main()` Step 7
+
+**3. RTL disarm timeout too short**
+
+- Cause: `_spin_until(lambda: not cmd._state.armed, timeout=60.0)` — the drone takes off to 90 m AGL and descends at ~1–1.5 m/s during RTL, which takes ~60–90 s to descend plus landing time. The 60 s timeout would expire during descent.
+- Fix: increased to 150 s to cover the full 90 m descent + landing sequence.
+- File: `control/flight_commander.py` → Step 9
+
+---
+
 ## 2026-05-30 — ROS2 node bugs fixed; postview added; dual file+ROS2 output
 
 ### Bugs fixed

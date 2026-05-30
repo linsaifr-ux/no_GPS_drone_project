@@ -13,7 +13,7 @@ Usage:
   # Terminal 1 — SITL
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
       -v ArduCopter --model=JSON --no-rebuild --console --map \
-      -l 23.450868,120.286135,46,0 \
+      -l 23.450868,120.286135,28.17,0 \
       --add-param-file=control/no_gps.parm --wipe \
       --out tcp:localhost:5763
 
@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control.sitl_bridge import SITLBridge
 
-_HOME_ELEV    = 46.0   # metres MSL — matches -l 23.450868,120.286135,46,0
+_HOME_ELEV    = 28.17  # metres MSL — matches -l 23.450868,120.286135,28.17,0
 _GRAVITY      = 9.81   # m/s²
 _MAX_TILT_ACC = 5.0    # m/s² horizontal acceleration cap (attitude-derived)
 _MAX_VEL      = 10.0   # m/s velocity clamp

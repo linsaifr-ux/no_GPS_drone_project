@@ -8,12 +8,14 @@ FRAME_TYPE      1       # 1 = quad-X (motor layout matches kinematic model in ce
 GPS_TYPE        0       # disable GPS driver
 SIM_GPS1_ENABLE 0       # disable SITL GPS simulation hardware
 SIM_GPS_DISABLE 1       # fallback disable flag (older ArduPilot versions)
+GPS_ARMING_MIN_SAT 0    # don't require GPS satellites for arming
 
 # SITL sensor noise — both simulated IMUs use the same bridge data; noise makes
 # them appear inconsistent ("Accels inconsistent") and crashes the EKF.
 SIM_ACC_NOISE   0
 SIM_GYR_NOISE   0
 SIM_BARO_DRIFT  0
+SIM_MAG_RND     0       # disable simulated compass noise
 
 # Loop rate — Isaac Sim physics runs at ~30-200 fps.  ArduPilot's default 400 Hz
 # loop requires 720 Hz gyro rate (400×1.8) which the bridge cannot provide.
@@ -23,7 +25,7 @@ SCHED_LOOP_RATE 50
 EK3_SRC1_POSXY  6       # horizontal position from ExternalNav (VISION_POSITION_ESTIMATE)
 EK3_SRC1_VELXY  0       # no horizontal velocity source
 EK3_SRC1_POSZ   1       # altitude from barometer
-EK3_SRC1_YAW    1       # yaw from compass
+EK3_SRC1_YAW    6       # yaw from ExternalNav (VPE yaw) — avoids compass field mismatch in SITL
 VISO_TYPE       1       # enable MAVLink ExternalNav processing
 
 # SITL only — GPS driver disabled; VisOdom pre-arm check trips because EKF_POS_ABS
@@ -36,3 +38,19 @@ ARMING_CHECK    0
 # FENCE_ENABLE 0 prevents the geofence from blocking flight near origin.
 FS_GPS_ENABLE   0
 FENCE_ENABLE    0
+
+# Kinematic model hovers at PWM 1500 = thrust_norm 0.5 = 1g.
+# ArduPilot default MOT_THST_HOVER ~0.36 → hover PWM 1360 → thrust 0.72g → drone falls.
+# Setting to 0.5 aligns ArduPilot's altitude hold with the kinematic model.
+MOT_THST_HOVER  0.5
+
+# Altitude PID gains — default values are tuned for ~100 Hz physics.
+# Isaac Sim renders at 10-30 fps so the controller runs at that rate.
+# Reducing gains prevents oscillation at slower update rates.
+PSC_POSZ_P      0.5     # position Z P (default 1.0)
+PSC_VELZ_P      2.0     # velocity Z P (default 5.0)
+PSC_ACCZ_P      0.2     # acceleration Z P (default 0.5)
+PSC_ACCZ_I      0.3     # acceleration Z I (default 1.0)
+PSC_ACCZ_D      0.0     # acceleration Z D (default 0.0)
+WPNAV_SPEED_UP  100     # max climb rate cm/s (default 250) — gentler climb
+WPNAV_SPEED_DN  60      # max descent rate cm/s (default 150)

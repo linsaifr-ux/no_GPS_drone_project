@@ -1012,6 +1012,7 @@ _K_GRAVITY  = 9.81
 _K_MAX_VEL  = 15.0   # m/s velocity clamp
 _K_MAX_TILT = 0.35   # rad (~20°) max tilt from PWM differential
 _K_TILT_TAU = 0.15   # s first-order attitude time constant
+_K_DRAG     = 0.35   # aerodynamic drag coefficient (s⁻¹) — damps oscillation
 
 _kspawn = drone_pos_op.Get()
 _kx     = float(_kspawn[0])   # ENU east  of home (m)
@@ -1090,6 +1091,11 @@ while simulation_app.is_running():
         _kvn = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvn + _kan * _kdt))
         _kve = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kve + _kae * _kdt))
         _kvd = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvd + _kad * _kdt))
+
+        # Aerodynamic drag — damps velocity, prevents PID oscillation.
+        # Real drones have significant drag; without it any PID gain oscillates.
+        drag = 1.0 - _K_DRAG * _kdt
+        _kvn *= drag; _kve *= drag; _kvd *= drag
 
         _ky += _kvn * _kdt   # ENU north = +Y
         _kx += _kve * _kdt   # ENU east  = +X
