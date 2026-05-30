@@ -11,30 +11,33 @@ Autonomous drone system that localises itself and detects objects without GPS, v
 
 ```
 Isaac Sim (cesium_scene.py)
+    │ /drone/camera/image_raw  (sensor_msgs/Image, ROS2)
+    │ /drone/pose              (geometry_msgs/PoseStamped, ROS2)
+    │ /drone/agl               (std_msgs/Float64, ROS2)
     │ physics JSON  ◄──binary servo PWM──┐
     ▼                                    │
 control/sitl_bridge.py              ArduPilot SITL
   (UDP server :9002)  ──JSON+\n──►  (JSON client)
                                          │ MAVLink TCP:5762
+                                         ▼
+                                      MAVROS2
                               ┌──────────┴──────────────────┐
                               ▼                             ▼
-                      HIGHRES_IMU                  EKF_STATUS_REPORT
-                      → imu_fusion.py              (position valid?)
+                    /mavros/imu/data_raw         /mavros/state
+                    /mavros/local_position/pose  /mavros/ekf_status
 
-drone_frames/latest.jpg + latest_meta.json
+/drone/camera/image_raw
     │
-    ├──► AnyLoc + VO  ──VISION_POSITION_ESTIMATE──► ArduPilot EKF3
-    │    (position estimate)                        (no-GPS fusion)
+    ├──► anyloc/ros2_node.py ──/mavros/vision_pose/pose──► MAVROS2 ──► ArduPilot EKF3
+    │    (AnyLoc + VO)            (VISION_POSITION_ESTIMATE)            (no-GPS fusion)
     │
-    └──► YOLO (bounding boxes)
+    └──► detection/ros2_node.py ──/yolo/detections──► (mission planner)
+         (YOLOv8)
 
-imu_fusion.py validates AnyLoc anchors using HIGHRES_IMU
-    │
+control/flight_commander.py
+    │ /mavros/setpoint_position/local
     ▼
-main.py (orchestrator)
-    │ SET_POSITION_TARGET_LOCAL_NED
-    ▼
-ArduPilot SITL / real FC
+MAVROS2 ──SET_POSITION_TARGET_LOCAL_NED──► ArduPilot SITL / real FC
 ```
 
 ---
@@ -47,30 +50,36 @@ no_GPS_drone_project/
 │   ├── project_plan.md    # module status, design decisions, milestones
 │   └── history.md         # session-by-session change log
 ├── simulator/             # Isaac Sim scene — WORKING
-│   ├── cesium_scene.py    # main scene: terrain + buildings + drone + camera
-│   ├── drone_frames/      # live output: latest.jpg + latest_meta.json
-│   └── run_chiayi.sh      # launch script
+│   ├── cesium_scene.py    # main scene: publishes /drone/camera/image_raw + /drone/pose via ROS2
+│   ├── drone_frames/      # fallback file output (used only when ROS2 not available)
+│   └── run_chiayi.sh      # launch script (sources ROS2 Jazzy before starting Isaac Sim)
 ├── anyloc/                # AnyLoc visual localization — WORKING
 │   ├── build_database.py  # build VLAD database from satellite orthophoto (run once)
 │   ├── localizer.py       # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
-│   ├── run_localizer.py   # live dual postview
+│   ├── vo_refiner.py      # VORefiner (LK optical flow)
+│   ├── ros2_node.py       # ROS2 node: dual postview + pub /anyloc/pose_estimate + /mavros/vision_pose/pose
+│   ├── run_ros2_localizer.sh  # launch script for ros2_node.py (sources ROS2, uses conda env)
+│   ├── run_localizer.py   # legacy file-based dual postview (non-ROS2 fallback)
 │   └── database/          # 2821-entry VLAD database (49152-dim, 50 m grid)
 ├── detection/             # YOLO — WORKING
 │   ├── detector.py        # YOLODetector (auto-detects COCO / VisDrone class maps)
-│   ├── run_detector.py    # live annotated postview
+│   ├── ros2_node.py       # ROS2 node: sub /drone/camera → pub /yolo/detections
+│   ├── run_detector.py    # legacy file-based postview (non-ROS2 fallback)
 │   ├── label_writer.py    # nadir projection math for synthetic label generation
 │   ├── collect_training_data.py  # Isaac Sim headless synthetic data collector
 │   ├── prepare_dataset.py # download VisDrone + remap classes + merge synth data
 │   └── finetune.py        # fine-tune YOLOv8 on the top-down dataset
 ├── yolov8l_visdrone.pt    # YOLOv8l pre-trained on VisDrone (10 aerial classes)
 ├── yolov8n.pt             # YOLOv8n COCO pretrained (baseline)
-├── control/               # ArduPilot MAVLink + IMU fusion
-│   ├── sitl_bridge.py     #   UDP server :9002 — receives binary servo PWM, replies physics JSON (DONE)
+├── control/               # ArduPilot + ROS2/MAVROS2 flight control
+│   ├── sitl_bridge.py     #   UDP server :9002 — receives binary servo PWM, replies physics JSON
 │   ├── stub_bridge.py     #   kinematic drone stub for testing without Isaac Sim
-│   ├── mavlink_ctrl.py    #   MAVLinkCtrl: recv loop + vision + mode + arm + waypoint helpers
-│   ├── run_mavlink.py     #   live terminal monitor: attitude, NED pos, IMU, EKF flags
-│   ├── run_vision.py      #   standalone vision bridge (use run_flight.py for combined operation)
-│   ├── run_flight.py      #   arm → takeoff → waypoints → RTL + vision thread (6b-iv)
+│   ├── launch_mavros.sh   #   start MAVROS2 connected to SITL TCP:5762
+│   ├── flight_commander.py #  ROS2 node: GUIDED → arm → takeoff → waypoints → RTL (via MAVROS2)
+│   ├── mavlink_ctrl.py    #   legacy pymavlink controller (non-ROS2 fallback)
+│   ├── run_flight.py      #   legacy pymavlink flight script (non-ROS2 fallback)
+│   ├── run_mavlink.py     #   legacy terminal monitor (replaced by ros2 topic echo)
+│   ├── run_vision.py      #   legacy standalone vision bridge (replaced by anyloc/ros2_node.py)
 │   ├── no_gps.parm        #   SITL param file: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
 │   ├── imu_reader.py      #   HIGHRES_IMU reader from MAVLink (TODO 6c)
 │   └── imu_fusion.py      #   AnyLoc anchor validator + VO quality gate (TODO 6d)
@@ -99,6 +108,7 @@ no_GPS_drone_project/
 | 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | Done |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
+| 6e | ROS2 migration: all IPC via topics/MAVROS2 | Done |
 | 7 | Full pipeline integrated in simulation | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -115,6 +125,11 @@ no_GPS_drone_project/
 - Python 3 system packages: `pexpect`, `mavproxy`, `pymavlink`, `future`
   ```bash
   pip3 install --user --break-system-packages pexpect mavproxy pymavlink future
+  ```
+- ROS2 Jazzy + MAVROS2 (already installed on this machine)
+  ```bash
+  # one-time geographiclib datasets (needed by MAVROS2)
+  sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh
   ```
 
 ### Run the simulator
@@ -161,6 +176,15 @@ The Tab viewport renders the same camera at 1920×1080 for visual inspection —
 
 ### Run the AnyLoc localizer (separate terminal)
 
+**ROS2 mode (recommended):**
+```bash
+./anyloc/run_ros2_localizer.sh
+```
+Same dual-window postview as the legacy localizer. Subscribes to `/drone/camera/image_raw`,
+`/drone/pose`, `/drone/agl`; publishes `/anyloc/pose_estimate` and `/mavros/vision_pose/pose`;
+also writes `anyloc/latest_estimate.json` for legacy `run_flight.py` compatibility.
+
+**Legacy file-based mode (fallback, no ROS2):**
 ```bash
 DISPLAY=:2 conda run -n isaac_sim_test python anyloc/run_localizer.py
 ```
@@ -181,6 +205,14 @@ conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 
 ### Run the YOLO vehicle detector (separate terminal)
 
+**ROS2 mode (recommended):**
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 detection/ros2_node.py
+```
+Publishes detections to `/yolo/detections` (vision_msgs/Detection2DArray).
+
+**Legacy file-based mode (fallback, no ROS2):**
 ```bash
 DISPLAY=:2 conda run -n isaac_sim_test python detection/run_detector.py
 ```
@@ -261,31 +293,40 @@ To test MAVLink without Isaac Sim, use the kinematic stub bridge (prints physics
 python3 control/stub_bridge.py
 ```
 
+### Run MAVROS2 (separate terminal)
+
+```bash
+bash control/launch_mavros.sh
+```
+
+Bridges MAVLink ↔ ROS2. Connects to SITL on `tcp:localhost:5762`.
+Key topics provided:
+- `/mavros/state` — armed status, flight mode, EKF health
+- `/mavros/local_position/pose` — NED position from EKF
+- `/mavros/vision_pose/pose` ← feed from `anyloc/ros2_node.py` → `VISION_POSITION_ESTIMATE`
+- `/mavros/setpoint_position/local` ← feed from `flight_commander.py` → position commands
+
 ### Run the flight sequence (separate terminal)
 
+**ROS2 mode (recommended) — requires MAVROS2 + AnyLoc ROS2 node running:**
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 control/flight_commander.py
+```
+
+Sequence:
+1. `SET_GPS_GLOBAL_ORIGIN` + `SET_HOME_POSITION` via pymavlink (before VPE arrives)
+2. Wait for MAVROS2 connection
+3. Wait for EKF position fix (driven by `/mavros/vision_pose/pose` from AnyLoc node)
+4. GUIDED → arm → takeoff → waypoints → RTL
+
+**Legacy pymavlink mode (fallback, no MAVROS2):**
 ```bash
 python3 control/run_flight.py
 ```
 
-Handles vision position and flight commands in one process on a single MAVLink connection
-(`tcp:localhost:5762`). No second TCP port or `run_vision.py` needed.
-
-Sequence:
-1. Connect → `SET_GPS_GLOBAL_ORIGIN` + `SET_HOME_POSITION` (required before VPE is sent)
-2. Start vision thread (`VISION_POSITION_ESTIMATE` at 5 Hz from `anyloc/latest_estimate.json`)
-3. Wait `EKF_POS_ABS` → wait `EKF_PRED_POS_ABS` (VisOdom healthy)
-4. GUIDED → arm → takeoff → waypoints → RTL
-
-If `latest_estimate.json` does not exist or is older than 10 s, a stub estimate at home
-is written automatically so the pipeline works without `run_localizer.py`.
-
-**Delete `anyloc/latest_estimate.json` before each test run** to prevent a stale AnyLoc
-estimate from initialising the EKF far from home.
-
 Requires SITL launched with `--add-param-file=control/no_gps.parm` so that
 `EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` are set.
-
-`run_vision.py` is kept as a standalone alternative when testing vision fusion without flying.
 
 ---
 
@@ -312,6 +353,42 @@ Expected EKF progression after bridge connects:
 - `ATT` — IMU tilt alignment complete (~5–10 s)
 - `ATT,VEL_H,VEL_V,ALT` + bit 7 (`CONST_POS_MODE`) — bridge running but no VPE yet; N/E/D show `nan`
 - `ATT,VEL,ALT,POS_ABS` — VPE fused; N/E/D populate; flight commands accepted
+
+---
+
+## ROS2 full-pipeline run order
+
+```bash
+# Terminal 1 — SITL
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    -l 23.450868,120.286135,28.17,0 --add-param-file=control/no_gps.parm
+
+# Terminal 2 — physics bridge (or Isaac Sim for full scene)
+python3 control/stub_bridge.py
+# cd simulator && ./run_chiayi.sh   ← use this instead for full Isaac Sim scene
+
+# Terminal 3 — MAVROS2
+bash control/launch_mavros.sh
+
+# Terminal 4 — AnyLoc ROS2 node (opens dual postview window)
+./anyloc/run_ros2_localizer.sh
+
+# Terminal 5 — YOLO detection (optional)
+source /opt/ros/jazzy/setup.bash && conda run -n isaac_sim_test python3 detection/ros2_node.py
+
+# Terminal 6 — flight commander
+source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
+```
+
+Monitor topics:
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic hz /drone/camera/image_raw     # expect ~6 Hz
+ros2 topic echo /mavros/vision_pose/pose  # AnyLoc VPE flowing to EKF3
+ros2 topic echo /mavros/state             # armed, mode, EKF status
+ros2 topic echo /yolo/detections          # vehicle detections
+```
 
 ---
 

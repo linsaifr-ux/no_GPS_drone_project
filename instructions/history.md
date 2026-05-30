@@ -944,3 +944,118 @@ AP: EKF3 IMU0 MAG0 in-flight yaw alignment complete
 | `control/run_flight.py` | Calls `set_ekf_origin` + `set_home_position` after heartbeat; replaces 3 s sleep with `wait_visodom_healthy()` |
 | `control/run_vision.py` | Same origin/home calls added; stale `HOME_ALT_MSL=46.0` → `28.17` |
 | `README.md`, `project_plan.md`, `history.md` | SITL `-l` altitude placeholder `<centre_elev>`/`46` → `28.17` throughout |
+
+---
+
+## 2026-05-30 — Milestone 6e: ROS2 migration (all IPC via topics + MAVROS2)
+
+### Motivation
+
+All previous inter-process communication was file-based (JPEG frames + JSON estimates) or raw sockets (pymavlink TCP). This introduced polling latency, file-write race conditions, and non-standard interfaces. ROS2 pub/sub eliminates polling, provides introspectability (`ros2 topic echo`), and matches the standard deployment interface for real hardware.
+
+### Environment
+
+- **ROS2 Jazzy** already installed at `/opt/ros/jazzy` (Ubuntu 24.04)
+- **MAVROS2 2.14.0** already installed (`ros-jazzy-mavros`, `ros-jazzy-mavros-extras`)
+- **vision_msgs 4.1.1** already installed (`ros-jazzy-vision-msgs`)
+- **rclpy** uses Python 3.12 — same as Isaac Sim 6.0 — so system rclpy is used directly inside Isaac Sim by adding `/opt/ros/jazzy/lib/python3.12/site-packages` to `sys.path`
+
+### New ROS2 topic map
+
+| Topic | Type | Publisher | Subscriber(s) |
+|-------|------|-----------|---------------|
+| `/drone/camera/image_raw` | `sensor_msgs/Image` (rgb8) | Isaac Sim | AnyLoc node, YOLO node |
+| `/drone/pose` | `geometry_msgs/PoseStamped` (frame=wgs84, pos=lat/lon/alt) | Isaac Sim | AnyLoc node, YOLO node |
+| `/drone/agl` | `std_msgs/Float64` | Isaac Sim | AnyLoc node |
+| `/anyloc/pose_estimate` | `geometry_msgs/PoseWithCovarianceStamped` | AnyLoc node | (mission planner) |
+| `/mavros/vision_pose/pose` | `geometry_msgs/PoseStamped` (frame=map, NED) | AnyLoc node | MAVROS2 → `VISION_POSITION_ESTIMATE` |
+| `/yolo/detections` | `vision_msgs/Detection2DArray` | YOLO node | (mission planner) |
+| `/mavros/state` | `mavros_msgs/State` | MAVROS2 | Flight commander |
+| `/mavros/local_position/pose` | `geometry_msgs/PoseStamped` | MAVROS2 | Flight commander |
+| `/mavros/setpoint_position/local` | `geometry_msgs/PoseStamped` | Flight commander | MAVROS2 → `SET_POSITION_TARGET` |
+
+### Files created
+
+| File | Purpose |
+|------|---------|
+| `simulator/cesium_scene.py` (modified) | Publishes `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl` via system rclpy; falls back to file output if ROS2 unavailable |
+| `simulator/run_chiayi.sh` (modified) | Sources `/opt/ros/jazzy/setup.bash` before `conda run` so ROS2 shared libs are on `LD_LIBRARY_PATH` |
+| `anyloc/ros2_node.py` | rclpy node: subscribes to camera + pose → runs AnyLoc+VO → publishes to `/anyloc/pose_estimate` and `/mavros/vision_pose/pose` |
+| `detection/ros2_node.py` | rclpy node: subscribes to camera → runs YOLOv8 → publishes to `/yolo/detections` |
+| `control/launch_mavros.sh` | Starts MAVROS2 connected to SITL `tcp:localhost:5762` |
+| `control/flight_commander.py` | rclpy node: GUIDED → arm → takeoff → waypoints → RTL via MAVROS2 services/topics |
+
+### Architecture decision: pymavlink for EKF origin only
+
+MAVROS2 Jazzy 2.14 has no `/mavros/global_position/set_gp_origin` service. `flight_commander.py` uses a thin pymavlink call only for `SET_GPS_GLOBAL_ORIGIN` + `SET_HOME_POSITION` at startup, then hands off to MAVROS2 for everything else.
+
+### Legacy files kept (non-ROS2 fallback)
+
+`anyloc/run_localizer.py`, `detection/run_detector.py`, `control/run_flight.py`, `control/run_vision.py`, `control/run_mavlink.py`, `control/mavlink_ctrl.py` — all kept as file-based / pymavlink fallbacks. Remove when ROS2 pipeline is validated on hardware.
+
+### Run order (ROS2 mode)
+
+```bash
+# Terminal 1 — SITL
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild --console --map \
+    -l 23.450868,120.286135,28.17,0 --add-param-file=control/no_gps.parm
+
+# Terminal 2 — physics bridge (or Isaac Sim)
+python3 control/stub_bridge.py
+
+# Terminal 3 — MAVROS2
+bash control/launch_mavros.sh
+
+# Terminal 4 — AnyLoc ROS2 node
+source /opt/ros/jazzy/setup.bash && python3 anyloc/ros2_node.py
+
+# Terminal 5 — YOLO ROS2 node (optional)
+source /opt/ros/jazzy/setup.bash && python3 detection/ros2_node.py
+
+# Terminal 6 — Isaac Sim (publishes camera + pose topics)
+cd simulator && ./run_chiayi.sh
+
+# Terminal 7 — Flight commander
+source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
+```
+
+---
+
+## 2026-05-30 — ROS2 node bugs fixed; postview added; dual file+ROS2 output
+
+### Bugs fixed
+
+**1. `ros2_node.py` crashed with `ModuleNotFoundError: faiss`**
+
+- Cause: run command was `source /opt/ros/jazzy/setup.bash && python3 anyloc/ros2_node.py`, which uses system Python 3. System Python has rclpy but not faiss, torch, or PIL (those are in `isaac_sim_test` conda env).
+- Fix: run with `conda run -n isaac_sim_test python3` so ML libraries are available. Add `/opt/ros/jazzy/lib/python3.12/site-packages` to `sys.path` inside the script so rclpy is importable from the conda env. Same fix applied to `detection/ros2_node.py` and `control/flight_commander.py`.
+- New launch script: `anyloc/run_ros2_localizer.sh` — sources ROS2 then calls `conda run -n isaac_sim_test`.
+
+**2. `VORefiner.update()` called with wrong arguments**
+
+- Cause: `ros2_node.py` was calling `self._vo.update(prev_bgr, curr_bgr, agl_m, yaw_rad)` — passing two BGR numpy arrays, 4 positional args, and yaw in radians.
+- Actual signature: `update(self, frame_pil: PIL.Image, agl_m: float, yaw_deg: float)` — takes a single PIL image (stores previous frame internally), and expects yaw in degrees.
+- Fix: `dlat, dlon, _ = self._vo.update(pil_img, agl_m, math.degrees(self._drone_yaw))`
+
+**3. `cesium_scene.py` stopped writing files when ROS2 was available**
+
+- Cause: ROS2 publish and file write were in an if/else — when `_ros2_node is not None`, files were never written, so `run_localizer.py` (legacy, polls files by mtime) saw no new frames and stayed stuck at starting position.
+- Fix: always write files unconditionally; publish to ROS2 on top when available (dual output).
+
+### Feature added: `ros2_node.py` postview
+
+`anyloc/ros2_node.py` now includes the same dual-window matplotlib postview as `run_localizer.py`:
+- Left panel: live drone camera with LAT/LON/ALT/AGL/YAW overlay
+- Right panel: AnyLoc satellite match crop with ERR/score/VO pts; green < 200 m, blue otherwise
+
+ROS2 spin runs in a daemon background thread; matplotlib owns the main thread.
+Node also writes `anyloc/latest_estimate.json` on each anchor for legacy `run_flight.py` compatibility.
+
+| File | Change |
+|------|--------|
+| `anyloc/ros2_node.py` | Added sys.path ROS2 fix; fixed VORefiner.update() call; added full postview |
+| `anyloc/run_ros2_localizer.sh` | New launch script: `source /opt/ros/jazzy/setup.bash && conda run -n isaac_sim_test python3 anyloc/ros2_node.py` |
+| `detection/ros2_node.py` | Added sys.path ROS2 fix |
+| `control/flight_commander.py` | Added sys.path ROS2 fix |
+| `simulator/cesium_scene.py` | Always writes files; publishes ROS2 on top (dual output) |

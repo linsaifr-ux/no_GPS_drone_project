@@ -19,6 +19,22 @@ import io as _io, json, math, os, struct, sys, time, urllib.parse, urllib.reques
 # Project root on path so control/ package is importable from simulator/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ROS2 Jazzy Python packages (Python 3.12) — compatible with Isaac Sim 6.0 (Python 3.12).
+# run_chiayi.sh sources /opt/ros/jazzy/setup.bash so ROS2 shared libs are on LD_LIBRARY_PATH.
+_ROS2_SITE = "/opt/ros/jazzy/lib/python3.12/site-packages"
+if os.path.isdir(_ROS2_SITE) and _ROS2_SITE not in sys.path:
+    sys.path.insert(0, _ROS2_SITE)
+try:
+    import rclpy
+    import rclpy.node
+    from sensor_msgs.msg import Image as RosImage
+    from geometry_msgs.msg import PoseStamped
+    from std_msgs.msg import Float64
+    _ROS2_OK = True
+except ImportError as _e:
+    print(f"[ROS2] rclpy not available ({_e}) — falling back to file output")
+    _ROS2_OK = False
+
 import numpy as np
 import requests
 from PIL import Image
@@ -753,6 +769,24 @@ except ImportError as _e:
     print(f"[SITL] Bridge not loaded: {_e}")
     _sitl = None
 
+# ── ROS2 publishers (init after centre_elev is known) ─────────────────────────
+_ros2_node  = None
+_img_pub    = None
+_pose_pub   = None
+_agl_pub    = None
+
+if _ROS2_OK:
+    try:
+        rclpy.init()
+        _ros2_node = rclpy.create_node("isaac_sim_drone")
+        _img_pub   = _ros2_node.create_publisher(RosImage,    "/drone/camera/image_raw", 1)
+        _pose_pub  = _ros2_node.create_publisher(PoseStamped, "/drone/pose",              1)
+        _agl_pub   = _ros2_node.create_publisher(Float64,     "/drone/agl",               1)
+        print("[ROS2] Publishers ready: /drone/camera/image_raw, /drone/pose, /drone/agl")
+    except Exception as _e:
+        print(f"[ROS2] Node init failed: {_e} — falling back to file output")
+        _ros2_node = None
+
 # ── LOAD CESIUM OSM BUILDINGS ─────────────────────────────────────────────────
 print("[CESIUM] Loading Cesium OSM Buildings …")
 building_tiles, bld_token = fetch_building_tiles()
@@ -1084,7 +1118,7 @@ while simulation_app.is_running():
         _sitl.step(float(_p[0]), float(_p[1]), _alt,
                    float(drone_yaw_op.Get()), _kroll, _kpitch, time.time())
 
-    # ── Frame capture ─────────────────────────────────────────────────────────
+    # ── Frame capture + publish ───────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:
         rep.orchestrator.step(rt_subframes=1, delta_time=0.0)
         raw = _rgb.get_data()
@@ -1096,21 +1130,55 @@ while simulation_app.is_running():
                 print(f"[DRONE] step {_step}: empty frame — skipped")
             else:
                 rgb_arr = arr[:, :, :3].astype(np.uint8)
+
+                # ── Always write files (legacy run_localizer.py polls these) ──
                 Image.fromarray(rgb_arr, "RGB").save(
                     os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
                 with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
                     json.dump({
-                        "step":         _step,
-                        "lat":          _lat,
-                        "lon":          _lon,
-                        "alt_m":        _alt,
-                        "agl_m":        _agl,
-                        "centre_elev":  centre_elev,
-                        "yaw_deg":      yaw,
-                        "frame_w":      DRONE_CAM_W,
-                        "frame_h":      DRONE_CAM_H,
+                        "step":        _step,
+                        "lat":         _lat,
+                        "lon":         _lon,
+                        "alt_m":       _alt,
+                        "agl_m":       _agl,
+                        "centre_elev": centre_elev,
+                        "yaw_deg":     yaw,
+                        "frame_w":     DRONE_CAM_W,
+                        "frame_h":     DRONE_CAM_H,
                     }, f)
                 if _step == DRONE_SAVE_EVERY:
                     print(f"[DRONE] Frame capture working — saving to {DRONE_FRAME_DIR}/")
+
+                # ── Additionally publish to ROS2 when available ───────────────
+                if _ros2_node is not None:
+                    _now = _ros2_node.get_clock().now().to_msg()
+
+                    img_msg = RosImage()
+                    img_msg.header.stamp    = _now
+                    img_msg.header.frame_id = "drone_camera"
+                    img_msg.height   = DRONE_CAM_H
+                    img_msg.width    = DRONE_CAM_W
+                    img_msg.encoding = "rgb8"
+                    img_msg.step     = DRONE_CAM_W * 3
+                    img_msg.data     = rgb_arr.flatten().tobytes()
+                    _img_pub.publish(img_msg)
+
+                    pose_msg = PoseStamped()
+                    pose_msg.header.stamp    = _now
+                    pose_msg.header.frame_id = "wgs84"
+                    pose_msg.pose.position.x = _lat
+                    pose_msg.pose.position.y = _lon
+                    pose_msg.pose.position.z = _alt
+                    _hy = math.radians(yaw) / 2.0
+                    pose_msg.pose.orientation.z = math.sin(_hy)
+                    pose_msg.pose.orientation.w = math.cos(_hy)
+                    _pose_pub.publish(pose_msg)
+
+                    agl_msg = Float64()
+                    agl_msg.data = float(_agl)
+                    _agl_pub.publish(agl_msg)
+
+                    if _step == DRONE_SAVE_EVERY:
+                        print("[ROS2] First frame published to /drone/camera/image_raw")
 
 simulation_app.close()

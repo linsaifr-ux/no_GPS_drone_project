@@ -16,12 +16,14 @@ no_GPS_drone_project/
 │   ├── drone_frames/     # Live output: latest.jpg + latest_meta.json (per step)
 │   └── run_chiayi.sh     # Launch script
 ├── anyloc/               # AnyLoc visual localization — WORKING
-│   ├── build_database.py # Build geo-tagged VLAD database from satellite orthophoto (run once)
-│   ├── localizer.py      # AnyLocLocalizer class (DINOv2 + VLAD + FAISS)
-│   ├── vo_refiner.py     # VORefiner class (LK optical flow, frame-to-frame delta)
-│   ├── run_localizer.py  # Live dual postview with AnyLoc+VO combined estimate
-│   ├── requirements.txt  # Dependency notes
-│   └── database/         # Built database (2821 entries, VLAD dim=49152, 50 m grid)
+│   ├── build_database.py      # Build geo-tagged VLAD database from satellite orthophoto (run once)
+│   ├── localizer.py           # AnyLocLocalizer class (DINOv2 + VLAD + FAISS)
+│   ├── vo_refiner.py          # VORefiner class (LK optical flow, frame-to-frame delta)
+│   ├── ros2_node.py           # ROS2 node: dual postview + pub /anyloc/pose_estimate + VPE
+│   ├── run_ros2_localizer.sh  # launch script: sources ROS2, runs with conda env
+│   ├── run_localizer.py       # Legacy file-based dual postview (non-ROS2 fallback)
+│   ├── requirements.txt       # Dependency notes
+│   └── database/              # Built database (2821 entries, VLAD dim=49152, 50 m grid)
 ├── detection/            # YOLO — object detection (WORKING)
 │   ├── detector.py       # YOLODetector — auto-detects COCO / VisDrone class maps
 │   ├── run_detector.py   # live mtime-polling postview
@@ -441,5 +443,6 @@ AnyLoc + VO          YOLO         │
 | 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | Done |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate using IMU data | TODO |
+| 6e | ROS2 migration: all IPC via topics + MAVROS2 (replaces file polling + pymavlink) | Done |
 | 7 | Full pipeline integrated: AnyLoc + VO + IMU → ArduPilot commands | TODO |
 | 8 | Deploy to real drone hardware | TODO |
