@@ -21,7 +21,7 @@ Usage:
   #
   #   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
   #       -v ArduCopter --model=JSON --no-rebuild --console --map \
-  #       -l 23.450868,120.286135,<centre_elev>,0 \
+  #       -l 23.450868,120.286135,28.17,0 \
   #       --add-param-file=control/no_gps.parm --wipe
   #   (wait for "Saved 1 params" in console, then type: reboot)
   #
@@ -169,7 +169,14 @@ def main():
         print("[Flight] No HEARTBEAT — is SITL running?")
         return
 
-    # 2 — Ensure estimate file exists and is fresh, then start vision thread
+    # 2 — Set EKF origin so EKF3 has an absolute NED reference frame.
+    # Without this, VISION_POSITION_ESTIMATE has nowhere to anchor and
+    # ArduPilot reports "EKF attitude is bad" / "VisOdom: not healthy".
+    ctrl.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+    ctrl.set_home_position(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+    time.sleep(0.5)   # give SITL time to process before VPE starts arriving
+
+    # 4 — Ensure estimate file exists and is fresh, then start vision thread
     # Treat files older than 10 s as stale (leftover from a previous localizer run).
     _needs_stub = True
     if os.path.exists(ESTIMATE_JSON):
@@ -187,27 +194,28 @@ def main():
     vt.start()
     print(f"[Flight] Vision thread started — sending at {VISION_HZ} Hz")
 
-    # 3 — Wait for EKF POS_ABS
+    # 5 — Wait for EKF POS_ABS
     print("[Flight] Waiting for EKF POS_ABS …")
     if not ctrl.wait_ekf_pos(timeout=60.0):
         print("[Flight] EKF never reached POS_ABS — aborting")
         stop_ev.set(); ctrl.close(); return
     print("[Flight] EKF POS_ABS ✓")
 
-    # Let VisOdom health window fill: EKF_POS_ABS fires on the first VPE message,
-    # but AP_VisualOdom::healthy() requires a full second of steady messages.
-    # 3 s @ 5 Hz = 15 more VPEs, well above the 1-second health timeout.
-    print("[Flight] Waiting 3 s for VisOdom health …")
-    for _ in range(30):
-        ctrl.recv()
-        time.sleep(0.1)
+    # Wait for PRED_POS_ABS (bit 9) — set only when AP_VisualOdom::healthy() is
+    # satisfied. Without this, regular arm fails with result=FAILED even when
+    # ARMING_CHECK=0, because the VisOdom health check is mandatory in AP 4.x+.
+    print("[Flight] Waiting for VisOdom healthy (EKF PRED_POS_ABS) …")
+    if not ctrl.wait_visodom_healthy(timeout=30.0):
+        print("[Flight] VisOdom did not become healthy — will use force arm")
+    else:
+        print("[Flight] VisOdom healthy ✓")
 
-    # 4 — GUIDED mode
+    # 6 — GUIDED mode
     ctrl.set_mode("GUIDED")
     time.sleep(1.0)
     ctrl.recv()
 
-    # 5 — Arm
+    # 7 — Arm
     print("[Flight] Arming …")
     ctrl.arm()
     result = ctrl.wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=10.0)
@@ -224,7 +232,7 @@ def main():
         stop_ev.set(); ctrl.close(); return
     print("[Flight] Armed ✓")
 
-    # 6 — Takeoff
+    # 8 — Takeoff
     print(f"[Flight] Takeoff → {TAKEOFF_ALT} m AGL …")
     ctrl.takeoff(TAKEOFF_ALT)
     if ctrl.wait_altitude(TAKEOFF_ALT, tolerance=1.5, timeout=30.0):
@@ -233,7 +241,7 @@ def main():
         print(f"[Flight] Altitude timeout — continuing")
     time.sleep(2.0)
 
-    # 7 — Waypoints
+    # 9 — Waypoints
     for i, (n, e, d) in enumerate(WAYPOINTS):
         print(f"[Flight] WP {i+1}/{len(WAYPOINTS)}  N={n:+.0f} E={e:+.0f} ALT={-d:.0f} m AGL")
         ctrl.set_position_ned(n, e, d)
@@ -243,7 +251,7 @@ def main():
             print(f"[Flight] WP {i+1} timeout")
         time.sleep(1.0)
 
-    # 8 — RTL
+    # 10 — RTL
     print("[Flight] Mission complete — RTL")
     ctrl.set_mode("RTL")
 

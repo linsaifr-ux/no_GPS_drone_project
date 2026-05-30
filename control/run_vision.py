@@ -24,7 +24,7 @@ Usage:
   # Terminal 1: SITL  (--out opens the extra port for run_vision.py)
   python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
       -v ArduCopter --model=JSON --no-rebuild --console --map \
-      -l 23.450868,120.286135,46,0 --add-param-file=control/no_gps.parm \
+      -l 23.450868,120.286135,28.17,0 --add-param-file=control/no_gps.parm \
       --out tcp:localhost:5763
 
   # Terminal 2: Isaac Sim (bridge)
@@ -57,7 +57,7 @@ from control.mavlink_ctrl import (
 
 HOME_LAT     = 23.450868     # SITL home (matches -l flag)
 HOME_LON     = 120.286135
-HOME_ALT_MSL = 46.0          # metres MSL
+HOME_ALT_MSL = 28.17         # metres MSL (from control/home_elevation.json)
 COS_LAT      = math.cos(math.radians(HOME_LAT))
 M_PER_DEG    = 111_320.0
 
@@ -87,6 +87,11 @@ def main():
     if not ctrl.wait_heartbeat(timeout=60.0):
         print("[Vision] No HEARTBEAT — is SITL running?")
         return
+
+    # Set EKF origin so VPE messages have an absolute NED reference frame.
+    ctrl.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+    ctrl.set_home_position(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+    time.sleep(0.5)
 
     print("\n[Vision] Sending VISION_POSITION_ESTIMATE at 5 Hz")
     print(f"[Vision] Reading from: {ESTIMATE_JSON}")

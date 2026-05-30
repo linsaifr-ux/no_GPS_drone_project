@@ -35,9 +35,10 @@ no_GPS_drone_project/
 │   ├── sitl_bridge.py    #   UDP :9002 server — binary servo in, JSON physics out (no GPS)
 │   ├── stub_bridge.py    #   minimal bridge for testing MAVLink without Isaac Sim
 │   ├── no_gps.parm       #   SITL params: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1, FS_GPS_ENABLE=0
-│   ├── mavlink_ctrl.py   #   MAVLinkCtrl class + EKF flag constants + vision + command stubs
+│   ├── mavlink_ctrl.py   #   MAVLinkCtrl class + EKF flag constants + vision + flight command helpers
 │   ├── run_mavlink.py    #   live terminal monitor (port 5762)
-│   └── run_vision.py     #   AnyLoc → VISION_POSITION_ESTIMATE → ArduPilot EKF3 (port 5763)
+│   ├── run_flight.py     #   vision thread + full flight sequence, single port 5762 (6b-iv)
+│   └── run_vision.py     #   standalone vision bridge — use run_flight.py for combined operation
 └── main.py               # Top-level orchestrator (TODO)
 ```
 
@@ -237,7 +238,7 @@ Next step:
 
 ### 4. Flight Control (`control/`)
 
-**Status:** In progress — ArduPilot SITL + MAVLink next; IMU fusion after
+**Status:** 6b-iv done — autonomous flight commands working; 6c/6d (IMU reader + fusion) TODO
 
 #### Architecture decision (2026-05-27)
 
@@ -299,7 +300,7 @@ Run SITL:
 ```bash
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,46,0 \
+    -l 23.450868,120.286135,28.17,0 \
     --add-param-file=control/no_gps.parm --wipe
 ```
 
@@ -323,20 +324,22 @@ This is the core no-GPS milestone. Four sub-steps must happen in order:
 - `control/run_vision.py` reads `anyloc/latest_estimate.json` (written by `run_localizer.py` each anchor), converts lat/lon to NED, sends `VISION_POSITION_ESTIMATE` to ArduPilot at 5 Hz
 - `no_gps.parm` params: `EK3_SRC1_POSXY=6` (ExtNav), `VISO_TYPE=1`
 - EKF3 fuses this as the external vision position source — same as Intel T265 / OptiTrack on real hardware
-- Uses port **5763** (separate from `run_mavlink.py` on 5762 — each TCP port allows one client)
 - Covariance: 20 m horizontal std (matches AnyLoc ~15–20 m anchor error), 5 m vertical, 0.3 rad yaw
 - Root cause of EKF UNINIT reset (20 s cycle): `EK3_SRC1_POSXY` defaults to 3 (GPS); with `GPS_TYPE=0` EKF times out waiting for GPS and resets. Fix: set `EK3_SRC1_POSXY=6` so EKF expects ExtNav instead
 - Watch for `POS_ABS` (0x0010) in EKF flags — confirms EKF3 accepted the vision position
 
-**6b-iv  Flight commands replace keyboard** — In progress
+**6b-iv  Flight commands replace keyboard** — DONE
 - `control/run_flight.py`: full flight sequence in one process on `tcp:localhost:5762`
+  - After heartbeat: sends `SET_GPS_GLOBAL_ORIGIN` + `SET_HOME_POSITION` (required before VPE)
   - Background thread sends `VISION_POSITION_ESTIMATE` at 5 Hz (merged from `run_vision.py`)
-  - Main thread: wait POS_ABS → GUIDED → arm → takeoff → waypoints → RTL
-- `mavlink_ctrl.py` additions: `set_mode()`, `wait_ekf_pos()`, `wait_command_ack()`,
-  `wait_altitude()`, `wait_position()`, `is_armed`
+  - Main thread: wait `EKF_POS_ABS` → wait `EKF_PRED_POS_ABS` (VisOdom healthy) → GUIDED → arm → takeoff → waypoints → RTL
+- `mavlink_ctrl.py` additions: `set_mode()`, `wait_ekf_pos()`, `wait_visodom_healthy()`,
+  `set_ekf_origin()`, `set_home_position()`, `wait_command_ack()`, `wait_altitude()`, `wait_position()`, `is_armed`
 - `stub_bridge.py` upgraded to kinematic altitude model: starts on ground (AGL=0),
   integrates thrust from PWM → ArduPilot can arm and take off without Isaac Sim
 - No second TCP port needed — vision and flight share one `MAVLinkCtrl` connection
+- **Important:** delete `anyloc/latest_estimate.json` before each test run — a stale file
+  causes EKF to initialise far from home (observed: 350 m N, 1351 m E offset)
 
 **Why this order matters:**
 ArduPilot will not accept position commands until EKF3 has a valid position estimate.
@@ -371,10 +374,10 @@ Files status:
 | `control/sitl_bridge.py` | Done | Binary servo in → JSON physics out, UDP :9002; full gyro p/q/r; full DCM accel; `debug_hz` property |
 | `control/no_gps.parm` | Done | GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1, FS_GPS_ENABLE=0, FENCE_ENABLE=0 |
 | `control/stub_bridge.py` | Done | Kinematic altitude model (PWM → thrust → AGL), port 9002; prints state at 1 Hz |
-| `control/mavlink_ctrl.py` | Done | pymavlink: recv + vision + set_mode + arm + wait helpers; HIGHRES_IMU at 25 Hz |
+| `control/mavlink_ctrl.py` | Done | pymavlink: recv + vision + set_mode + arm + wait helpers; `set_ekf_origin`, `set_home_position`, `wait_visodom_healthy`; HIGHRES_IMU at 25 Hz |
 | `control/run_mavlink.py` | Done | Live terminal monitor at 10 Hz, port 5762 |
 | `control/run_vision.py` | Done (standalone) | Vision bridge only — use run_flight.py for combined |
-| `control/run_flight.py` | In progress (6b-iv) | Vision thread + flight sequence, single port 5762; stale estimate check; 3 s VisOdom wait |
+| `control/run_flight.py` | Done (6b-iv) | Vision thread + flight sequence, single port 5762; sets EKF origin; waits PRED_POS_ABS for VisOdom health before arming |
 | `control/imu_reader.py` | TODO (6c) | HIGHRES_IMU reader, writes to shared state |
 | `control/imu_fusion.py` | TODO (6d) | IMU-based anchor validation + VO quality gate |
 
@@ -435,7 +438,7 @@ AnyLoc + VO          YOLO         │
 | 6b-i | pymavlink connection to ArduPilot SITL (tcp:localhost:5762) | Done |
 | 6b-ii | Disable GPS in SITL; strip position from JSON bridge (velocity stays — required) | Done |
 | 6b-iii | Feed AnyLoc estimates to ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
-| 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | In progress |
+| 6b-iv | Send flight commands via SET_POSITION_TARGET_LOCAL_NED (replaces keyboard) | Done |
 | 6c | Read HIGHRES_IMU back from ArduPilot MAVLink → feed localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate using IMU data | TODO |
 | 7 | Full pipeline integrated: AnyLoc + VO + IMU → ArduPilot commands | TODO |

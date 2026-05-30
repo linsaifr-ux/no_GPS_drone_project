@@ -883,6 +883,64 @@ SITL command simplified — `--out tcp:localhost:5763` no longer needed:
 ```bash
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,46,0 \
+    -l 23.450868,120.286135,28.17,0 \
     --add-param-file=control/no_gps.parm --wipe
 ```
+
+---
+
+## 2026-05-30 — EKF origin fix; VisOdom health; confirmed first autonomous flight
+
+### Bugs fixed
+
+**1. `SET_GPS_GLOBAL_ORIGIN` never sent — root cause of all arming failures**
+
+- Cause: `run_flight.py` connected and immediately started sending `VISION_POSITION_ESTIMATE`, but ArduPilot's EKF3 had no NED reference frame. Without a known origin, VPE messages cannot be anchored to absolute coordinates — EKF3 discards them, reports "EKF attitude is bad" and "VisOdom: not healthy", and blocks arming.
+- Fix: added `set_ekf_origin()` and `set_home_position()` to `MAVLinkCtrl`; both are called right after `wait_heartbeat()` in `run_flight.py` and `run_vision.py`, before the vision thread starts.
+- Confirmed: SITL console shows `EKF3 IMU0 origin set`, `EKF3 IMU1 origin set`, `Field Elevation Set: 28m` immediately after connection.
+
+```python
+# mavlink_ctrl.py — new methods
+def set_ekf_origin(lat, lon, alt_msl_m)   # sends SET_GPS_GLOBAL_ORIGIN
+def set_home_position(lat, lon, alt_msl_m) # sends SET_HOME_POSITION
+```
+
+**2. Regular arm FAILED even with `ARMING_CHECK 0` — VisOdom mandatory check**
+
+- Cause: In ArduPilot 4.x+, the VisOdom health pre-arm check is mandatory when `EK3_SRC1_POSXY=6`. `ARMING_CHECK 0` does not bypass it. `AP_VisualOdom::healthy()` requires a continuous 1-second window of VPE messages — the previous fixed 3-second sleep was not tight enough to guarantee this.
+- Fix: replaced the fixed sleep with `wait_visodom_healthy()` which polls `EKF_PRED_POS_HORIZ_ABS` (bit 9). This flag is set only when EKF3 is predicting future position from VPE, which implies `AP_VisualOdom::healthy()` is satisfied. Regular arm now succeeds without needing force arm.
+
+```python
+# mavlink_ctrl.py — new method
+def wait_visodom_healthy(timeout=30.0)  # waits for EKF_POS_ABS | EKF_PRED_POS_ABS
+```
+
+### Confirmed flight output
+
+```
+AP: EKF3 IMU0 origin set
+AP: EKF3 IMU1 origin set
+AP: Field Elevation Set: 28m
+AP: EKF3 IMU0 is using external nav data
+AP: EKF3 IMU0 initial pos NED = 350.4,1351.6,0.0 (m)   ← stale AnyLoc estimate
+ARMED
+AP: EKF3 IMU0 MAG0 in-flight yaw alignment complete
+
+[Flight] EKF POS_ABS ✓
+[Flight] VisOdom healthy ✓
+[Flight] Armed ✓
+[Flight] Takeoff → 10.0 m AGL …
+[Flight] Reached 10.0 m AGL ✓
+[Flight] WP 1/4  N=+20 E=+0 ALT=10 m AGL
+```
+
+**Note on initial NED offset (350.4, 1351.6):** The first VPE sent was a stale `anyloc/latest_estimate.json` from a previous AnyLoc run (position was not at home). Delete or overwrite this file before each test to ensure EKF initialises at NED (0, 0, 0).
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/mavlink_ctrl.py` | Added `set_ekf_origin()`, `set_home_position()`, `wait_visodom_healthy()` |
+| `control/run_flight.py` | Calls `set_ekf_origin` + `set_home_position` after heartbeat; replaces 3 s sleep with `wait_visodom_healthy()` |
+| `control/run_vision.py` | Same origin/home calls added; stale `HOME_ALT_MSL=46.0` → `28.17` |
+| `README.md`, `project_plan.md`, `history.md` | SITL `-l` altitude placeholder `<centre_elev>`/`46` → `28.17` throughout |

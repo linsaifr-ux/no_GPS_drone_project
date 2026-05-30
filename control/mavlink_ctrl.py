@@ -193,6 +193,22 @@ class MAVLinkCtrl:
             time.sleep(0.05)
         return False
 
+    def wait_visodom_healthy(self, timeout: float = 30.0) -> bool:
+        """
+        Block until EKF3 has both POS_ABS and PRED_POS_ABS set.
+        PRED_POS_ABS (bit 9) means EKF is predicting future position from VPE,
+        which implies AP_VisualOdom::healthy() is satisfied — allowing regular arm
+        without needing force arm to bypass the mandatory VisOdom pre-arm check.
+        """
+        need = EKF_POS_HORIZ_ABS | EKF_PRED_POS_HORIZ_ABS
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.recv()
+            if (self.ekf_flags & need) == need:
+                return True
+            time.sleep(0.05)
+        return False
+
     def wait_command_ack(self, cmd_id: int, timeout: float = 10.0) -> int | None:
         """
         Block until COMMAND_ACK for cmd_id arrives.
@@ -232,6 +248,39 @@ class MAVLinkCtrl:
                     return True
             time.sleep(0.05)
         return False
+
+    # ── EKF origin (required for no-GPS operation) ────────────────────────────
+
+    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float) -> None:
+        """
+        Send SET_GPS_GLOBAL_ORIGIN to define the EKF3 NED reference frame.
+
+        Must be called before sending VISION_POSITION_ESTIMATE. Without this
+        ArduPilot has no absolute coordinate reference, so VPE messages cannot
+        anchor the EKF — causing 'EKF attitude is bad' and 'VisOdom: not healthy'.
+        """
+        self._mav.mav.set_gps_global_origin_send(
+            self._mav.target_system,
+            int(lat * 1e7),          # 1e-7 degrees
+            int(lon * 1e7),
+            int(alt_msl_m * 1e3),    # mm MSL
+            int(time.time() * 1e6),  # time_usec
+        )
+        print(f"[MAVLink] SET_GPS_GLOBAL_ORIGIN  lat={lat:.6f} lon={lon:.6f} alt={alt_msl_m:.1f} m")
+
+    def set_home_position(self, lat: float, lon: float, alt_msl_m: float) -> None:
+        """Send SET_HOME_POSITION to define the RTL target."""
+        self._mav.mav.set_home_position_send(
+            self._mav.target_system,
+            int(lat * 1e7),
+            int(lon * 1e7),
+            int(alt_msl_m * 1e3),
+            0.0, 0.0, 0.0,        # local NED x/y/z (unused when lat/lon/alt given)
+            [1.0, 0.0, 0.0, 0.0], # quaternion (identity, not used)
+            0.0, 0.0, 0.0,        # approach vector (unused)
+            int(time.time() * 1e6),
+        )
+        print(f"[MAVLink] SET_HOME_POSITION      lat={lat:.6f} lon={lon:.6f} alt={alt_msl_m:.1f} m")
 
     # ── 6b-iii: Vision position ────────────────────────────────────────────────
 

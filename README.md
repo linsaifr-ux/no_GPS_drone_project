@@ -96,7 +96,7 @@ no_GPS_drone_project/
 | 6b-i | pymavlink connection to ArduPilot MAVLink output | Done |
 | 6b-ii | Disable GPS; strip position from JSON bridge (IMU+baro only) | Done |
 | 6b-iii | AnyLoc → ArduPilot EKF3 via VISION_POSITION_ESTIMATE | Done |
-| 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | In progress |
+| 6b-iv | Flight commands via SET_POSITION_TARGET (replaces keyboard) | Done |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
@@ -230,7 +230,7 @@ Then start SITL before Isaac Sim:
 # Terminal 1 — FIRST RUN (or after changing no_gps.parm): flush EEPROM with --wipe
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,<centre_elev>,0 \
+    -l 23.450868,120.286135,28.17,0 \
     --add-param-file=control/no_gps.parm --wipe
 # Wait for "Saved N params" in MAVProxy console, then type: reboot
 # (VISO_TYPE and SCHED_LOOP_RATE require a second boot to take effect)
@@ -238,7 +238,7 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
 # Terminal 1 — SUBSEQUENT RUNS (params already in EEPROM):
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild --console --map \
-    -l 23.450868,120.286135,<centre_elev>,0
+    -l 23.450868,120.286135,28.17,0
 
 # Terminal 2 — Isaac Sim (bridge auto-connects on first step)
 cd simulator && ./run_chiayi.sh
@@ -270,11 +270,17 @@ python3 control/run_flight.py
 Handles vision position and flight commands in one process on a single MAVLink connection
 (`tcp:localhost:5762`). No second TCP port or `run_vision.py` needed.
 
-Sequence: waits for EKF POS_ABS → GUIDED mode → arm → takeoff → waypoints → RTL.
+Sequence:
+1. Connect → `SET_GPS_GLOBAL_ORIGIN` + `SET_HOME_POSITION` (required before VPE is sent)
+2. Start vision thread (`VISION_POSITION_ESTIMATE` at 5 Hz from `anyloc/latest_estimate.json`)
+3. Wait `EKF_POS_ABS` → wait `EKF_PRED_POS_ABS` (VisOdom healthy)
+4. GUIDED → arm → takeoff → waypoints → RTL
 
-Vision sending (`VISION_POSITION_ESTIMATE` at 5 Hz) runs in a background thread, feeding
-EKF3 from `anyloc/latest_estimate.json`. If the file doesn't exist a stub estimate at home
-is created automatically so the pipeline works without `run_localizer.py`.
+If `latest_estimate.json` does not exist or is older than 10 s, a stub estimate at home
+is written automatically so the pipeline works without `run_localizer.py`.
+
+**Delete `anyloc/latest_estimate.json` before each test run** to prevent a stale AnyLoc
+estimate from initialising the EKF far from home.
 
 Requires SITL launched with `--add-param-file=control/no_gps.parm` so that
 `EK3_SRC1_POSXY=6` (ExtNav) and `VISO_TYPE=1` are set.
