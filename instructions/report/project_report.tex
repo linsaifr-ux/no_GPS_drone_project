@@ -194,134 +194,213 @@ Figure~\ref{fig:pipeline} shows the full data flow from simulation to flight com
 %
 % Long feedback arrows routed along right margin (x=12) to avoid all nodes.
 %
+% Architecture diagram — updated 2026-06-01 to reflect ROS2 / MAVROS2 pipeline,
+% drone_sim.py kinematic physics, VPE altitude fix (EK3_SRC1_POSZ=6), motor layout fix.
 \begin{figure}[p]
 \centering
 \begin{tikzpicture}[
   >=Stealth,
   block/.style={
     rectangle, rounded corners=4pt, draw, thick,
-    minimum width=3.4cm, minimum height=1.0cm,
-    align=center, font=\small\bfseries, inner sep=5pt,
+    minimum width=4.0cm, minimum height=2.8cm,
+    align=center, font=\small\bfseries, inner sep=6pt,
   },
-  data/.style={
-    rectangle, rounded corners=3pt, draw, thick,
-    minimum width=3.4cm, minimum height=0.85cm,
-    align=center, font=\footnotesize, inner sep=4pt,
+  optblock/.style={
+    rectangle, rounded corners=4pt, draw, dashed, thick,
+    minimum width=4.0cm, minimum height=2.2cm,
+    align=center, font=\small\bfseries, inner sep=6pt,
   },
   arr/.style={->, thick},
-  lbl/.style={font=\scriptsize, fill=white, inner sep=2pt},
+  biarr/.style={<->, thick},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=2pt, align=center},
 ]
 
-% ── Node placement ────────────────────────────────────────────────────────────
-%  Columns: A=0, B=5, C=10
-%  Rows:    R0=0, R1=-3.2, R2=-6.2, R3=-9.0, R4=-11.8
+%% ── Row 0  Physics simulation ─────────────────────────────────────────────
 
-\node[block, fill=simblue!18, draw=simblue]  (isaacSim)    at ( 0,  0  ) {Isaac Sim\\[2pt]\scriptsize cesium\_scene.py};
-\node[block, fill=simblue!10, draw=simblue!80](bridge)      at ( 5,  0  ) {SITL Bridge\\[2pt]\scriptsize sitl\_bridge.py\\[1pt]\scriptsize UDP :9002};
-\node[block, fill=ardu!18,    draw=ardu]      (ardupilot)   at (10,  0  ) {ArduPilot SITL\\[2pt]\scriptsize JSON backend\\[1pt]\scriptsize EKF3 / TCP :5762/:5763};
+\node[block, fill=ardu!15, draw=ardu] (sitl) at (0, 0) {%
+  ArduPilot SITL\\[3pt]%
+  \scriptsize EKF3 ExtNav XYZ\\%
+  \scriptsize GPS\_TYPE=0\\%
+  \scriptsize EK3\_SRC1\_POSXY=6\\%
+  \scriptsize EK3\_SRC1\_POSZ=6\\%
+  \scriptsize SCHED\_LOOP 50\,Hz%
+};
 
-\node[data,  fill=simblue!8,  draw=simblue!55](frames)      at ( 0, -3.2) {drone\_frames/\\[1pt]\scriptsize latest.jpg + meta.json\\[1pt]\scriptsize 640\texttimes480, nadir, 90\textdegree};
-\node[data,  fill=ardu!10,    draw=ardu!55]   (mavstate)    at (10, -3.2) {MAVLink stream\\[1pt]\scriptsize ATTITUDE, HIGHRES\_IMU\\[1pt]\scriptsize EKF\_STATUS\_REPORT};
+\node[block, fill=locgreen!18, draw=locgreen] (droneSim) at (6.8, 0) {%
+  drone\_sim.py\\[3pt]%
+  \scriptsize 6-DOF kinematic physics\\%
+  \scriptsize SITLBridge UDP :9002\\%
+  \scriptsize pub /drone/state @ 100\,Hz\\%
+  \scriptsize ch1=FR\ ch2=RL\\%
+  \scriptsize ch3=RR\ ch4=FL%
+};
 
-\node[block, fill=locgreen!18,draw=locgreen]  (anyloc)      at ( 0, -6.2) {AnyLoc + VO\\[2pt]\scriptsize run\_localizer.py\\[1pt]\scriptsize DINOv2 + VLAD + FAISS};
-\node[block, fill=detred!18,  draw=detred]    (yolo)        at ( 5, -6.2) {YOLOv8\\[2pt]\scriptsize run\_detector.py\\[1pt]\scriptsize yolov8l\_visdrone.pt};
-\node[block, fill=ardu!18,    draw=ardu]      (mavctrl)     at (10, -6.2) {MAVLinkCtrl\\[2pt]\scriptsize mavlink\_ctrl.py\\[1pt]\scriptsize pymavlink};
+\node[optblock, fill=simblue!8, draw=simblue!60] (cesium) at (13.6, 0) {%
+  cesium\_scene.py\,$\dagger$\\[3pt]%
+  \scriptsize optional --- Isaac Sim 6.0\\%
+  \scriptsize sub /drone/state $\to$ USD mesh\\%
+  \scriptsize pub /drone/camera/image\_raw\\%
+  \scriptsize pub /drone/pose\ \ /drone/agl%
+};
 
-\node[data,  fill=locgreen!10,draw=locgreen!55](estimate)   at ( 0, -9.0) {latest\_estimate.json\\[1pt]\scriptsize lat, lon, alt\_msl\\[1pt]\scriptsize yaw, error\_m};
-\node[data,  fill=detred!10,  draw=detred!55] (detections)  at ( 5, -9.0) {Detections\\[1pt]\scriptsize \{label, conf, bbox\}\\[1pt]\scriptsize est\_lat, est\_lon};
-\node[data,  fill=gray!14,    draw=gray!50]   (imuFusion)   at (10, -9.0) {IMU Fusion\\[1pt]\scriptsize imu\_fusion.py \textrm{[TODO]}\\[1pt]\scriptsize anchor validator + VO gate};
+%% ── Row 1  Flight control ─────────────────────────────────────────────────
 
-\node[block, fill=locgreen!14,draw=locgreen!80](visionBridge)at( 0,-11.8) {Vision Bridge\\[2pt]\scriptsize run\_vision.py\\[1pt]\scriptsize TCP :5763 @ 5 Hz};
-\node[block, fill=ctrlgold!20,draw=ctrlgold]  (orchestrator)at ( 5,-11.8) {Orchestrator\\[2pt]\scriptsize main.py \textrm{[TODO]}};
+\node[block, fill=ctrlgold!18, draw=ctrlgold] (mavros) at (0, -6.8) {%
+  MAVROS2\\[3pt]%
+  \scriptsize fcu\_url udp://:14550@\\%
+  \scriptsize VPE$\!\to\!$VISION\_POS\_EST\\%
+  \scriptsize pub /uas1/mavlink\_source\\%
+  \scriptsize pub /mavros/state\\%
+  \scriptsize pub /local\_position/pose%
+};
 
-% ── Layer backgrounds ─────────────────────────────────────────────────────────
+\node[block, fill=ctrlgold!25, draw=ctrlgold!80] (flightCmd) at (6.8, -6.8) {%
+  flight\_commander.py\\[3pt]%
+  \scriptsize arm$\!\to\!$NAV\_TAKEOFF$\!\to\!$WPs$\!\to\!$RTL\\%
+  \scriptsize VPE\,XY: home(Ph1)/AnyLoc(Ph2)\\%
+  \scriptsize VPE\,Z: kinematic AGL, cov=0.25\,m\textsuperscript{2}\\%
+  \scriptsize sub /drone/state (AGL truth)\\%
+  \scriptsize pub /mavros/vision\_pose/pose\_cov%
+};
+
+\node[optblock, fill=locgreen!10, draw=locgreen] (anyloc) at (13.6, -6.8) {%
+  anyloc/ros2\_node.py\,$\dagger$\\[3pt]%
+  \scriptsize DINOv2+VLAD+FAISS\\%
+  \scriptsize AnyLoc + VO refinement\\%
+  \scriptsize 2821-entry DB, $\sim$15--20\,m\\%
+  \scriptsize \textbf{pub /vision\_pose/\textit{pose}} (ENU)\\%
+  \scriptsize writes latest\_estimate.json%
+};
+
+%% ── Row 2  Detection (optional) ──────────────────────────────────────────
+
+\node[optblock, fill=detred!8, draw=detred!60] (detection) at (13.6, -12.2) {%
+  detection/ros2\_node.py\,$\dagger$\\[3pt]%
+  \scriptsize optional --- Isaac Sim\\%
+  \scriptsize YOLOv8l VisDrone\\%
+  \scriptsize sub /drone/camera/image\_raw\\%
+  \scriptsize sub /drone/pose\\%
+  \scriptsize pub /yolo/detections%
+};
+
+%% ── Layer backgrounds ────────────────────────────────────────────────────
+
 \begin{pgfonlayer}{background}
-  % Simulation: row 0 only, cols A+B
-  \fill[simblue!6,  rounded corners=6pt] (-2.1, 1.10) rectangle (7.3,-1.6);
-  \draw[simblue!50, rounded corners=6pt, dashed, thick] (-2.1, 1.10) rectangle (7.3,-1.6);
-  % Perception: rows 1-4, cols A+B
-  \fill[locgreen!5, rounded corners=6pt] (-2.1,-1.8 ) rectangle (7.3,-12.7);
-  \draw[locgreen!60,rounded corners=6pt, dashed, thick] (-2.1,-1.8 ) rectangle (7.3,-12.7);
-  % Flight control: rows 0-3, col C
-  \fill[ardu!5,     rounded corners=6pt] ( 8.2, 1.10) rectangle (12.2,-10.1);
-  \draw[ardu!50,    rounded corners=6pt, dashed, thick] ( 8.2, 1.10) rectangle (12.2,-10.1);
+  % Physics row
+  \fill[ardu!4,      rounded corners=6pt] (-2.5, 1.9) rectangle (15.8,-2.0);
+  \draw[ardu!35,     rounded corners=6pt, dashed, thick] (-2.5, 1.9) rectangle (15.8,-2.0);
+  % Flight control row (left + center only)
+  \fill[ctrlgold!4,  rounded corners=6pt] (-2.5,-5.0) rectangle (10.8,-8.7);
+  \draw[ctrlgold!35, rounded corners=6pt, dashed, thick] (-2.5,-5.0) rectangle (10.8,-8.7);
+  % Perception column (right)
+  \fill[locgreen!4,  rounded corners=6pt] (11.2,-5.0) rectangle (15.8,-14.0);
+  \draw[locgreen!35, rounded corners=6pt, dashed, thick] (11.2,-5.0) rectangle (15.8,-14.0);
 \end{pgfonlayer}
 
-\node[font=\small\bfseries, text=simblue,  fill=white, inner sep=2pt, anchor=north west] at (-2.05, 1.05) {Simulation Layer};
-\node[font=\small\bfseries, text=locgreen, fill=white, inner sep=2pt, anchor=north west] at (-2.05,-1.85) {Perception Layer};
-\node[font=\small\bfseries, text=ardu,     fill=white, inner sep=2pt, anchor=north west] at ( 8.25, 1.05) {Flight Control Layer};
+\node[font=\small\bfseries, text=ardu,      fill=white, inner sep=2pt, anchor=north west] at (-2.45, 1.85) {Physics Simulation};
+\node[font=\small\bfseries, text=ctrlgold!80,fill=white, inner sep=2pt, anchor=north west] at (-2.45,-5.05) {Flight Control};
+\node[font=\small\bfseries, text=locgreen,  fill=white, inner sep=2pt, anchor=north west] at (11.25,-5.05) {Perception};
 
-% ═══════════════════════════════════════════════════════════════════════════════
-% ALL ARROWS — Cleanly routed using orthogonal lines and strict coordinates
-% ═══════════════════════════════════════════════════════════════════════════════
+%% ── Connections ──────────────────────────────────────────────────────────
 
-% ── Row-0 horizontals ─────────────────────────────────────────────────────────
-\draw[arr, simblue] (isaacSim.east) -- node[lbl,above]{physics state} (bridge.west);
-\draw[arr, ardu!80] (bridge.east) -- node[lbl,above,pos=0.3]{\{JSON+\textbackslash n\}} (ardupilot.west);
+% A — ArduPilot SITL ↔ drone_sim.py (UDP 9002, bidirectional)
+\draw[biarr, ardu!80]
+  (sitl.east) --
+  node[lbl, above]{\scriptsize UDP 9002}
+  node[lbl, below]{\scriptsize servo\_packet\_16 $\leftrightarrow$ JSON+\textbackslash n}
+  (droneSim.west);
 
-% Servo feedback: rise, go left, drop down cleanly
-\draw[arr, ardu!70] (ardupilot.north) -- ++(0,1.25) -| (bridge.north) node[lbl,above,pos=0.25]{\scriptsize servo\_packet\_16};
+% B — ArduPilot SITL ↔ MAVROS2 (UDP 14550, bidirectional, vertical)
+\draw[biarr, ctrlgold!80]
+  (sitl.south) --
+  node[lbl, left, pos=0.5]{\scriptsize UDP 14550\\MAVLink}
+  (mavros.north);
 
-% ── Column A ──────────────────────────────────────────────────────────────────
-\draw[arr, simblue!70] (isaacSim.south) -- node[lbl, right, pos=0.35]{\scriptsize every 5 steps} (frames.north);
-\draw[arr, locgreen!70] (frames.south) -- node[lbl,right]{\scriptsize PIL image} (anyloc.north);
-\draw[arr, locgreen!70] (anyloc.south) -- node[lbl,right]{\scriptsize anchor fix} (estimate.north);
-\draw[arr, locgreen!70] (estimate.south) -- (visionBridge.north);
+% C — drone_sim.py → cesium_scene.py (/drone/state)
+\draw[arr, locgreen!70]
+  (droneSim.east) --
+  node[lbl, above]{\scriptsize /drone/state}
+  (cesium.west);
 
-% ── Column C ──────────────────────────────────────────────────────────────────
-\draw[arr, ardu!70] (ardupilot.south) -- (mavstate.north);
-\draw[arr, ardu!70] (mavstate.south)  -- (mavctrl.north);
-\draw[arr, ardu!70] (mavctrl.south) -- node[lbl,right]{\scriptsize HIGHRES\_IMU} (imuFusion.north);
+% D — drone_sim.py → flight_commander.py (/drone/state for kinematic AGL → VPE z)
+\draw[arr, locgreen!60, dashed]
+  (droneSim.south) --
+  node[lbl, right, pos=0.5]{\scriptsize /drone/state\\[-1pt](AGL$\!\to\!$VPE\,z)}
+  (flightCmd.north);
 
-% ── Column B ──────────────────────────────────────────────────────────────────
-\draw[arr, detred!70] (yolo.south)       -- (detections.north);
-\draw[arr, detred!70] (detections.south) -- (orchestrator.north);
+% E — cesium_scene.py → anyloc/ros2_node.py (camera + pose + agl topics)
+\draw[arr, simblue!70]
+  (cesium.south) --
+  node[lbl, right]{\scriptsize /drone/camera/image\_raw\\[-2pt]/drone/pose\ /drone/agl}
+  (anyloc.north);
 
-% ── frames → YOLOv8 ──────────────────────────────────────────────────────────
-% Clean horizontal then vertical drop to avoid messy diagonals
-\draw[arr, detred!70] (frames.east) -| node[lbl,above,pos=0.25]{\scriptsize PIL image} (yolo.north);
+% F — anyloc/ros2_node.py → flight_commander.py (Phase 2 XY via JSON file)
+\draw[arr, locgreen!60, dashed]
+  (anyloc.west) --
+  node[lbl, above]{\scriptsize latest\_estimate.json (Phase\,2 XY)}
+  (flightCmd.east);
 
-% ── estimate → orchestrator ───────────────────────────────────────────────────
-% Route to the top-left of the orchestrator to avoid hitting the visionBridge line
-\draw[arr, locgreen!50] (estimate.east) -| ([xshift=-1.2cm]orchestrator.north);
+% G — flight_commander.py → MAVROS2 (VPE xyz + position setpoints + EKF origin)
+\draw[arr, ctrlgold!90]
+  ([yshift=3pt]flightCmd.west) --
+  node[lbl, above]{\scriptsize VPE\,xyz\ $\cdot$\ setpoints\ $\cdot$\ gp\_origin}
+  ([yshift=3pt]mavros.east);
 
-% ── Vision Bridge → Orchestrator ──────────────────────────────────────────────
-\draw[arr, locgreen!60] (visionBridge.east) -- (orchestrator.west);
+% H — MAVROS2 → flight_commander.py (/mavros/state, /uas1/mavlink_source)
+\draw[arr, ctrlgold!70]
+  ([yshift=-3pt]mavros.east) --
+  node[lbl, below]{\scriptsize /mavros/state\ $\cdot$\ /uas1/mavlink\_source}
+  ([yshift=-3pt]flightCmd.west);
 
-% ── Orchestrator → ArduPilot (Gap rail x=7.7) ────────────────────────────────
-% Routes cleanly between the Perception and Flight Control bounding boxes
-\draw[arr, ctrlgold, thick] 
-  (orchestrator.east) -- (7.7, -11.8) -- (7.7, 0) -- (ardupilot.west);
-\node[lbl, rotate=90, text=ctrlgold] at (7.7,-5.9) {\scriptsize SET\_POSITION\_TARGET};
+% I — anyloc → detection (camera shared topic, dashed)
+\draw[arr, locgreen!40, dashed]
+  (anyloc.south) --
+  node[lbl, right]{\scriptsize /drone/camera/image\_raw}
+  (detection.north);
 
-% ── Vision Bridge → ArduPilot (Bottom & far-right rail x=13.5) ────────────────
-% Goes completely under the perception box, then up the far right
-\draw[arr, locgreen, thick] 
-  (visionBridge.south) -- (0, -13.2) -- (13.5, -13.2) -- (13.5, 0) -- (ardupilot.east);
-\node[lbl, rotate=90, text=locgreen] at (13.5,-5.9) {\scriptsize VISION\_POSITION\_ESTIMATE};
+% J — anyloc → MAVROS2 directly via /vision_pose/pose (dashed route below row 1)
+% Goes left then down past flight-control row, arrives at MAVROS2 bottom.
+% Note: this is a DIFFERENT topic from flight_commander's /vision_pose/pose_cov;
+%       both reach MAVROS2 when the full pipeline runs (potential VPE conflict).
+\draw[arr, locgreen!60, dashed]
+  (anyloc.west) -- (-2.0, -6.8) -- (-2.0, -6.8) node[lbl, above, pos=0]{}
+  -- ([xshift=-0.4cm]mavros.south) -- (mavros.south);
+\node[lbl, text=locgreen!80] at (5.5, -9.5)
+  {\scriptsize /vision\_pose/\textit{pose} (PoseStamped, ENU; full pipeline only)};
+\node[lbl, text=ctrlgold!80, align=left] at (5.5,-10.2)
+  {\scriptsize \textcolor{ctrlgold!80}{[!]}\,Both VPE topics reach MAVROS2 simultaneously%
+   when anyloc + flight\_commander run together};
 
-% ── IMU Fusion → AnyLoc (Left outer rail x=-2.6) ──────────────────────────────
-% Routes around the left side, crossing the estimate line at a clean 90-degree angle
-\draw[arr, dashed, gray!70, thick] 
-  (imuFusion.south) -- (10, -10.5) -- (-2.6, -10.5) -- (-2.6, -6.2) -- (anyloc.west);
-\node[lbl, rotate=90, text=gray!70] at (-2.6,-8.3) {\scriptsize quality gate [TODO]};
+%% ── Legend ───────────────────────────────────────────────────────────────
 
-% ── Legend ────────────────────────────────────────────────────────────────────
-\node[anchor=south west, font=\scriptsize, align=left] at (-2.6,-14.5) {%
-  \textcolor{simblue}{\rule{0.8cm}{2pt}}~Simulation\quad
-  \textcolor{locgreen}{\rule{0.8cm}{2pt}}~Perception\quad
-  \textcolor{ardu}{\rule{0.8cm}{2pt}}~MAVLink\quad
-  \textcolor{ctrlgold}{\rule{0.8cm}{2pt}}~Commands\quad
-  \textcolor{gray}{\rule{0.4cm}{1pt}\ \rule{0.4cm}{1pt}}~Future / TODO%
+\node[anchor=south west, font=\scriptsize, align=left] at (-2.5,-15.2) {%
+  \textcolor{ardu}{\rule{0.7cm}{2pt}}\ Physics / MAVLink\quad
+  \textcolor{locgreen}{\rule{0.7cm}{2pt}}\ ROS2 topic\quad
+  \textcolor{ctrlgold}{\rule{0.7cm}{2pt}}\ Flight control\quad
+  {\color{gray}\rule{0.35cm}{1pt}\ \rule{0.25cm}{1pt}\ \rule{0.25cm}{1pt}}\ optional / file\quad
+  $\dagger$\,Optional module (requires Isaac Sim)%
 };
 
 \end{tikzpicture}
-
-\caption{Full system pipeline. Three layers are colour-coded:
-\textcolor{simblue}{blue} (simulation loop), \textcolor{locgreen}{green} (perception --- localisation and detection), and
-\textcolor{ardu}{purple} (flight control --- MAVLink and EKF3).
-Long feedback arrows are routed along the right margin to avoid overlaps.
-Dashed elements are planned future work.}
+\caption{%
+  System architecture (updated 2026-06-01, milestone~6j).
+  \textbf{Physics simulation layer} (top): \texttt{drone\_sim.py} runs the 6-DOF kinematic
+  model and exchanges binary servo packets with ArduPilot SITL over UDP~9002; it publishes
+  \texttt{/drone/state} (ENU, 100\,Hz). Motor channel assignment follows ArduCopter X-frame
+  FRAME\_TYPE=1: ch1=Front-Right, ch2=Rear-Left, ch3=Rear-Right, ch4=Front-Left.
+  The optional Isaac Sim visualiser (\texttt{cesium\_scene.py}) subscribes to
+  \texttt{/drone/state} and feeds nadir camera/pose topics to the perception pipeline.
+  \textbf{Flight control layer} (middle-left): \texttt{flight\_commander.py} publishes 3-axis VPE
+  to MAVROS2 --- XY from home (Phase\,1, below 50\,m) or AnyLoc~JSON (Phase\,2, above 50\,m);
+  Z from kinematic AGL read off \texttt{/drone/state} (covariance 0.25\,m\textsuperscript{2}).
+  With \texttt{EK3\_SRC1\_POSZ=6} (ExternalNav), ArduPilot EKF3 uses VPE\,z for altitude ---
+  barometer is unreliable in SIM\_JSON when \texttt{"position"} is omitted.
+  MAVROS2 forwards VPE as \texttt{VISION\_POSITION\_ESTIMATE} and returns status topics.
+  \textbf{Perception layer} (right): \texttt{anyloc/ros2\_node.py} localises from DINOv2+VLAD
+  and writes \texttt{latest\_estimate.json}; \texttt{detection/ros2\_node.py} (optional) detects
+  vehicles with YOLOv8l.
+  Dashed borders = optional modules; dashed arrows = optional or file-based interfaces.%
+}
 \label{fig:pipeline}
 \end{figure}
 
@@ -586,13 +665,18 @@ packet.
 
 \subsubsection*{EKF3 Configuration (\texttt{no\_gps.parm})}
 
-\begin{lstlisting}[caption={SITL parameter file for GPS-denied operation}]
+\begin{lstlisting}[caption={SITL parameter file for GPS-denied operation (no\_gps.parm)}]
 GPS_TYPE        0   # disable GPS sensor
-EK3_SRC1_POSXY  6   # horizontal position: ExternalNav (AnyLoc)
+EK3_SRC1_POSXY  6   # horizontal position: ExternalNav (VPE XY)
 EK3_SRC1_VELXY  0   # no horizontal velocity source
-EK3_SRC1_POSZ   1   # altitude from barometer
-EK3_SRC1_YAW    1   # yaw from compass
+EK3_SRC1_POSZ   6   # altitude: ExternalNav (VPE z = kinematic AGL)
+                    # NOT barometer (1) -- baro stuck at 0 in SIM_JSON
+                    # when "position" field is omitted from JSON bridge
+EK3_SRC1_YAW    6   # yaw: ExternalNav
 VISO_TYPE       1   # enable MAVLink ExternalNav processing
+MOT_THST_HOVER  0.5 # hover at PWM 1500 (matches kinematic model)
+DISARM_DELAY    0   # enables NAV_TAKEOFF (removes land-detector deadlock)
+SCHED_LOOP_RATE 50  # 50 Hz loop rate
 \end{lstlisting}
 
 \subsubsection*{MAVLink Controller (\texttt{mavlink\_ctrl.py})}
@@ -788,11 +872,15 @@ conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
 5 & YOLO detection working on simulated frames & Done\\
 5a & Switch to VisDrone-trained YOLOv8l; auto class-map in detector & Done\\
 5b & Top-down fine-tuning pipeline (VisDrone + synthetic data) & Ready to run\\
-6a & ArduPilot SITL + Isaac Sim JSON bridge (IMU + baro) & Done\\
-6b-i & pymavlink connection to ArduPilot MAVLink output & Done\\
-6b-ii & Disable GPS; strip position from JSON bridge (IMU+baro only) & Done\\
-6b-iii & AnyLoc $\to$ ArduPilot EKF3 via \texttt{VISION\_POSITION\_ESTIMATE} & Done\\
-6b-iv & Flight commands via \texttt{SET\_POSITION\_TARGET} (replaces keyboard) & TODO\\
+6a & ArduPilot SITL + JSON bridge (IMU + baro) & Done\\
+6b-i--iv & pymavlink pipeline: GPS-denied EKF3, VPE fusion, flight commands & Done\\
+6e & ROS2 migration: all IPC via topics + MAVROS2 & Done\\
+6f & Separate drone physics (\texttt{drone\_sim.py}) from Isaac Sim & Done\\
+6g & Fix VPE: ENU coordinate order + covariance for EKF POS\_ABS & Done\\
+6h & Remove pymavlink; MAVROS2 raw MAVLink; \texttt{DISARM\_DELAY=0} & Done\\
+6i & NAV\_TAKEOFF replaces P-controller; EKF origin blocking; ATC gain reduction & Done\\
+6j & Fix altitude runaway (\texttt{EK3\_SRC1\_POSZ}$\to$6) + 90° course-error (motor layout) & \textbf{Done}\\
+6j-wp & Waypoints via position setpoints & WIP\\
 6c & \texttt{HIGHRES\_IMU} from ArduPilot $\to$ localisation pipeline & TODO\\
 6d & IMU fusion: AnyLoc anchor validator + VO quality gate & TODO\\
 7 & Full pipeline integrated in simulation & TODO\\

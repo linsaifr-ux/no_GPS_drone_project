@@ -264,10 +264,10 @@ class AnyLocNode(rclpy.node.Node):
 
         north, east, down = _ned_from_geopose(lat, lon, alt_msl)
         vpe = PoseStamped()
-        vpe.header.stamp = now; vpe.header.frame_id = "map"
-        vpe.pose.position.x = north
-        vpe.pose.position.y = east
-        vpe.pose.position.z = down
+        vpe.header.stamp = now; vpe.header.frame_id = "map"  # ENU: x=East, y=North, z=Up
+        vpe.pose.position.x = east    # ENU East  (was: north — swapped)
+        vpe.pose.position.y = north   # ENU North (was: east  — swapped)
+        vpe.pose.position.z = -down   # ENU Up    (was: down  — wrong sign)
         vpe.pose.orientation.z = math.sin(hy)
         vpe.pose.orientation.w = math.cos(hy)
         self.pub_vpe.publish(vpe)
