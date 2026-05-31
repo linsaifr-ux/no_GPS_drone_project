@@ -1091,6 +1091,58 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 
 ---
 
+## 2026-05-31 — Remove pymavlink; MAVROS2 raw MAVLink for EKF origin + status; two-phase VPE
+
+### What was done
+
+**Removed all pymavlink dependencies from `flight_commander.py`**
+
+The old code used pymavlink on UDP 14551 for three things: setting the EKF global origin, monitoring EKF status flags, and reading altitude during takeoff. All three are replaced by MAVROS2 infrastructure:
+
+- **EKF origin**: publish `GeoPointStamped` to `/mavros/global_position/set_gp_origin`. Confirmed by monitoring GPS_GLOBAL_ORIGIN (msg 49) on `/uas1/mavlink_source` with BEST_EFFORT QoS. No extra UDP port required — MAVROS2's global_position plugin forwards to ArduPilot.
+
+- **EKF status**: read EKF_STATUS_REPORT (msg 193) from `/uas1/mavlink_source`. Flags decoded at **byte offset 20** (after 5 floats × 4 bytes). `/mavros/estimator_status` is advertised in MAVROS2 Jazzy 2.14 but publishes no messages at a useful rate — confirmed by `ros2 topic echo` producing no output. The `/uas1/mavlink_source` approach works.
+
+- **Altitude**: already reading `/mavros/local_position/pose` (was the case since 6f/6g).
+
+- **Motor PWM**: also decoded from SERVO_OUTPUT_RAW (msg 36) via `_cb_mavlink` and printed alongside each AGL line during takeoff for diagnostics.
+
+**Why TCP 5760 (MAVProxy master) cannot be used:**
+ArduPilot SITL's TCP 5760 only serves one client (MAVProxy). Additional connections are accepted at the TCP level but receive no MAVLink data. Confirmed by pymavlink `wait_heartbeat` timing out despite a successful TCP socket connect.
+
+**Two-phase VPE strategy**
+
+The VPE thread now uses altitude-dependent covariance and position:
+- **Phase 1 (below 50 m AGL):** position = home (east=0, north=0), cov_xy = 0.1 m². EKF sets POS_HORIZ_ABS immediately because the drone IS at the known home position on the ground.
+- **Phase 2 (above 50 m AGL):** position = AnyLoc estimate from `latest_estimate.json`, cov_xy = max(1.0, error_m²). Only estimates with `agl_m >= 50` accepted (rejects ground-level stubs).
+
+**`launch_mavros.sh` updated:**
+Only `--out udp:127.0.0.1:14550` needed in the SITL command. The `--out udp:127.0.0.1:14551` line is removed.
+
+### Key diagnostic findings from debugging session
+
+| Finding | Detail |
+|---------|--------|
+| `/uas1/mavlink_source` QoS | Publisher uses BEST_EFFORT — subscription must match |
+| EKF_STATUS_REPORT flags offset | Byte 20 (not 0) — after 5 floats (velocity_variance, pos_horiz_variance, pos_vert_variance, compass_variance, terrain_alt_variance) |
+| GPS_GLOBAL_ORIGIN msg ID | 49 — only echoed when EKF successfully accepts the origin |
+| SERVO_OUTPUT_RAW struct | 4 uint16 motors at byte offset 4 (after uint32 time_usec) |
+| "Mode change to Guided failed: requires position" | MAVROS2 returns success but ArduPilot silently rejects — indicates EKF flags=0x000 (degraded SITL state) |
+| SITL degradation pattern | After 180s failed takeoff, EKF flags drop to 0x000; GPS_GLOBAL_ORIGIN no longer echoed; must restart SITL + drone_sim + MAVROS2 |
+
+### Status
+
+Arming pipeline fully working: connect → EKF origin confirmed → STABILIZE arm → GUIDED → EKF POS_ABS → NAV_TAKEOFF accepted. Takeoff (actual climb) is **not yet working** — motors read from SERVO_OUTPUT_RAW during the climb will be printed in the next run to determine whether ArduPilot is commanding throttle.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/flight_commander.py` | Removed pymavlink; added `/uas1/mavlink_source` subscription; `set_ekf_origin()` via GeoPointStamped + GPS_GLOBAL_ORIGIN confirmation; `wait_ekf_pos()` via EKF_STATUS_REPORT flags; two-phase VPE; motor PWM logging |
+| `control/launch_mavros.sh` | Updated comments: only `--out udp:127.0.0.1:14550` needed |
+
+---
+
 ## 2026-05-31 — flight_commander.py: dead code removed, cleanup fixes
 
 ### Bugs fixed

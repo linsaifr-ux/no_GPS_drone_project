@@ -56,8 +56,9 @@ ArduPilot SITL  ◄─UDP 9002─►  control/drone_sim.py
 
 ArduPilot SITL
   ─UDP 14550──► MAVROS2  ◄──/mavros/vision_pose/pose_cov (EKF3 fusion)
-  ─UDP 14551──► flight_commander.py (pymavlink: EKF origin, EKF status, altitude)
-                │
+                │          └── /uas1/mavlink_source (BEST_EFFORT) → flight_commander.py
+                │              (EKF origin confirm, EKF status flags, motor PWM)
+                ├─ /mavros/global_position/set_gp_origin → MAVROS2 → SET_GPS_GLOBAL_ORIGIN
                 ├─ /mavros/setpoint_position/local  → MAVROS2 → ArduPilot
                 └─ MAV_CMD_NAV_TAKEOFF              → MAVROS2 → ArduPilot
 ```
@@ -66,10 +67,9 @@ ArduPilot SITL
 
 | Port | Protocol | Owner |
 |------|----------|-------|
-| TCP 5760 | MAVLink | MAVProxy ↔ ArduPilot SITL (internal) |
+| TCP 5760 | MAVLink | MAVProxy ↔ ArduPilot SITL (internal; single client only) |
 | UDP 9002 | JSON SITL | drone_sim.py ↔ ArduPilot physics |
 | UDP 14550 | MAVLink | MAVROS2 listens (MAVProxy → MAVROS2) |
-| UDP 14551 | MAVLink | flight_commander.py listens (pymavlink) |
 
 ---
 
@@ -130,29 +130,30 @@ Run:
 
 ### 5. Flight Control (`control/flight_commander.py`)
 
-**Status:** Arming + EKF POS_ABS working; takeoff in progress
+**Status:** Arming + EKF POS_ABS working; takeoff under investigation
 
-ROS2 node. Full arming and flight sequence:
+ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming and flight sequence:
 
-1. Start VPE thread (publishes stub estimate to `/mavros/vision_pose/pose_cov` at 5 Hz)
+1. Start VPE thread — Phase 1: home position (0,0) at 0.1 m² cov; Phase 2: AnyLoc above 50 m AGL
 2. Wait for MAVROS2 connection (`/mavros/state.connected`)
-3. Send `SET_GPS_GLOBAL_ORIGIN` via pymavlink UDP 14551 (confirmed by echo)
+3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; confirm via GPS_GLOBAL_ORIGIN (msg 49) on `/uas1/mavlink_source`
 4. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm; only needs IMU attitude)
 5. Switch to GUIDED
-6. Wait for `EKF_POS_HORIZ_ABS` flag — diagnostic logging every 5 s if stuck
+6. Wait for `EKF_POS_HORIZ_ABS` (bit 4) from EKF_STATUS_REPORT (msg 193) on `/uas1/mavlink_source` — flags at byte offset 20
 7. Send `MAV_CMD_NAV_TAKEOFF` (breaks "landed" state — position setpoints alone are insufficient)
-8. Rate-limited position setpoint ramp to 90 m AGL at 1 m/s
+8. Rate-limited position setpoint ramp to 90 m AGL at 1 m/s (prints motor PWM alongside AGL for diagnostics)
 9. Square waypoint pattern → RTL
 
 **VPE covariance design:**
 - `frame_id = "map"` (ENU): x = East, y = North, z = Up
-- x/y covariance = **1 m²** (must be ≤ ~5 m² for EKF to set POS_HORIZ_ABS)
+- Phase 1 x/y covariance = **0.1 m²** (EKF sets POS_HORIZ_ABS immediately at ground)
+- Phase 2 x/y covariance = **max(1, error_m²)** (scales with AnyLoc confidence)
 - z covariance = **1e6 m²** (EKF ignores VPE altitude, uses barometer)
 
 **MAVROS2 (UDP):**
 - `launch_mavros.sh` uses `fcu_url:="udp://:14550@"` (binds local port 14550)
 - MAVProxy sends to 14550 via `--out udp:127.0.0.1:14550`
-- `flight_commander.py` pymavlink uses `udpin:0.0.0.0:14551` (binds 14551, receives from MAVProxy `--out udp:127.0.0.1:14551`)
+- `/mavros/estimator_status` is advertised but publishes no messages in MAVROS2 Jazzy 2.14; use `/uas1/mavlink_source` instead
 
 **no_gps.parm highlights:**
 
@@ -180,7 +181,7 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild \
     -l 23.450868,120.286135,28.17,0 \
     --add-param-file=control/no_gps.parm --wipe \
-    --out udp:127.0.0.1:14550 --out udp:127.0.0.1:14551
+    --out udp:127.0.0.1:14550
 
 # T2 — Drone physics (start within ~10 s of SITL)
 source /opt/ros/jazzy/setup.bash && python3 control/drone_sim.py
@@ -191,6 +192,8 @@ bash control/launch_mavros.sh
 # T4 — Flight commander
 source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 ```
+
+> **Note:** Restart all three (SITL + drone_sim + MAVROS2) after any failed run.
 
 ### Full (with Isaac Sim)
 
@@ -203,7 +206,7 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild \
     -l 23.450868,120.286135,28.17,0 \
     --add-param-file=control/no_gps.parm --wipe \
-    --out udp:127.0.0.1:14550 --out udp:127.0.0.1:14551
+    --out udp:127.0.0.1:14550
 
 # T3 — Drone physics
 source /opt/ros/jazzy/setup.bash && python3 control/drone_sim.py
@@ -239,6 +242,7 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6e | ROS2 migration: all IPC via topics + MAVROS2 | Done |
 | 6f | Separate drone physics (drone_sim.py) from Isaac Sim | Done |
 | 6g | Fix VPE: ENU coordinate order + 1 m² covariance for EKF POS_ABS | Done |
+| 6h | Remove pymavlink; EKF origin + status via MAVROS2 raw MAVLink; two-phase VPE | Done (takeoff pending) |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

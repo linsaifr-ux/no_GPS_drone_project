@@ -10,8 +10,8 @@ Architecture:
   anyloc/ros2_node.py  →  /mavros/vision_pose/pose  →  MAVROS2  →  ArduPilot EKF3
   this node            →  /mavros/setpoint_position/local  →  MAVROS2  →  ArduPilot
 
-Uses pymavlink only for SET_GPS_GLOBAL_ORIGIN + SET_HOME_POSITION at startup
-(MAVROS2 Jazzy 2.14 has no /mavros/global_position/set_gp_origin service).
+EKF origin and status are handled via MAVROS2 raw MAVLink topics
+(/uas1/mavlink_source BEST_EFFORT) — no pymavlink or extra UDP port needed.
 
 Run:
   source /opt/ros/jazzy/setup.bash
@@ -27,6 +27,7 @@ Prerequisites (running concurrently):
 import json
 import math
 import os
+import struct
 import sys
 import threading
 import time
@@ -37,10 +38,17 @@ if os.path.isdir(_ROS2_SITE) and _ROS2_SITE not in sys.path:
 
 import rclpy
 import rclpy.node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from mavros_msgs.msg import State
+from mavros_msgs.msg import Mavlink, State
 from mavros_msgs.srv import CommandBool, CommandLong, CommandTOL, SetMode
-from pymavlink import mavutil
+
+_SENSOR_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+    depth=10,
+)
 
 # ── Home position ──────────────────────────────────────────────────────────────
 HOME_LAT     = 23.450868
@@ -56,9 +64,11 @@ except (FileNotFoundError, KeyError):
     print(f"[Commander] HOME_ALT_MSL = {HOME_ALT_MSL:.1f} m (default)")
 
 # ── Mission parameters ─────────────────────────────────────────────────────────
-TAKEOFF_ALT     = 90.0   # metres AGL
-WAYPOINT_RADIUS =  3.0   # metres — how close counts as reached
-WAYPOINT_TIMEOUT = 60.0  # seconds per waypoint
+TAKEOFF_ALT          = 90.0   # metres AGL
+WAYPOINT_RADIUS      =  3.0   # metres — how close counts as reached
+WAYPOINT_TIMEOUT     = 60.0   # seconds per waypoint
+MIN_LOCALISATION_AGL = 50.0   # metres AGL — below this, VPE is locked to home position;
+                               # above this, AnyLoc estimates are used
 
 # NED waypoints (north m, east m, down m) — down = -alt_agl
 WAYPOINTS = [
@@ -92,89 +102,34 @@ def _write_stub_estimate() -> None:
     os.replace(tmp, ESTIMATE_JSON)
 
 
-# ── EKF origin via pymavlink (no MAVROS2 service for this in Jazzy 2.14) ───────
-
-def _set_ekf_origin_confirmed(lat: float, lon: float, alt_msl_m: float,
-                               timeout: float = 30.0,
-                               connection_str: str = "udpin:0.0.0.0:14551") -> bool:
-    """
-    Send SET_GPS_GLOBAL_ORIGIN + SET_HOME_POSITION and retry until ArduPilot
-    confirms by sending back a GPS_GLOBAL_ORIGIN message.
-
-    ArduPilot broadcasts GPS_GLOBAL_ORIGIN when it accepts the origin —
-    this is the only reliable confirmation that the message was processed.
-    Returns True on confirmation, False on timeout.
-    """
-    mav = mavutil.mavlink_connection(connection_str, source_system=254,
-                                     dialect="ardupilotmega")
-    print("[Commander] Waiting for HEARTBEAT (EKF origin setup) …")
-    if not mav.wait_heartbeat(timeout=30):
-        print("[Commander] No heartbeat on UDP:14551")
-        mav.close()
-        return False
-
-    deadline  = time.time() + timeout
-    attempt   = 0
-    confirmed = False
-
-    while time.time() < deadline:
-        attempt += 1
-        ts = int(time.time() * 1e6)
-        mav.mav.set_gps_global_origin_send(
-            mav.target_system,
-            int(lat * 1e7), int(lon * 1e7), int(alt_msl_m * 1e3), ts)
-        mav.mav.set_home_position_send(
-            mav.target_system,
-            int(lat * 1e7), int(lon * 1e7), int(alt_msl_m * 1e3),
-            0.0, 0.0, 0.0, [1.0, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0, ts)
-        print(f"[Commander] SET_GPS_GLOBAL_ORIGIN attempt {attempt} …")
-
-        # Wait up to 2 s for GPS_GLOBAL_ORIGIN echo from ArduPilot
-        t_end = time.time() + 2.0
-        while time.time() < t_end:
-            msg = mav.recv_match(type="GPS_GLOBAL_ORIGIN", blocking=False)
-            if msg is not None:
-                print(f"[Commander] EKF origin confirmed ✓  "
-                      f"(attempt {attempt}, "
-                      f"lat={msg.latitude/1e7:.6f} lon={msg.longitude/1e7:.6f})")
-                confirmed = True
-                break
-            time.sleep(0.05)
-
-        if confirmed:
-            break
-
-    mav.close()
-    if not confirmed:
-        print(f"[Commander] EKF origin not confirmed after {attempt} attempts — "
-              "check SITL console for 'EKF3 IMU0 origin set'")
-    return confirmed
-
-
 # ── Flight commander ROS2 node ─────────────────────────────────────────────────
 
 class FlightCommander(rclpy.node.Node):
     def __init__(self):
         super().__init__("flight_commander")
 
-        self._state     = State()
-        self._local_pos = None
+        self._state               = State()
+        self._local_pos           = None
+        self._ekf_flags           = 0     # from EKF_STATUS_REPORT (msg 193)
+        self._gps_origin_received = False # set when GPS_GLOBAL_ORIGIN (msg 49) arrives
+        self._last_motor_pwm      = None  # from SERVO_OUTPUT_RAW (msg 36)
 
         # Subscribers
         self.create_subscription(State, "/mavros/state",
                                  self._cb_state, 10)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
-                                 self._cb_local_pos, 10)
+                                 self._cb_local_pos, _SENSOR_QOS)
+        # Raw MAVLink from FCU — BEST_EFFORT matches mavros_router's QoS
+        self.create_subscription(Mavlink, "/uas1/mavlink_source",
+                                 self._cb_mavlink, _SENSOR_QOS)
 
         # Publishers
-        self._pos_pub = self.create_publisher(
+        self._pos_pub    = self.create_publisher(
             PoseStamped, "/mavros/setpoint_position/local", 1)
-        # Use pose_cov so we can set z covariance = infinity → ArduPilot ignores
-        # VPE z and relies entirely on barometer for altitude. PoseStamped would
-        # send zero z covariance (100% certain), which fails the EKF innovation
-        # gate when the stub z differs from barometer altitude.
-        self._vpe_pub = self.create_publisher(
+        self._vpe_pub    = self.create_publisher(
             PoseWithCovarianceStamped, "/mavros/vision_pose/pose_cov", 1)
+        self._origin_pub = self.create_publisher(
+            GeoPointStamped, "/mavros/global_position/set_gp_origin", 1)
 
         # Service clients
         self._arm_cli  = self.create_client(CommandBool, "/mavros/cmd/arming")
@@ -188,65 +143,94 @@ class FlightCommander(rclpy.node.Node):
 
     def start_vision_thread(self, stop_event: threading.Event) -> threading.Thread:
         """
-        Background thread: reads latest_estimate.json and publishes VPE to
-        /mavros/vision_pose/pose at 5 Hz. Sends home-position stub when the
-        file doesn't exist or is stale, so VisOdom stays healthy even before
-        AnyLoc produces its first anchor.
+        Background thread: publishes VPE to /mavros/vision_pose/pose_cov at 5 Hz.
+
+        Two-phase strategy:
+          Phase 1 — below MIN_LOCALISATION_AGL:
+            VPE = home position (0, 0) with 0.1 m² covariance.
+            The drone is on the ground at the known home position so this is accurate.
+            EKF sets POS_HORIZ_ABS and holds XY at home while baro handles altitude.
+
+          Phase 2 — above MIN_LOCALISATION_AGL:
+            VPE = AnyLoc estimate from latest_estimate.json.
+            Camera can see landmarks at altitude → real visual localisation.
+            Covariance scales with AnyLoc's reported error_m (min 1 m²).
         """
         def _loop():
-            last_mtime  = 0.0
-            current_est = (0.0, 0.0, 0.0, 0.0)   # north, east, down, yaw_rad
-            n_sent = 0
+            last_mtime   = 0.0
+            anyloc_est   = None   # (east, north, yaw_rad, cov_xy) — set once above altitude
+            n_sent       = 0
+            n_anyloc     = 0
+            phase_logged = False
 
-            # Write stub at home so there's always a fresh file to read
             _write_stub_estimate()
 
             while not stop_event.is_set():
                 t0 = time.time()
-                try:
-                    mtime = os.path.getmtime(ESTIMATE_JSON)
-                    if mtime != last_mtime:
-                        with open(ESTIMATE_JSON) as fh:
-                            est = json.load(fh)
-                        lat = est["est_lat"]; lon = est["est_lon"]
-                        alt = est["alt_msl_m"]
-                        yaw = math.radians(est.get("yaw_deg", 0.0))
-                        north = (lat - HOME_LAT) * M_PER_DEG
-                        east  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
-                        down  = -(alt - HOME_ALT_MSL)
-                        current_est = (north, east, down, yaw)
-                        last_mtime  = mtime
-                except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                    pass
 
-                north, east, down, yaw = current_est
+                # Current AGL from EKF local position (ENU z = up from home = AGL)
+                agl = 0.0
+                if self._local_pos is not None:
+                    agl = max(0.0, self._local_pos.pose.position.z)
 
-                hy = yaw / 2.0
+                # ── Phase 2: above localisation altitude — read AnyLoc estimate ──
+                if agl >= MIN_LOCALISATION_AGL:
+                    if not phase_logged:
+                        print(f"[Commander] AGL {agl:.0f} m ≥ {MIN_LOCALISATION_AGL:.0f} m "
+                              "— switching VPE to AnyLoc")
+                        phase_logged = True
+                    try:
+                        mtime = os.path.getmtime(ESTIMATE_JSON)
+                        if mtime != last_mtime:
+                            with open(ESTIMATE_JSON) as fh:
+                                est = json.load(fh)
+                            # Only accept estimates taken at altitude (not the ground stub)
+                            if est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL:
+                                lat  = est["est_lat"]; lon = est["est_lon"]
+                                yaw  = math.radians(est.get("yaw_deg", 0.0))
+                                north = (lat - HOME_LAT) * M_PER_DEG
+                                east  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
+                                cov_xy = max(1.0, est.get("error_m", 10.0) ** 2)
+                                anyloc_est = (east, north, yaw, cov_xy)
+                                last_mtime = mtime
+                                n_anyloc += 1
+                                if n_anyloc == 1:
+                                    print(f"[Commander] First AnyLoc VPE: "
+                                          f"N={north:+.1f} E={east:+.1f} m  "
+                                          f"err={est.get('error_m', 0):.1f} m")
+                    except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                        pass
+
+                # ── Choose position and covariance ────────────────────────────────
+                if agl >= MIN_LOCALISATION_AGL and anyloc_est is not None:
+                    east_v, north_v, yaw_v, cov_xy = anyloc_est
+                else:
+                    # Phase 1 — home position.  The drone is at the known home point;
+                    # use 0.1 m² so EKF marks POS_HORIZ_ABS "good" immediately.
+                    east_v, north_v, yaw_v, cov_xy = 0.0, 0.0, 0.0, 0.1
+
+                # ── Publish VPE ───────────────────────────────────────────────────
+                hy  = yaw_v / 2.0
                 msg = PoseWithCovarianceStamped()
                 msg.header.stamp    = self.get_clock().now().to_msg()
-                msg.header.frame_id = "map"
-                # ENU convention: x = East, y = North, z = Up
-                msg.pose.pose.position.x = east
-                msg.pose.pose.position.y = north
-                msg.pose.pose.position.z = -down  # z irrelevant — huge cov below
+                msg.header.frame_id = "map"   # ENU: x=East, y=North, z=Up
+                msg.pose.pose.position.x    = east_v
+                msg.pose.pose.position.y    = north_v
+                msg.pose.pose.position.z    = 0.0   # z irrelevant — huge cov below
                 msg.pose.pose.orientation.z = math.sin(hy)
                 msg.pose.pose.orientation.w = math.cos(hy)
-                # Covariance matrix (6×6, row-major):
-                # x,y: 1 m² — must be ≤ ~5 m² for EKF to mark POS_HORIZ_ABS "good".
-                #             400 m² (20 m std) prevents EKF POS_ABS from ever being set.
-                # z:   1e6 m² → EKF ignores VPE altitude entirely, uses barometer.
                 cov = [0.0] * 36
-                cov[0]  = 1.0     # x variance (1 m std)
-                cov[7]  = 1.0     # y variance
-                cov[14] = 1e6     # z variance → EKF ignores VPE z, uses baro
-                cov[21] = 0.09    # roll variance (0.3 rad std)
-                cov[28] = 0.09    # pitch variance
-                cov[35] = 0.09    # yaw variance
+                cov[0]  = cov_xy  # x variance
+                cov[7]  = cov_xy  # y variance
+                cov[14] = 1e6     # z → EKF ignores VPE altitude, uses barometer
+                cov[21] = 0.09    # roll  (0.3 rad std)
+                cov[28] = 0.09    # pitch
+                cov[35] = 0.09    # yaw
                 msg.pose.covariance = cov
                 self._vpe_pub.publish(msg)
                 n_sent += 1
                 if n_sent == 1:
-                    print("[Commander] First VPE stub published to /mavros/vision_pose/pose")
+                    print("[Commander] VPE thread started — Phase 1 (home position)")
 
                 elapsed = time.time() - t0
                 time.sleep(max(0.0, 0.2 - elapsed))   # 5 Hz
@@ -260,6 +244,51 @@ class FlightCommander(rclpy.node.Node):
 
     def _cb_local_pos(self, msg: PoseStamped):
         self._local_pos = msg
+
+    def _cb_mavlink(self, msg: Mavlink) -> None:
+        raw = b"".join(x.to_bytes(8, "little") for x in msg.payload64)[:msg.len]
+        if msg.msgid == 193 and len(raw) >= 22:  # EKF_STATUS_REPORT: flags at byte 20
+            self._ekf_flags = struct.unpack_from("<H", raw, 20)[0]
+        elif msg.msgid == 49:  # GPS_GLOBAL_ORIGIN
+            self._gps_origin_received = True
+        elif msg.msgid == 36 and len(raw) >= 12:  # SERVO_OUTPUT_RAW: 4 motors after uint32
+            ch = struct.unpack_from("<4H", raw, 4)
+            self._last_motor_pwm = ch
+
+    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float,
+                       timeout: float = 30.0) -> bool:
+        """
+        Publish GPS global origin via /mavros/global_position/set_gp_origin and
+        confirm receipt by waiting for GPS_GLOBAL_ORIGIN (msg 49) from ArduPilot.
+        MAVROS2's global_position plugin converts GeoPointStamped → SET_GPS_GLOBAL_ORIGIN.
+        """
+        self.get_logger().info(
+            f"Setting EKF origin: {lat:.6f}°N {lon:.6f}°E {alt_msl_m:.1f} m MSL")
+        self._gps_origin_received = False
+
+        origin_msg = GeoPointStamped()
+        origin_msg.position.latitude  = lat
+        origin_msg.position.longitude = lon
+        origin_msg.position.altitude  = alt_msl_m
+
+        deadline = time.time() + timeout
+        attempt  = 0
+        while time.time() < deadline:
+            attempt += 1
+            origin_msg.header.stamp = self.get_clock().now().to_msg()
+            self._origin_pub.publish(origin_msg)
+            print(f"[Commander] SET_GPS_GLOBAL_ORIGIN attempt {attempt} …")
+
+            t_end = time.time() + 2.0
+            while time.time() < t_end:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                if self._gps_origin_received:
+                    self.get_logger().info("EKF origin confirmed via GPS_GLOBAL_ORIGIN ✓")
+                    return True
+
+        self.get_logger().warn(
+            f"EKF origin not confirmed after {attempt} attempts — continuing anyway")
+        return False
 
     # ── Blocking helpers ──────────────────────────────────────────────────────
 
@@ -280,54 +309,35 @@ class FlightCommander(rclpy.node.Node):
 
     def wait_ekf_pos(self, timeout=90.0) -> bool:
         """
-        Block until EKF_POS_HORIZ_ABS is set.
-        Reads EKF_STATUS_REPORT directly via pymavlink UDP:14551 rather than
-        relying on /mavros/estimator_status (not published in Jazzy 2.14).
-        Continues spinning rclpy so the VPE thread keeps publishing.
+        Block until EKF_POS_HORIZ_ABS is set (bit 4 of EKF_STATUS_REPORT flags).
+        Uses _ekf_flags updated by _cb_mavlink via /uas1/mavlink_source.
+        /mavros/estimator_status is NOT published in MAVROS2 Jazzy 2.14 at useful rate.
         """
-        EKF_POS_HORIZ_ABS = 1 << 4
+        EKF_POS_HORIZ_ABS = 0x010
+        _FLAG_NAMES = {
+            0x001: "ATT", 0x002: "VEL_H", 0x004: "VEL_V",
+            0x008: "POS_H_REL", 0x010: "POS_H_ABS", 0x020: "POS_V_ABS",
+            0x040: "POS_V_AGL", 0x080: "CONST_POS",
+        }
         self.get_logger().info(
             "Waiting for EKF POS_ABS — VPE must reach ArduPilot EKF3 …")
-
-        try:
-            mav = mavutil.mavlink_connection(
-                "udpin:0.0.0.0:14551", source_system=254,
-                dialect="ardupilotmega")
-            mav.wait_heartbeat(timeout=10)
-        except Exception as e:
-            self.get_logger().warn(f"pymavlink EKF monitor: {e}")
-            return False
-
-        _FLAG_NAMES = {
-            0x001: "ATT",
-            0x002: "VEL_H",
-            0x004: "VEL_V",
-            0x008: "POS_H_REL",
-            0x010: "POS_H_ABS",
-            0x020: "POS_V_ABS",
-            0x040: "POS_V_AGL",
-            0x080: "CONST_POS",
-        }
 
         deadline   = time.time() + timeout
         last_print = 0.0
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
-            msg = mav.recv_match(type="EKF_STATUS_REPORT", blocking=False)
-            if msg:
-                if msg.flags & EKF_POS_HORIZ_ABS:
-                    mav.close()
-                    self.get_logger().info("EKF POS_ABS ✓")
-                    return True
-                now = time.time()
-                if now - last_print > 5.0:
-                    active = " | ".join(n for v, n in _FLAG_NAMES.items()
-                                       if msg.flags & v)
-                    self.get_logger().warn(
-                        f"EKF flags 0x{msg.flags:03x}: [{active or 'none'}]"
-                        " — waiting for POS_H_ABS")
-                    last_print = now
-        mav.close()
+            if self._ekf_flags & EKF_POS_HORIZ_ABS:
+                self.get_logger().info("EKF POS_ABS ✓")
+                return True
+            now = time.time()
+            if now - last_print > 5.0:
+                active = " | ".join(n for v, n in _FLAG_NAMES.items()
+                                   if self._ekf_flags & v)
+                self.get_logger().warn(
+                    f"EKF flags 0x{self._ekf_flags:03x}: [{active or 'none'}]"
+                    " — waiting for POS_H_ABS")
+                last_print = now
+
         self.get_logger().warn("EKF POS_ABS timeout — check VPE flow and EKF origin")
         return False
 
@@ -400,28 +410,19 @@ class FlightCommander(rclpy.node.Node):
         else:
             self.get_logger().warn("NAV_TAKEOFF service timed out — continuing anyway")
 
-        try:
-            mav = mavutil.mavlink_connection("udpin:0.0.0.0:14551",
-                                             source_system=254,
-                                             dialect="ardupilotmega")
-            mav.wait_heartbeat(timeout=5)
-        except Exception as e:
-            self.get_logger().warn(f"Altitude monitor: {e}")
-            return False
-
-        STEP_DT    = 0.2          # setpoint publish interval (s)
-        setpt_alt  = 0.0          # current commanded altitude (m AGL, ENU z)
+        # Altitude is read from /mavros/local_position/pose (ENU z = AGL).
+        # Altitude read from /mavros/local_position/pose (ENU z = AGL).
+        STEP_DT    = 0.2
+        setpt_alt  = 0.0
         deadline   = time.time() + timeout
         last_print = 0.0
 
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=STEP_DT)
 
-            # Ramp position setpoint so GUIDED target tracks the climb
             if setpt_alt < alt_m:
                 setpt_alt = min(setpt_alt + climb_rate * STEP_DT, alt_m)
 
-            # Publish ENU setpoint (x=east, y=north, z=up)
             msg = PoseStamped()
             msg.header.stamp    = self.get_clock().now().to_msg()
             msg.header.frame_id = "map"
@@ -429,21 +430,19 @@ class FlightCommander(rclpy.node.Node):
             msg.pose.orientation.w = 1.0
             self._pos_pub.publish(msg)
 
-            # Read actual AGL
-            lp = mav.recv_match(type="LOCAL_POSITION_NED", blocking=False)
-            if lp:
-                agl = -lp.z
+            if self._local_pos is not None:
+                agl = self._local_pos.pose.position.z   # ENU z = up = AGL
                 now = time.time()
                 if now - last_print > 2.0:
+                    mot = self._last_motor_pwm
+                    mot_str = (f"  motors={list(mot)}" if mot else "")
                     print(f"[Commander] AGL = {agl:.1f} m  "
-                          f"(setpt {setpt_alt:.1f} m  target {alt_m:.0f} m)")
+                          f"(setpt {setpt_alt:.1f} m  target {alt_m:.0f} m){mot_str}")
                     last_print = now
                 if setpt_alt >= alt_m and abs(agl - alt_m) < 5.0:
-                    mav.close()
                     self.get_logger().info(f"Reached {alt_m:.0f} m AGL ✓")
                     return True
 
-        mav.close()
         self.get_logger().warn("Takeoff altitude timeout")
         return False
 
@@ -493,10 +492,8 @@ def main():
         print("[Commander] MAVROS2 not connected — is SITL + launch_mavros.sh running?")
         stop_ev.set(); rclpy.shutdown(); return
 
-    # Step 3: send EKF origin and wait for ArduPilot confirmation.
-    # Retries until ArduPilot echoes GPS_GLOBAL_ORIGIN (30 s timeout).
-    if not _set_ekf_origin_confirmed(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=30.0):
-        print("[Commander] EKF origin not confirmed — continuing anyway")
+    # Step 3: send EKF origin and wait for ArduPilot to echo GPS_GLOBAL_ORIGIN.
+    cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=30.0)
     time.sleep(0.3)
 
     # Step 4: arm in STABILIZE first — only needs EKF attitude, not position.
@@ -548,28 +545,5 @@ def main():
     rclpy.shutdown()
 
 
-def _emergency_stabilize():
-    """Switch ArduPilot to STABILIZE via pymavlink on Ctrl-C / crash.
-    Prevents VisOdom-loss failsafe from commanding descent after commander exits."""
-    try:
-        mav = mavutil.mavlink_connection("udpin:0.0.0.0:14551", source_system=254)
-        if mav.wait_heartbeat(timeout=3):
-            mode_id = mav.mode_mapping().get("STABILIZE", 0)
-            mav.mav.command_long_send(
-                mav.target_system, mav.target_component,
-                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                mode_id, 0, 0, 0, 0, 0)
-            print("[Commander] Switched to STABILIZE on exit")
-        mav.close()
-    except Exception:
-        pass
-
-
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        _emergency_stabilize()
+    main()
