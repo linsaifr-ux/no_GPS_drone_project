@@ -96,7 +96,7 @@ def _write_stub_estimate() -> None:
 
 def _set_ekf_origin_confirmed(lat: float, lon: float, alt_msl_m: float,
                                timeout: float = 30.0,
-                               connection_str: str = "udp:localhost:14550") -> bool:
+                               connection_str: str = "udpin:0.0.0.0:14551") -> bool:
     """
     Send SET_GPS_GLOBAL_ORIGIN + SET_HOME_POSITION and retry until ArduPilot
     confirms by sending back a GPS_GLOBAL_ORIGIN message.
@@ -109,7 +109,7 @@ def _set_ekf_origin_confirmed(lat: float, lon: float, alt_msl_m: float,
                                      dialect="ardupilotmega")
     print("[Commander] Waiting for HEARTBEAT (EKF origin setup) …")
     if not mav.wait_heartbeat(timeout=30):
-        print("[Commander] No heartbeat on UDP:14550")
+        print("[Commander] No heartbeat on UDP:14551")
         mav.close()
         return False
 
@@ -225,16 +225,19 @@ class FlightCommander(rclpy.node.Node):
                 msg = PoseWithCovarianceStamped()
                 msg.header.stamp    = self.get_clock().now().to_msg()
                 msg.header.frame_id = "map"
-                msg.pose.pose.position.x = north
-                msg.pose.pose.position.y = east
-                msg.pose.pose.position.z = down   # z value irrelevant — huge cov below
+                # ENU convention: x = East, y = North, z = Up
+                msg.pose.pose.position.x = east
+                msg.pose.pose.position.y = north
+                msg.pose.pose.position.z = -down  # z irrelevant — huge cov below
                 msg.pose.pose.orientation.z = math.sin(hy)
                 msg.pose.pose.orientation.w = math.cos(hy)
-                # Covariance matrix (6x6 upper-triangle, row-major):
-                # x,y: 20m std (400 m²)   z: 1e6 m² = ignore z entirely
+                # Covariance matrix (6×6, row-major):
+                # x,y: 1 m² — must be ≤ ~5 m² for EKF to mark POS_HORIZ_ABS "good".
+                #             400 m² (20 m std) prevents EKF POS_ABS from ever being set.
+                # z:   1e6 m² → EKF ignores VPE altitude entirely, uses barometer.
                 cov = [0.0] * 36
-                cov[0]  = 400.0   # x variance (20m std)
-                cov[7]  = 400.0   # y variance
+                cov[0]  = 1.0     # x variance (1 m std)
+                cov[7]  = 1.0     # y variance
                 cov[14] = 1e6     # z variance → EKF ignores VPE z, uses baro
                 cov[21] = 0.09    # roll variance (0.3 rad std)
                 cov[28] = 0.09    # pitch variance
@@ -278,7 +281,7 @@ class FlightCommander(rclpy.node.Node):
     def wait_ekf_pos(self, timeout=90.0) -> bool:
         """
         Block until EKF_POS_HORIZ_ABS is set.
-        Reads EKF_STATUS_REPORT directly via pymavlink UDP:14550 rather than
+        Reads EKF_STATUS_REPORT directly via pymavlink UDP:14551 rather than
         relying on /mavros/estimator_status (not published in Jazzy 2.14).
         Continues spinning rclpy so the VPE thread keeps publishing.
         """
@@ -288,23 +291,44 @@ class FlightCommander(rclpy.node.Node):
 
         try:
             mav = mavutil.mavlink_connection(
-                "udp:localhost:14550", source_system=254,
+                "udpin:0.0.0.0:14551", source_system=254,
                 dialect="ardupilotmega")
             mav.wait_heartbeat(timeout=10)
         except Exception as e:
             self.get_logger().warn(f"pymavlink EKF monitor: {e}")
             return False
 
-        deadline = time.time() + timeout
+        _FLAG_NAMES = {
+            0x001: "ATT",
+            0x002: "VEL_H",
+            0x004: "VEL_V",
+            0x008: "POS_H_REL",
+            0x010: "POS_H_ABS",
+            0x020: "POS_V_ABS",
+            0x040: "POS_V_AGL",
+            0x080: "CONST_POS",
+        }
+
+        deadline   = time.time() + timeout
+        last_print = 0.0
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
             msg = mav.recv_match(type="EKF_STATUS_REPORT", blocking=False)
-            if msg and (msg.flags & EKF_POS_HORIZ_ABS):
-                mav.close()
-                self.get_logger().info("EKF POS_ABS ✓")
-                return True
+            if msg:
+                if msg.flags & EKF_POS_HORIZ_ABS:
+                    mav.close()
+                    self.get_logger().info("EKF POS_ABS ✓")
+                    return True
+                now = time.time()
+                if now - last_print > 5.0:
+                    active = " | ".join(n for v, n in _FLAG_NAMES.items()
+                                       if msg.flags & v)
+                    self.get_logger().warn(
+                        f"EKF flags 0x{msg.flags:03x}: [{active or 'none'}]"
+                        " — waiting for POS_H_ABS")
+                    last_print = now
         mav.close()
-        self.get_logger().warn("EKF POS_ABS timeout — check VPE + EKF origin")
+        self.get_logger().warn("EKF POS_ABS timeout — check VPE flow and EKF origin")
         return False
 
     def set_mode(self, mode: str, timeout=10.0) -> bool:
@@ -352,17 +376,32 @@ class FlightCommander(rclpy.node.Node):
     def takeoff(self, alt_m: float, climb_rate: float = 1.0,
                 timeout: float = 180.0) -> bool:
         """
-        Rate-limited setpoint ramp instead of NAV_TAKEOFF.
+        Issue MAV_CMD_NAV_TAKEOFF to break ArduPilot out of "landed" state,
+        then track climb with rate-limited position setpoints.
 
-        Publishes a position setpoint that walks up at climb_rate m/s.
-        The altitude error is always ≤ 1 step (0.2 s × climb_rate ≈ 0.2 m),
-        so the PID integral never winds up and oscillation is prevented.
+        Position setpoints alone cannot trigger liftoff — ArduPilot keeps motors
+        at idle while in landed state regardless of the setpoint altitude.
+        NAV_TAKEOFF is the required signal to transition landed → flying.
         """
         self.get_logger().info(
             f"Climbing to {alt_m:.0f} m AGL at {climb_rate:.1f} m/s …")
 
+        # NAV_TAKEOFF breaks ArduPilot out of "landed" state so the position
+        # controller is allowed to command above-hover throttle.
+        req = CommandTOL.Request()
+        req.altitude = alt_m
+        future = self._tof_cli.call_async(req)
+        tof_deadline = time.time() + 10.0
+        while not future.done() and time.time() < tof_deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if future.done():
+            self.get_logger().info(
+                f"NAV_TAKEOFF {'accepted' if future.result().success else 'rejected'}")
+        else:
+            self.get_logger().warn("NAV_TAKEOFF service timed out — continuing anyway")
+
         try:
-            mav = mavutil.mavlink_connection("udp:localhost:14550",
+            mav = mavutil.mavlink_connection("udpin:0.0.0.0:14551",
                                              source_system=254,
                                              dialect="ardupilotmega")
             mav.wait_heartbeat(timeout=5)
@@ -378,7 +417,7 @@ class FlightCommander(rclpy.node.Node):
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=STEP_DT)
 
-            # Ramp commanded altitude
+            # Ramp position setpoint so GUIDED target tracks the climb
             if setpt_alt < alt_m:
                 setpt_alt = min(setpt_alt + climb_rate * STEP_DT, alt_m)
 
@@ -513,7 +552,7 @@ def _emergency_stabilize():
     """Switch ArduPilot to STABILIZE via pymavlink on Ctrl-C / crash.
     Prevents VisOdom-loss failsafe from commanding descent after commander exits."""
     try:
-        mav = mavutil.mavlink_connection("udp:localhost:14550", source_system=254)
+        mav = mavutil.mavlink_connection("udpin:0.0.0.0:14551", source_system=254)
         if mav.wait_heartbeat(timeout=3):
             mode_id = mav.mode_mapping().get("STABILIZE", 0)
             mav.mav.command_long_send(

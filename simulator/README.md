@@ -1,4 +1,14 @@
-# Isaac Sim Test
+# Isaac Sim — Simulator README
+
+`cesium_scene.py` is a **pure visualiser** for the no-GPS drone project. It subscribes to `/drone/state` published by `control/drone_sim.py` and moves the USD drone mesh; it publishes `/drone/camera/image_raw`, `/drone/pose`, and `/drone/agl` for the AnyLoc and detection nodes.
+
+**drone_sim.py must be running** for the drone to move in the viewport.
+
+Launch: `cd simulator && ./run_chiayi.sh`
+
+---
+
+# Isaac Sim Environment Setup
 
 A Python environment for running NVIDIA Isaac Sim 6.0.0.0 simulations.
 

@@ -1,5 +1,74 @@
 # Project History
 
+## 2026-05-31 — Separate drone physics from Isaac Sim; fix VPE + takeoff
+
+### What was done
+
+**Separated `drone_sim.py` from `cesium_scene.py`**
+
+The kinematic physics model and SITL bridge (previously embedded in `cesium_scene.py`) were extracted into a standalone ROS2 node `control/drone_sim.py`. Isaac Sim is now a pure visualiser: it subscribes to `/drone/state` (ENU PoseStamped, 100 Hz) and moves the USD drone mesh. This makes headless flight possible without Isaac Sim running.
+
+- **New:** `control/drone_sim.py` — 6-DOF kinematic model + `SITLBridge` + `/drone/state` publisher
+- **Modified:** `simulator/cesium_scene.py` — removed kinematic physics, SITL bridge, and keyboard control; added `/drone/state` subscriber + `_cb_drone_state()` callback
+- **Deprecated:** `control/stub_bridge.py` — replaced by `drone_sim.py`
+
+**Switched MAVROS2 and pymavlink from TCP to UDP**
+
+`tcpin:localhost:5762` in `launch_mavros.sh` caused `PermissionError: [Errno 13] Permission denied` on socket bind inside `mavproxy`. Root cause unresolved (pure Python socket tests passed), so switched to UDP to avoid MAVProxy's `tcpin:` binding path entirely.
+
+- `launch_mavros.sh`: `fcu_url:="tcp://localhost:5762"` → `fcu_url:="udp://:14550@"`
+- `flight_commander.py`: all `udp:localhost:14550` → `udpin:0.0.0.0:14551`
+- SITL command: `--out tcpin:localhost:5762` → `--out udp:127.0.0.1:14550 --out udp:127.0.0.1:14551`
+- Removed `--console --map` flags (MAVProxy GUI modules not installed)
+
+**Fixed `MAV_CMD_NAV_TAKEOFF` missing from takeoff sequence**
+
+`flight_commander.py`'s `takeoff()` was publishing position setpoints but never sending `MAV_CMD_NAV_TAKEOFF`. ArduPilot keeps motors at idle in "landed" state regardless of setpoint altitude. Added a `CommandTOL` call at the top of `takeoff()` before the position ramp. `_tof_cli` was already wired up but unused.
+
+**Fixed VPE coordinate order and covariance (EKF POS_ABS was never set)**
+
+Two bugs in `flight_commander.py`'s VPE thread:
+
+1. **x/y swap** — `position.x = north, position.y = east` instead of ENU (x=East, y=North).
+2. **Covariance 400 m² too large** — EKF3 only sets `EKF_POS_HORIZ_ABS` when internal position uncertainty is below a few metres. With 20 m std dev measurement covariance, the EKF's uncertainty stays ~20 m and the flag is never set. Reduced to 1 m² (1 m std dev). z covariance unchanged at 1e6 m².
+
+Added diagnostic logging to `wait_ekf_pos()`: prints active EKF flags every 5 s if stuck, e.g. `EKF flags 0x00f: [ATT | VEL_H | VEL_V | POS_H_REL] — waiting for POS_H_ABS`.
+
+### Bugs fixed
+
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| Drone mesh frozen at ground in Isaac Sim | `flight_commander` sent setpoints but Isaac Sim AGL didn't change | Extracted kinematic model to `drone_sim.py`; cesium_scene.py subscribes `/drone/state` |
+| `PermissionError` on MAVProxy `tcpin:` bind | SITL crashes with `[Errno 13] Permission denied` | Switched to UDP 14550/14551 |
+| `Connection refused` on `--out tcp:localhost:5763` | MAVProxy exits immediately | Changed to `--out udp:` |
+| `No module named 'console'`/`'map'` | MAVProxy exits | Removed `--console --map` flags |
+| `link 1 down` after SITL start | ArduPilot waiting for physics bridge | `drone_sim.py` must start within ~10 s of SITL |
+| EKF POS_ABS never set | `flight_commander` stuck on "Waiting for EKF POS_ABS" | Fixed VPE x/y order + reduced covariance to 1 m² |
+| Drone never lifts off | AGL stays near 0 despite climbing setpoints | Added `MAV_CMD_NAV_TAKEOFF` to `takeoff()` |
+
+---
+
+## 2026-05-30 — ROS2 migration (Milestone 6e)
+
+### What was done
+
+Migrated all IPC from file polling + direct pymavlink to ROS2 topics + MAVROS2.
+
+- **New:** `control/flight_commander.py` — full ROS2 node replacing `run_flight.py`
+  - EKF origin via pymavlink (MAVROS2 Jazzy 2.14 has no service for this)
+  - VPE thread publishes `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov`
+  - Position setpoints via `/mavros/setpoint_position/local`
+  - STABILIZE arm → GUIDED → EKF POS_ABS → takeoff → waypoints → RTL
+- **New:** `control/launch_mavros.sh` — MAVROS2 launch script
+- **Modified:** `simulator/cesium_scene.py` — added ROS2 node, publishes `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl`; kinematic model driven by ArduPilot PWM via embedded SITL bridge
+- **Modified:** `anyloc/ros2_node.py` — subscribes ROS2 camera/pose; publishes VPE + AnyLoc estimates
+
+### Key design: VPE with z=1e6 covariance
+
+`PoseWithCovarianceStamped` on `/mavros/vision_pose/pose_cov` allows setting per-axis covariance. z covariance = 1e6 m² tells EKF3 to ignore VPE altitude and rely on barometer. This prevents EKF innovation gate failures when the stub VPE z differs from baro.
+
+---
+
 ## 2026-05-15 — Simulator working
 
 ### What was done

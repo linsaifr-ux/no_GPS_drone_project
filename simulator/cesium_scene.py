@@ -99,7 +99,6 @@ simulation_app = SimulationApp({
 
 import omni.usd
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
-import carb.input as _ci
 import omni.replicator.core as rep
 
 stage = omni.usd.get_context().get_stage()
@@ -761,19 +760,33 @@ with open(_home_cfg, "w") as _f:
     json.dump({"centre_elev_m": centre_elev,
                "lat": CENTER_LAT, "lon": CENTER_LON}, _f)
 
-# ── SITL bridge (import after centre_elev is known) ───────────────────────────
-try:
-    from control.sitl_bridge import SITLBridge as _SITLBridge
-    _sitl = _SITLBridge(listen_port=9002, centre_elev=centre_elev)
-except ImportError as _e:
-    print(f"[SITL] Bridge not loaded: {_e}")
-    _sitl = None
-
-# ── ROS2 publishers (init after centre_elev is known) ─────────────────────────
+# ── ROS2 publishers + /drone/state subscriber ─────────────────────────────────
 _ros2_node  = None
 _img_pub    = None
 _pose_pub   = None
 _agl_pub    = None
+
+# Shared drone position received from drone_sim.py via /drone/state.
+# Initialised to ground level; updated by the callback below once connected.
+_drone_x = 0.0
+_drone_y = 0.0
+_drone_z = centre_elev   # MSL altitude (m)
+_drone_yaw_deg = 0.0
+
+def _cb_drone_state(msg):
+    """Apply position + yaw from drone_sim.py to the Isaac Sim drone mesh."""
+    global _drone_x, _drone_y, _drone_z, _drone_yaw_deg
+    _drone_x = msg.pose.position.x
+    _drone_y = msg.pose.position.y
+    _drone_z = msg.pose.position.z
+    # Extract yaw from quaternion (ZYX, yaw = rotation about world Z)
+    qx = msg.pose.orientation.x; qy = msg.pose.orientation.y
+    qz = msg.pose.orientation.z; qw = msg.pose.orientation.w
+    siny = 2.0 * (qw * qz + qx * qy)
+    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
+    _drone_yaw_deg = math.degrees(math.atan2(siny, cosy))
+    drone_pos_op.Set(Gf.Vec3d(_drone_x, _drone_y, _drone_z))
+    drone_yaw_op.Set(_drone_yaw_deg)
 
 if _ROS2_OK:
     try:
@@ -782,7 +795,9 @@ if _ROS2_OK:
         _img_pub   = _ros2_node.create_publisher(RosImage,    "/drone/camera/image_raw", 1)
         _pose_pub  = _ros2_node.create_publisher(PoseStamped, "/drone/pose",              1)
         _agl_pub   = _ros2_node.create_publisher(Float64,     "/drone/agl",               1)
+        _ros2_node.create_subscription(PoseStamped, "/drone/state", _cb_drone_state, 1)
         print("[ROS2] Publishers ready: /drone/camera/image_raw, /drone/pose, /drone/agl")
+        print("[ROS2] Subscribed to /drone/state (from drone_sim.py)")
     except Exception as _e:
         print(f"[ROS2] Node init failed: {_e} — falling back to file output")
         _ros2_node = None
@@ -858,7 +873,7 @@ os.makedirs(DRONE_FRAME_DIR, exist_ok=True)
 drone_root   = UsdGeom.Xform.Define(stage, "/World/Drone")
 drone_pos_op = drone_root.AddTranslateOp()
 drone_yaw_op = drone_root.AddRotateZOp()          # yaw about world-up (Z)
-drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev if _sitl is not None else centre_elev + 50.0))
+drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev))
 drone_yaw_op.Set(0.0)
 
 # Quadcopter: central body + 4 arms + motor pods + propeller discs
@@ -925,16 +940,7 @@ _rp  = rep.create.render_product("/World/Drone/Camera", (DRONE_CAM_W, DRONE_CAM_
 _rgb = rep.AnnotatorRegistry.get_annotator("rgb")
 _rgb.attach([_rp])
 
-# Keyboard interface — keyboard device lives on the app window, not IInput
-import omni.appwindow as _aw
-_il = _ci.acquire_input_interface()
-_kb = _aw.get_default_app_window().get_keyboard()
-
-def _key(name):
-    return _il.get_keyboard_value(_kb, getattr(_ci.KeyboardInput, name)) > 0.5
-
 print(f"[DRONE] Nadir camera {DRONE_CAM_W}×{DRONE_CAM_H}  →  {DRONE_FRAME_DIR}/")
-print("[DRONE] Keys: W/S=N/S  A/D=W/E  Q/E=up/down  Z/X=yaw")
 
 # Write geo metadata
 stage.SetMetadata("customLayerData", {
@@ -956,16 +962,6 @@ with open(os.path.join(HERE, "geo_metadata.json"), "w") as f:
     }, f, indent=2)
 
 # ── SIMULATION LOOP ────────────────────────────────────────────────────────────
-try:
-    from omni.kit.viewport.utility import get_active_viewport
-    _vp = get_active_viewport()
-except Exception:
-    _vp = None
-
-_OVERVIEW_CAM = "/World/Camera"
-_DRONE_CAM    = "/World/Drone/Camera"
-_drone_view   = False
-_tab_was_down = False
 
 # ── HUD overlay (omni.ui window pinned to top-left corner) ────────────────────
 try:
@@ -996,133 +992,31 @@ except Exception as _e:
 print(f"[SCENE] {n_terrain_tiles} terrain tiles | {n_bld} Cesium buildings")
 print(f"[GEO] Camera: lat={to_latlon(0,-600)[0]:.4f}°N  lon={CENTER_LON:.4f}°E  alt={cam_z:.1f} m")
 print("[CESIUM] © Cesium ion | © OpenStreetMap contributors | © 內政部國土測繪中心 (NLSC)")
-print("[SCENE] Running — close the window to exit  |  TAB = toggle camera view")
+print("[SCENE] Running — close the window to exit")
 
 simulation_app.update()
-
-# ── Kinematic drone physics ────────────────────────────────────────────────────
-# ArduPilot PWM (1000–2000 µs) drives the drone position each sim step.
-# Keyboard keys act as an override for manual repositioning.
-#
-# Motor layout assumed (ArduPilot QUAD_X):
-#   index 0 (M1) = front-right,  index 1 (M2) = rear-left
-#   index 2 (M3) = front-left,   index 3 (M4) = rear-right
-# If the drone moves in the wrong direction, flip the sign of _roll_tgt / _pitch_tgt.
-_K_GRAVITY  = 9.81
-_K_MAX_VEL  = 15.0   # m/s velocity clamp
-_K_MAX_TILT = 0.35   # rad (~20°) max tilt from PWM differential
-_K_TILT_TAU = 0.15   # s first-order attitude time constant
-_K_DRAG     = 0.35   # aerodynamic drag coefficient (s⁻¹) — damps oscillation
-
-_kspawn = drone_pos_op.Get()
-_kx     = float(_kspawn[0])   # ENU east  of home (m)
-_ky     = float(_kspawn[1])   # ENU north of home (m)
-_kz     = float(_kspawn[2])   # altitude MSL (m)
-_kvn    = 0.0                 # velocity north (m/s)
-_kve    = 0.0                 # velocity east  (m/s)
-_kvd    = 0.0                 # velocity NED down (m/s)
-_kroll  = 0.0                 # estimated roll  (rad, positive = right side down)
-_kpitch = 0.0                 # estimated pitch (rad, positive = nose up)
-_kprev_t = None
 
 _step = 0
 while simulation_app.is_running():
     simulation_app.update()
     _step += 1
 
-    # ── Tab: toggle viewport camera ───────────────────────────────────────────
-    tab_down = _key("TAB")
-    if tab_down and not _tab_was_down and _vp is not None:
-        _drone_view = not _drone_view
-        _vp.camera_path = _DRONE_CAM if _drone_view else _OVERVIEW_CAM
-        print(f"[CAM] {'Drone (nadir)' if _drone_view else 'Overview'}")
-    _tab_was_down = tab_down
-
-    # ── Keyboard override (manual repositioning) ─────────────────────────────
-    dx = dy = dz = 0.0
-    if _key("W"): dy += DRONE_SPEED_M
-    if _key("S"): dy -= DRONE_SPEED_M
-    if _key("D"): dx += DRONE_SPEED_M
-    if _key("A"): dx -= DRONE_SPEED_M
-    if _key("E"): dz += DRONE_SPEED_M
-    if _key("Q"): dz -= DRONE_SPEED_M
-    _kb_moved = bool(dx or dy or dz)
-    if _kb_moved:
-        _kx += dx; _ky += dy; _kz += dz
-        _kvn = _kve = _kvd = 0.0   # reset velocity on manual move
-        _kroll = _kpitch = 0.0
-        drone_pos_op.Set(Gf.Vec3d(_kx, _ky, _kz))
-
-    yaw = float(drone_yaw_op.Get())
-    if _key("Z"): drone_yaw_op.Set(yaw + 1.0)
-    if _key("X"): drone_yaw_op.Set(yaw - 1.0)
-
-    # ── PWM kinematic physics ─────────────────────────────────────────────────
-    _t_now   = time.time()
-    _kdt     = min(_t_now - _kprev_t, 0.05) if _kprev_t is not None else 0.0
-    _kprev_t = _t_now
-
-    _kpwm = _sitl.last_pwm if _sitl is not None else None
-    if _kpwm is not None and _kdt > 0 and not _kb_moved:
-        _p4 = [max(0.0, (v - 1000) / 1000.0) for v in _kpwm[:4]]
-        _mean_p  = sum(_p4) / 4.0
-        _kthrust = _mean_p * 2.0 * _K_GRAVITY   # 0 – 2 g
-
-        # Motor differential → target roll/pitch
-        # roll right (+): left motors (M2+M3) > right motors (M1+M4)
-        # pitch up  (+): front motors (M1+M3) > rear  motors (M2+M4)
-        _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
-        _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
-
-        # First-order attitude dynamics
-        _ka = _kdt / (_K_TILT_TAU + _kdt)
-        _kroll  += _ka * (_roll_tgt  - _kroll)
-        _kpitch += _ka * (_pitch_tgt - _kpitch)
-
-        # Thrust vector rotated to NED via yaw
-        _kyaw_rad = -math.radians(float(drone_yaw_op.Get()))   # Isaac CCW° → NED CW rad
-        _kcy, _ksy = math.cos(_kyaw_rad), math.sin(_kyaw_rad)
-        _kbfwd = -_kthrust * math.sin(_kpitch)   # body-forward accel (- because pitch up = rearward)
-        _kbrgt =  _kthrust * math.sin(_kroll)    # body-right   accel
-        _kan = _kbfwd * _kcy - _kbrgt * _ksy     # NED north
-        _kae = _kbfwd * _ksy + _kbrgt * _kcy     # NED east
-        _kad = _K_GRAVITY - _kthrust * math.cos(_kroll) * math.cos(_kpitch)  # NED down
-
-        _kvn = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvn + _kan * _kdt))
-        _kve = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kve + _kae * _kdt))
-        _kvd = max(-_K_MAX_VEL, min(_K_MAX_VEL, _kvd + _kad * _kdt))
-
-        # Aerodynamic drag — damps velocity, prevents PID oscillation.
-        # Real drones have significant drag; without it any PID gain oscillates.
-        drag = 1.0 - _K_DRAG * _kdt
-        _kvn *= drag; _kve *= drag; _kvd *= drag
-
-        _ky += _kvn * _kdt   # ENU north = +Y
-        _kx += _kve * _kdt   # ENU east  = +X
-        _kz -= _kvd * _kdt   # NED down → decreasing altitude
-
-        if _kz <= centre_elev:   # ground constraint
-            _kz  = centre_elev
-            _kvd = min(0.0, _kvd)
-
-        drone_pos_op.Set(Gf.Vec3d(_kx, _ky, _kz))
+    # Drain /drone/state messages — updates drone_pos_op and drone_yaw_op
+    if _ros2_node is not None:
+        rclpy.spin_once(_ros2_node, timeout_sec=0.0)
 
     # ── Current drone geo position (shared by HUD + frame capture) ───────────
     _p   = drone_pos_op.Get()
     _lat, _lon = to_latlon(float(_p[0]), float(_p[1]))
     _alt = float(_p[2])
     _agl = _alt - centre_elev
+    _yaw_deg = float(drone_yaw_op.Get())
 
     # ── HUD update ────────────────────────────────────────────────────────────
     if _hud_ok:
         _lbl_latlon.text = f"  LAT  {_lat:.5f}°N    LON  {_lon:.5f}°E"
         _lbl_alt.text    = f"  ALT  {_alt:.1f} m MSL    AGL  {_agl:.1f} m"
-        _lbl_cam.text    = f"  CAM  {'Drone (nadir)' if _drone_view else 'Overview'}"
-
-    # ── SITL bridge — send physics state every step ───────────────────────────
-    if _sitl is not None:
-        _sitl.step(float(_p[0]), float(_p[1]), _alt,
-                   float(drone_yaw_op.Get()), _kroll, _kpitch, time.time())
+        _lbl_cam.text    = f"  CAM  Overview"
 
     # ── Frame capture + publish ───────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:
@@ -1148,7 +1042,7 @@ while simulation_app.is_running():
                         "alt_m":       _alt,
                         "agl_m":       _agl,
                         "centre_elev": centre_elev,
-                        "yaw_deg":     yaw,
+                        "yaw_deg":     _yaw_deg,
                         "frame_w":     DRONE_CAM_W,
                         "frame_h":     DRONE_CAM_H,
                     }, f)
@@ -1175,7 +1069,7 @@ while simulation_app.is_running():
                     pose_msg.pose.position.x = _lat
                     pose_msg.pose.position.y = _lon
                     pose_msg.pose.position.z = _alt
-                    _hy = math.radians(yaw) / 2.0
+                    _hy = math.radians(_yaw_deg) / 2.0
                     pose_msg.pose.orientation.z = math.sin(_hy)
                     pose_msg.pose.orientation.w = math.cos(_hy)
                     _pose_pub.publish(pose_msg)

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — replaced by control/drone_sim.py.
+
+drone_sim.py is a full 6-DOF ROS2 node that replaces this stub:
+  - Full roll/pitch/yaw kinematics (not just vertical)
+  - Publishes /drone/state so cesium_scene.py can visualise without physics coupling
+  - Use drone_sim.py for all new work
+
+This file is kept for reference only.  It will be removed in a future cleanup.
+
+──────────────────────────────────────────────────────────────────────────────
 Minimal SITL bridge stub — keeps ArduPilot SITL alive without Isaac Sim.
 
 Simulates a kinematic drone model driven by ArduPilot's PWM outputs:
