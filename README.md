@@ -107,7 +107,7 @@ no_GPS_drone_project/
 | 6e | ROS2 migration: all IPC via topics + MAVROS2 | Done |
 | 6f | Separate drone physics process from Isaac Sim (drone_sim.py) | Done |
 | 6g | Fix VPE: correct ENU x/y order + covariance for EKF POS_ABS | Done |
-| 6h | Remove pymavlink: EKF origin + status via MAVROS2 raw MAVLink | Done (takeoff pending) |
+| 6h | Remove pymavlink; MAVROS2 raw MAVLink; attitude P-ctrl takeoff to 90 m AGL | **Done ✓** |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
@@ -236,8 +236,12 @@ After loading `no_gps.parm` with `--wipe`, type `reboot` in the MAVProxy console
 3. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm checks)
 4. Switch to GUIDED
 5. Wait for `EKF_POS_HORIZ_ABS` flag (VPE accepted by EKF3)
-6. Send `MAV_CMD_NAV_TAKEOFF` — **required** to break ArduPilot out of "landed" state; position setpoints alone are insufficient
-7. Rate-limited position setpoint ramp to 90 m AGL
+6. Send `MAV_CMD_NAV_TAKEOFF` — sets `auto_armed=True` inside ArduPilot; required for GUIDED attitude mode to allow full throttle
+7. Publish `SET_ATTITUDE_TARGET` (level attitude, P-controlled thrust) to `/mavros/setpoint_raw/attitude` — bypasses land-detector deadlock
+8. Altitude feedback from `/drone/state` (kinematic truth from drone_sim.py, NOT EKF barometric)
+9. P-controller: `thrust = 0.50 + 0.004 × (target_agl − current_agl)`, clamped to [0.30, 0.70]
+
+**Why NOT position setpoints during climb:** Sending position setpoints switches ArduPilot from Guided_TakeOff → Guided_Pos mode. The position controller then adds aggressive attitude corrections (motor imbalances up to 1950 vs 1150 PWM), causing the drone to crash at ~5 m AGL.
 
 ### no_gps.parm highlights
 | Param | Value | Reason |

@@ -130,7 +130,7 @@ Run:
 
 ### 5. Flight Control (`control/flight_commander.py`)
 
-**Status:** Arming + EKF POS_ABS working; takeoff under investigation
+**Status:** TAKEOFF WORKING ✓ — drone reached 90 m AGL (2026-05-31). Waypoints pending EKF horizontal fix.
 
 ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming and flight sequence:
 
@@ -140,9 +140,12 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming an
 4. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm; only needs IMU attitude)
 5. Switch to GUIDED
 6. Wait for `EKF_POS_HORIZ_ABS` (bit 4) from EKF_STATUS_REPORT (msg 193) on `/uas1/mavlink_source` — flags at byte offset 20
-7. Send `MAV_CMD_NAV_TAKEOFF` (breaks "landed" state — position setpoints alone are insufficient)
-8. Rate-limited position setpoint ramp to 90 m AGL at 1 m/s (prints motor PWM alongside AGL for diagnostics)
-9. Square waypoint pattern → RTL
+7. Send `MAV_CMD_NAV_TAKEOFF` — sets `auto_armed=True` so GUIDED attitude mode allows full throttle
+8. Publish `SET_ATTITUDE_TARGET` (level, P-controlled thrust) to `/mavros/setpoint_raw/attitude`; read altitude from `/drone/state` (kinematic truth, not EKF)
+9. P-controller: `thrust = 0.50 + 0.004 × (target_agl − agl)`, clamped [0.30, 0.70]; LIFTOFF_THRUST=0.65 near ground
+10. Square waypoint pattern → RTL (go_to_ned sends position setpoints; land detector already released at altitude)
+
+**Why attitude control for takeoff (not position setpoints):** Position setpoints switch ArduPilot from Guided_TakeOff → Guided_Pos. The position controller then adds aggressive attitude corrections (motors 1950 vs 1150 PWM) causing crash at ~5 m AGL. SET_ATTITUDE_TARGET in Guided_Attitude mode calls `set_desired_spool_state(THROTTLE_UNLIMITED)` directly, bypassing the land-detector deadlock.
 
 **VPE covariance design:**
 - `frame_id = "map"` (ENU): x = East, y = North, z = Up
@@ -168,6 +171,7 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming an
 | `ARMING_CHECK` | 0 | skip pre-arm (SITL only) |
 | `MOT_THST_HOVER` | 0.5 | kinematic hover PWM = 1500 |
 | `SCHED_LOOP_RATE` | 50 | matches Isaac Sim frame rate |
+| `DISARM_DELAY` | 0 | prevent auto-disarm during takeoff (requires --wipe to activate) |
 
 ---
 
@@ -242,7 +246,7 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6e | ROS2 migration: all IPC via topics + MAVROS2 | Done |
 | 6f | Separate drone physics (drone_sim.py) from Isaac Sim | Done |
 | 6g | Fix VPE: ENU coordinate order + 1 m² covariance for EKF POS_ABS | Done |
-| 6h | Remove pymavlink; EKF origin + status via MAVROS2 raw MAVLink; two-phase VPE | Done (takeoff pending) |
+| 6h | Remove pymavlink; MAVROS2 raw MAVLink; attitude P-ctrl takeoff to 90 m AGL | **Done ✓** |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

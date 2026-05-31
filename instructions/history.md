@@ -1,5 +1,70 @@
 # Project History
 
+## 2026-05-31 — TAKEOFF SOLVED: attitude P-control to 90 m AGL ✓
+
+### What was done
+
+**Root cause of takeoff failure — land-detector deadlock:**
+
+ArduPilot's land detector kept motors at GROUND_IDLE (1100 PWM). At 1100 PWM, drone_sim.py's kinematic model produces net downward acceleration (thrust < gravity), so the drone never lifts. Baro stays constant → land detector sees no motion → stays at GROUND_IDLE → DISARM_DELAY (10 s) fires → motors drop to 1000 (disarmed). Classic circular deadlock.
+
+Diagnostic that revealed this: SERVO_OUTPUT_RAW (msg 36) motor PWM logging added to the AGL print line. Showed motors going 1000 → 1085 → 1100 → 1000 (exactly 10-second cycle), confirming DISARM_DELAY was the final cause.
+
+**Fix 1: SET_ATTITUDE_TARGET bypasses land detector**
+
+NAV_TAKEOFF (CommandTOL) sets `auto_armed=True` inside ArduPilot. Then immediately publishing SET_ATTITUDE_TARGET via `/mavros/setpoint_raw/attitude` (AttitudeTarget) switches to Guided_Attitude mode. In this mode, ArduPilot calls `set_desired_spool_state(THROTTLE_UNLIMITED)` directly — bypassing the land-detector check entirely. Motors spool up to commanded thrust within 0.5s (MOT_SPOOL_TIME).
+
+**Fix 2: /drone/state for altitude feedback**
+
+After liftoff, EKF barometric altitude (`/mavros/local_position/pose`) diverges when the drone briefly touches the ground. EKF integrates downward velocity and reports negative AGL (observed: −37 m). The P-controller fed with wrong altitude then drives wrong thrust and the drone crashes.
+
+Fix: subscribe to `/drone/state` (published by drone_sim.py at 100 Hz) and read `pose.position.z − HOME_ALT_MSL` as actual AGL. This is the kinematic truth from the physics model, immune to EKF drift.
+
+**Fix 3: DISARM_DELAY 0 in no_gps.parm**
+
+Added `DISARM_DELAY 0` to prevent auto-disarm while debugging. Requires `--wipe` on SITL restart to activate.
+
+**Why position setpoints fail (dead end):**
+
+Both approaches tried:
+- Phase A (attitude liftoff to 5 m) + Phase B (position setpoints): position controller switches ArduPilot from Guided_TakeOff → Guided_Pos. Position controller adds aggressive attitude corrections (motors: 1950 vs 1150 PWM), causing oscillation and crash at ~5 m AGL.
+- Full P-controller with `/mavros/local_position/pose` altitude: AGL diverges to −37 m after first ground contact, P-controller drives wrong thrust.
+
+**Solution: attitude control for the entire climb**
+
+P-controller in flight_commander.py (NOT ArduPilot's position controller):
+- `thrust = 0.50 + 0.004 × (target_agl − agl)` clamped to [0.30, 0.70]
+- Below 2 m AGL: minimum thrust = 0.65 (ensures land detector releases)
+- SET_ATTITUDE_TARGET at 100 Hz with `orientation.w=1.0` (level)
+
+**Confirmed result:** Drone reached 90 m AGL ✓. Motor balance throughout: ~1563 PWM (Phase A) → ~1640 PWM (climb). No oscillation.
+
+**Remaining issues after 90 m AGL:**
+- Waypoints (go_to_ned) timeout because EKF horizontal reference is wrong when GPS_GLOBAL_ORIGIN echo fails (SITL degraded state without `--wipe`)
+- ExternalShutdownException during waypoint loop (SITL crashes after extended flight)
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/flight_commander.py` | Added `AttitudeTarget` publisher (`/mavros/setpoint_raw/attitude`); `/drone/state` subscriber for kinematic altitude; rewrote `takeoff()` as attitude P-controller; removed two-phase position-setpoint approach |
+| `control/no_gps.parm` | Added `DISARM_DELAY 0` |
+| `README.md` | Updated takeoff sequence, milestone 6h Done |
+| `instructions/project_plan.md` | Updated flight control section and milestone table |
+| `instructions/history.md` | This entry |
+
+---
+
+## 2026-05-31 — Remove pymavlink; MAVROS2 raw MAVLink for EKF origin + status; two-phase VPE
+
+### What was done
+
+**Removed all pymavlink dependencies from `flight_commander.py`**
+
+[See earlier entry — this session's first half]
+
+---
+
 ## 2026-05-31 — Separate drone physics from Isaac Sim; fix VPE + takeoff
 
 ### What was done

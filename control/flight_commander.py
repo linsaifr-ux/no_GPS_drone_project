@@ -41,7 +41,7 @@ import rclpy.node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from mavros_msgs.msg import Mavlink, State
+from mavros_msgs.msg import AttitudeTarget, Mavlink, State
 from mavros_msgs.srv import CommandBool, CommandLong, CommandTOL, SetMode
 
 _SENSOR_QOS = QoSProfile(
@@ -110,6 +110,7 @@ class FlightCommander(rclpy.node.Node):
 
         self._state               = State()
         self._local_pos           = None
+        self._drone_state         = None  # from drone_sim.py — actual kinematic altitude
         self._ekf_flags           = 0     # from EKF_STATUS_REPORT (msg 193)
         self._gps_origin_received = False # set when GPS_GLOBAL_ORIGIN (msg 49) arrives
         self._last_motor_pwm      = None  # from SERVO_OUTPUT_RAW (msg 36)
@@ -119,6 +120,10 @@ class FlightCommander(rclpy.node.Node):
                                  self._cb_state, 10)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
                                  self._cb_local_pos, _SENSOR_QOS)
+        # Direct kinematic altitude from drone_sim.py — position.z = MSL altitude
+        # Use this for takeoff control to avoid EKF barometric divergence
+        self.create_subscription(PoseStamped, "/drone/state",
+                                 self._cb_drone_state, _SENSOR_QOS)
         # Raw MAVLink from FCU — BEST_EFFORT matches mavros_router's QoS
         self.create_subscription(Mavlink, "/uas1/mavlink_source",
                                  self._cb_mavlink, _SENSOR_QOS)
@@ -126,6 +131,8 @@ class FlightCommander(rclpy.node.Node):
         # Publishers
         self._pos_pub    = self.create_publisher(
             PoseStamped, "/mavros/setpoint_position/local", 1)
+        self._att_pub    = self.create_publisher(
+            AttitudeTarget, "/mavros/setpoint_raw/attitude", 1)
         self._vpe_pub    = self.create_publisher(
             PoseWithCovarianceStamped, "/mavros/vision_pose/pose_cov", 1)
         self._origin_pub = self.create_publisher(
@@ -244,6 +251,9 @@ class FlightCommander(rclpy.node.Node):
 
     def _cb_local_pos(self, msg: PoseStamped):
         self._local_pos = msg
+
+    def _cb_drone_state(self, msg: PoseStamped):
+        self._drone_state = msg
 
     def _cb_mavlink(self, msg: Mavlink) -> None:
         raw = b"".join(x.to_bytes(8, "little") for x in msg.payload64)[:msg.len]
@@ -386,18 +396,21 @@ class FlightCommander(rclpy.node.Node):
     def takeoff(self, alt_m: float, climb_rate: float = 1.0,
                 timeout: float = 180.0) -> bool:
         """
-        Issue MAV_CMD_NAV_TAKEOFF to break ArduPilot out of "landed" state,
-        then track climb with rate-limited position setpoints.
+        Altitude P-controller via SET_ATTITUDE_TARGET.
 
-        Position setpoints alone cannot trigger liftoff — ArduPilot keeps motors
-        at idle while in landed state regardless of the setpoint altitude.
-        NAV_TAKEOFF is the required signal to transition landed → flying.
+        NAV_TAKEOFF sets auto_armed=True so GUIDED attitude mode allows full
+        throttle.  SET_ATTITUDE_TARGET then directly controls thrust, bypassing
+        both the land-detector deadlock (which keeps position-control motors at
+        GROUND_IDLE 1100 PWM) and the position-controller instability that caused
+        oscillation when switching from attitude to position setpoints at liftoff.
+
+        Thrust: max(LIFTOFF_THRUST, HOVER + KP * error) while below LIFTOFF_AGL;
+                clamped to [MIN, MAX] above LIFTOFF_AGL.
         """
         self.get_logger().info(
             f"Climbing to {alt_m:.0f} m AGL at {climb_rate:.1f} m/s …")
 
-        # NAV_TAKEOFF breaks ArduPilot out of "landed" state so the position
-        # controller is allowed to command above-hover throttle.
+        # NAV_TAKEOFF sets auto_armed=True inside ArduPilot.
         req = CommandTOL.Request()
         req.altitude = alt_m
         future = self._tof_cli.call_async(req)
@@ -410,40 +423,59 @@ class FlightCommander(rclpy.node.Node):
         else:
             self.get_logger().warn("NAV_TAKEOFF service timed out — continuing anyway")
 
-        # Altitude is read from /mavros/local_position/pose (ENU z = AGL).
-        # Altitude read from /mavros/local_position/pose (ENU z = AGL).
-        STEP_DT    = 0.2
-        setpt_alt  = 0.0
+        # P-controller constants
+        # AGL source: /drone/state (kinematic truth from drone_sim.py) avoids EKF
+        # barometric divergence that corrupts /mavros/local_position/pose altitude.
+        HOVER_THRUST   = 0.50   # matches MOT_THST_HOVER = 0.5
+        LIFTOFF_THRUST = 0.65   # minimum thrust near ground to break land detector
+        LIFTOFF_AGL    = 2.0    # m — use at least LIFTOFF_THRUST below this
+        ALT_KP         = 0.004  # thrust per metre altitude error
+        MAX_THRUST     = 0.70   # conservative max — prevents aggressive attitude corrections
+        MIN_THRUST     = 0.30
+
         deadline   = time.time() + timeout
-        last_print = 0.0
+        last_print = time.time()
+        agl        = 0.0
 
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=STEP_DT)
+            rclpy.spin_once(self, timeout_sec=0.05)
 
-            if setpt_alt < alt_m:
-                setpt_alt = min(setpt_alt + climb_rate * STEP_DT, alt_m)
+            # Read AGL from kinematic model directly (position.z = MSL altitude)
+            if self._drone_state is not None:
+                agl = self._drone_state.pose.position.z - HOME_ALT_MSL
+            elif self._local_pos is not None:
+                agl = self._local_pos.pose.position.z  # EKF fallback
 
-            msg = PoseStamped()
-            msg.header.stamp    = self.get_clock().now().to_msg()
-            msg.header.frame_id = "map"
-            msg.pose.position.z = setpt_alt
-            msg.pose.orientation.w = 1.0
-            self._pos_pub.publish(msg)
+            alt_error = alt_m - agl
+            p_thrust  = HOVER_THRUST + ALT_KP * alt_error
+            if agl < LIFTOFF_AGL:
+                thrust = max(LIFTOFF_THRUST, p_thrust)
+            else:
+                thrust = max(MIN_THRUST, min(MAX_THRUST, p_thrust))
 
-            if self._local_pos is not None:
-                agl = self._local_pos.pose.position.z   # ENU z = up = AGL
-                now = time.time()
-                if now - last_print > 2.0:
-                    mot = self._last_motor_pwm
-                    mot_str = (f"  motors={list(mot)}" if mot else "")
-                    print(f"[Commander] AGL = {agl:.1f} m  "
-                          f"(setpt {setpt_alt:.1f} m  target {alt_m:.0f} m){mot_str}")
-                    last_print = now
-                if setpt_alt >= alt_m and abs(agl - alt_m) < 5.0:
-                    self.get_logger().info(f"Reached {alt_m:.0f} m AGL ✓")
-                    return True
+            att = AttitudeTarget()
+            att.header.stamp    = self.get_clock().now().to_msg()
+            att.header.frame_id = "map"
+            att.type_mask = (AttitudeTarget.IGNORE_ROLL_RATE |
+                             AttitudeTarget.IGNORE_PITCH_RATE |
+                             AttitudeTarget.IGNORE_YAW_RATE)
+            att.orientation.w = 1.0   # level attitude
+            att.thrust = thrust
+            self._att_pub.publish(att)
 
-        self.get_logger().warn("Takeoff altitude timeout")
+            now = time.time()
+            if now - last_print > 2.0:
+                mot = self._last_motor_pwm
+                mot_str = f"  motors={list(mot)}" if mot else ""
+                print(f"[Commander] AGL={agl:.1f} m  target={alt_m:.0f} m"
+                      f"  thrust={thrust:.0%}{mot_str}")
+                last_print = now
+
+            if abs(agl - alt_m) < 5.0:
+                self.get_logger().info(f"Reached {alt_m:.0f} m AGL ✓")
+                return True
+
+        self.get_logger().warn("Takeoff timeout")
         return False
 
     def go_to_ned(self, north: float, east: float, down: float,

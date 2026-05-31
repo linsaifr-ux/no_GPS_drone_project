@@ -54,3 +54,6 @@ PSC_ACCZ_I      0.3     # acceleration Z I (default 1.0)
 PSC_ACCZ_D      0.0     # acceleration Z D (default 0.0)
 WPNAV_SPEED_UP  100     # max climb rate cm/s (default 250) — gentler climb
 WPNAV_SPEED_DN  60      # max descent rate cm/s (default 150)
+
+# Prevent auto-disarm while debugging takeoff (10 s default causes disarm before liftoff)
+DISARM_DELAY    0
