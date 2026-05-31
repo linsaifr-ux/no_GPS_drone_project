@@ -171,7 +171,12 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming an
 | `ARMING_CHECK` | 0 | skip pre-arm (SITL only) |
 | `MOT_THST_HOVER` | 0.5 | kinematic hover PWM = 1500 |
 | `SCHED_LOOP_RATE` | 50 | matches Isaac Sim frame rate |
-| `DISARM_DELAY` | 0 | prevent auto-disarm during takeoff (requires --wipe to activate) |
+| `DISARM_DELAY` | 0 | prevent auto-disarm during takeoff |
+| `WPNAV_SPEED` | 100 | 1 m/s horizontal max (default 500 → runaway tilt at altitude) |
+| `PSC_POSXY_P` | 0.3 | horizontal position P (default 1.0) |
+| `PSC_VELXY_P` | 0.5 | horizontal velocity P (default 2.0) |
+| `PSC_VELXY_I` | 0.3 | horizontal velocity I (default 1.0) |
+| `PSC_VELXY_D` | 0.0 | horizontal velocity D (removed — unstable at 50 Hz) |
 
 ---
 

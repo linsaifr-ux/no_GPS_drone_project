@@ -175,7 +175,7 @@ source /opt/ros/jazzy/setup.bash
 python3 control/flight_commander.py
 ```
 
-> **Note:** Restart all three (SITL + drone_sim + MAVROS2) after any failed run. A prolonged failed takeoff degrades the SITL EKF state.
+> **Note:** Restart all three (SITL + drone_sim + MAVROS2) after every run, always using `--wipe` on SITL. Without `--wipe`, new parameters (WPNAV_SPEED, PSC gains, DISARM_DELAY) don't load and old EKF state persists. After a runaway flight the drone may be at 1000+ m AGL; `flight_commander.py` will abort with a clear error if it detects this.
 
 ## Run order — full (with Isaac Sim)
 

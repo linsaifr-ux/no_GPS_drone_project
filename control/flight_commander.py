@@ -265,40 +265,33 @@ class FlightCommander(rclpy.node.Node):
             ch = struct.unpack_from("<4H", raw, 4)
             self._last_motor_pwm = ch
 
-    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float,
-                       timeout: float = 30.0) -> bool:
+    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float) -> None:
         """
-        Publish GPS global origin via /mavros/global_position/set_gp_origin and
-        confirm receipt by waiting for GPS_GLOBAL_ORIGIN (msg 49) from ArduPilot.
+        Publish GPS global origin via /mavros/global_position/set_gp_origin.
         MAVROS2's global_position plugin converts GeoPointStamped → SET_GPS_GLOBAL_ORIGIN.
+
+        GPS_GLOBAL_ORIGIN echo (msg 49) is unreliable in MAVROS2 Jazzy 2.14 on
+        subsequent runs — ArduPilot may accept the command without echoing.
+        Publish 10× over 2 s and continue regardless of confirmation.
         """
         self.get_logger().info(
             f"Setting EKF origin: {lat:.6f}°N {lon:.6f}°E {alt_msl_m:.1f} m MSL")
-        self._gps_origin_received = False
 
         origin_msg = GeoPointStamped()
         origin_msg.position.latitude  = lat
         origin_msg.position.longitude = lon
         origin_msg.position.altitude  = alt_msl_m
 
-        deadline = time.time() + timeout
-        attempt  = 0
-        while time.time() < deadline:
-            attempt += 1
+        for _ in range(10):
             origin_msg.header.stamp = self.get_clock().now().to_msg()
             self._origin_pub.publish(origin_msg)
-            print(f"[Commander] SET_GPS_GLOBAL_ORIGIN attempt {attempt} …")
-
-            t_end = time.time() + 2.0
+            t_end = time.time() + 0.2
             while time.time() < t_end:
                 rclpy.spin_once(self, timeout_sec=0.05)
                 if self._gps_origin_received:
                     self.get_logger().info("EKF origin confirmed via GPS_GLOBAL_ORIGIN ✓")
-                    return True
-
-        self.get_logger().warn(
-            f"EKF origin not confirmed after {attempt} attempts — continuing anyway")
-        return False
+                    return
+        self.get_logger().info("EKF origin sent (no echo — ArduPilot may have accepted silently)")
 
     # ── Blocking helpers ──────────────────────────────────────────────────────
 
@@ -480,32 +473,53 @@ class FlightCommander(rclpy.node.Node):
 
     def go_to_ned(self, north: float, east: float, down: float,
                   timeout=60.0) -> bool:
+        """
+        Send position setpoint and wait until the drone reaches it.
+
+        Distance check uses /drone/state (kinematic truth from drone_sim.py)
+        rather than EKF local_position to avoid EKF horizontal-reference errors
+        when GPS_GLOBAL_ORIGIN is unconfirmed.
+
+        /drone/state frame: x=East(m), y=North(m), z=MSL altitude(m) from home.
+        Waypoints are NED offsets: north(m), east(m), down(m) where down=-AGL.
+        """
         msg = PoseStamped()
         msg.header.frame_id = "map"
         msg.pose.orientation.w = 1.0
 
         # /mavros/setpoint_position/local expects ENU: x=east, y=north, z=up
-        # /mavros/local_position/pose is also ENU
-        # Our waypoints are NED (north, east, down=-alt_agl)
-        enu_x = east            # east
-        enu_y = north           # north
-        enu_z = -down           # up = -down
+        enu_x = east      # east offset from home (m)
+        enu_y = north     # north offset from home (m)
+        enu_z = -down     # AGL (m)
 
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg.header.stamp     = self.get_clock().now().to_msg()
-            msg.pose.position.x  = enu_x
-            msg.pose.position.y  = enu_y
-            msg.pose.position.z  = enu_z
-            self._pos_pub.publish(msg)
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if self._local_pos is not None:
-                p = self._local_pos.pose.position
-                dist = math.sqrt((p.x - enu_x)**2 +
-                                 (p.y - enu_y)**2 +
-                                 (p.z - enu_z)**2)
-                if dist <= WAYPOINT_RADIUS:
+        try:
+            while time.time() < deadline:
+                msg.header.stamp    = self.get_clock().now().to_msg()
+                msg.pose.position.x = enu_x
+                msg.pose.position.y = enu_y
+                msg.pose.position.z = enu_z
+                self._pos_pub.publish(msg)
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+                # Use kinematic altitude directly; fall back to EKF if drone_state unavailable
+                if self._drone_state is not None:
+                    ds = self._drone_state.pose.position
+                    dx = ds.x - enu_x
+                    dy = ds.y - enu_y
+                    dz = (ds.z - HOME_ALT_MSL) - enu_z
+                elif self._local_pos is not None:
+                    p  = self._local_pos.pose.position
+                    dx = p.x - enu_x
+                    dy = p.y - enu_y
+                    dz = p.z - enu_z
+                else:
+                    continue
+
+                if math.sqrt(dx**2 + dy**2 + dz**2) <= WAYPOINT_RADIUS:
                     return True
+        except Exception:
+            pass
         return False
 
 
@@ -524,11 +538,23 @@ def main():
         print("[Commander] MAVROS2 not connected — is SITL + launch_mavros.sh running?")
         stop_ev.set(); rclpy.shutdown(); return
 
-    # Step 3: send EKF origin and wait for ArduPilot to echo GPS_GLOBAL_ORIGIN.
-    cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=30.0)
-    time.sleep(0.3)
+    # Step 3: sanity-check drone is on the ground before proceeding.
+    # If AGL > 10 m, SITL was not restarted cleanly — abort and ask user to --wipe.
+    for _ in range(20):
+        rclpy.spin_once(cmd, timeout_sec=0.1)
+        if cmd._drone_state is not None:
+            break
+    if cmd._drone_state is not None:
+        start_agl = cmd._drone_state.pose.position.z - HOME_ALT_MSL
+        if start_agl > 10.0:
+            print(f"[Commander] ABORT: drone is at {start_agl:.0f} m AGL at startup. "
+                  "Restart SITL with --wipe before running.")
+            stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 4: arm in STABILIZE first — only needs EKF attitude, not position.
+    # Step 4: send EKF global origin (published 10× over 2 s; no blocking confirmation)
+    cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+
+    # Step 5: arm in STABILIZE first — only needs EKF attitude, not position.
     # This bypasses the GPS/VisOdom position requirement that blocks GUIDED arming.
     cmd.set_mode("STABILIZE")
     time.sleep(0.5)
@@ -537,7 +563,7 @@ def main():
         print("[Commander] Arm failed in STABILIZE — check IMU/bridge")
         stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 5: switch to GUIDED now that motors are armed
+    # Step 6: switch to GUIDED now that motors are armed
     cmd.set_mode("GUIDED")
     time.sleep(0.5)
 
@@ -557,24 +583,27 @@ def main():
     cmd.go_to_ned(0.0, 0.0, -TAKEOFF_ALT, timeout=3.0)
 
     # Step 8: Waypoints
-    for i, (n, e, d) in enumerate(WAYPOINTS):
-        print(f"[Commander] WP {i+1}/{len(WAYPOINTS)}  "
-              f"N={n:+.0f} E={e:+.0f} ALT={-d:.0f} m AGL")
-        reached = cmd.go_to_ned(n, e, d, timeout=WAYPOINT_TIMEOUT)
-        print(f"[Commander] WP {i+1} {'✓' if reached else 'timeout'}")
-        time.sleep(1.0)
+    try:
+        for i, (n, e, d) in enumerate(WAYPOINTS):
+            print(f"[Commander] WP {i+1}/{len(WAYPOINTS)}  "
+                  f"N={n:+.0f} E={e:+.0f} ALT={-d:.0f} m AGL")
+            reached = cmd.go_to_ned(n, e, d, timeout=WAYPOINT_TIMEOUT)
+            print(f"[Commander] WP {i+1} {'✓' if reached else 'timeout'}")
+            time.sleep(1.0)
 
-    # Step 9: RTL
-    print("[Commander] Mission complete — RTL")
-    cmd.set_mode("RTL")
+        # Step 9: RTL
+        print("[Commander] Mission complete — RTL")
+        cmd.set_mode("RTL")
 
-    # Wait for disarm — 90 m AGL descent at ~1.5 m/s takes ~60 s + landing buffer
-    cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
-    print("[Commander] Disarmed — landed ✓")
-
-    stop_ev.set()
-    cmd.destroy_node()
-    rclpy.shutdown()
+        # Wait for disarm — 90 m AGL descent at ~1.5 m/s takes ~60 s + landing buffer
+        cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
+        print("[Commander] Disarmed — landed ✓")
+    except Exception as exc:
+        print(f"[Commander] Mission aborted: {exc}")
+    finally:
+        stop_ev.set()
+        cmd.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

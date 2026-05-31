@@ -1,5 +1,30 @@
 # Project History
 
+## 2026-05-31 — Waypoint instability: position controller runaway + fixes
+
+### What was done
+
+**Symptom:** After successful 90 m AGL takeoff, `go_to_ned()` sent position setpoints → ArduPilot switched from Guided_Attitude to Guided_Pos → position controller applied aggressive horizontal corrections → drone flew to **1458 m AGL** and kept climbing.
+
+**Root cause:** Default `WPNAV_SPEED = 500 cm/s` (5 m/s horizontal) combined with untuned horizontal PIDs (PSC_POSXY_P=1.0, PSC_VELXY_P=2.0) caused extreme tilt (motors: one at 1950 PWM, opposite at 1150 PWM). At 30°+ tilt, vertical thrust drops and horizontal acceleration is large. With no position reference correction (EKF origin unconfirmed), the drone flew away unchecked.
+
+**Additional discovery:** Restarting flight_commander.py without restarting SITL left the drone at 1458 m AGL from the previous run. The new run connected to SITL mid-flight. Startup AGL was 1458 m.
+
+**Fixes applied:**
+
+| Fix | File | Change |
+|-----|------|--------|
+| Horizontal speed limit | `no_gps.parm` | `WPNAV_SPEED 100` (1 m/s) |
+| Horizontal PID reduction | `no_gps.parm` | `PSC_POSXY_P 0.3`, `PSC_VELXY_P 0.5`, `PSC_VELXY_I 0.3`, `PSC_VELXY_D 0.0` |
+| EKF origin non-blocking | `flight_commander.py` | Publish 10× over 2 s; no GPS_GLOBAL_ORIGIN echo required |
+| go_to_ned distance check | `flight_commander.py` | Use `/drone/state` (kinematic truth) not EKF `_local_pos` |
+| ExternalShutdownException | `flight_commander.py` | `try/except` in go_to_ned() and main() waypoint loop |
+| Startup AGL sanity check | `flight_commander.py` | Abort if `/drone/state` AGL > 10 m at launch |
+
+**Status:** Fixes applied; not yet tested on clean --wipe SITL.
+
+---
+
 ## 2026-05-31 — TAKEOFF SOLVED: attitude P-control to 90 m AGL ✓
 
 ### What was done
