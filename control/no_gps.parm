@@ -44,6 +44,19 @@ FENCE_ENABLE    0
 # Setting to 0.5 aligns ArduPilot's altitude hold with the kinematic model.
 MOT_THST_HOVER  0.5
 
+# Attitude controller gains — default values (ATC_ANG_*_P=4.5, ATC_RAT_*=0.135)
+# are tuned for real-drone dynamics. drone_sim.py's kinematic model responds
+# differently, causing I-term windup → motor imbalances → 180 m horizontal drift.
+# Reducing these makes corrections gentler and prevents runaway.
+ATC_ANG_RLL_P   1.5     # roll angle P (default 4.5)
+ATC_ANG_PIT_P   1.5     # pitch angle P (default 4.5)
+ATC_RAT_RLL_P   0.04    # roll rate P (default 0.135)
+ATC_RAT_RLL_I   0.04    # roll rate I (default 0.135) — low I prevents windup
+ATC_RAT_RLL_D   0.0     # roll rate D (removed — causes oscillation with kinematic IMU)
+ATC_RAT_PIT_P   0.04    # pitch rate P
+ATC_RAT_PIT_I   0.04    # pitch rate I
+ATC_RAT_PIT_D   0.0     # pitch rate D
+
 # Altitude PID gains — default values are tuned for ~100 Hz physics.
 # Isaac Sim renders at 10-30 fps so the controller runs at that rate.
 # Reducing gains prevents oscillation at slower update rates.

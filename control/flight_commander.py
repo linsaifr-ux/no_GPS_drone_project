@@ -41,7 +41,7 @@ import rclpy.node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from mavros_msgs.msg import AttitudeTarget, Mavlink, State
+from mavros_msgs.msg import Mavlink, State
 from mavros_msgs.srv import CommandBool, CommandLong, CommandTOL, SetMode
 
 _SENSOR_QOS = QoSProfile(
@@ -66,7 +66,7 @@ except (FileNotFoundError, KeyError):
 # ── Mission parameters ─────────────────────────────────────────────────────────
 TAKEOFF_ALT          = 90.0   # metres AGL
 WAYPOINT_RADIUS      =  3.0   # metres — how close counts as reached
-WAYPOINT_TIMEOUT     = 60.0   # seconds per waypoint
+WAYPOINT_TIMEOUT     = 120.0  # seconds per waypoint (longer to allow for takeoff drift)
 MIN_LOCALISATION_AGL = 50.0   # metres AGL — below this, VPE is locked to home position;
                                # above this, AnyLoc estimates are used
 
@@ -131,8 +131,6 @@ class FlightCommander(rclpy.node.Node):
         # Publishers
         self._pos_pub    = self.create_publisher(
             PoseStamped, "/mavros/setpoint_position/local", 1)
-        self._att_pub    = self.create_publisher(
-            AttitudeTarget, "/mavros/setpoint_raw/attitude", 1)
         self._vpe_pub    = self.create_publisher(
             PoseWithCovarianceStamped, "/mavros/vision_pose/pose_cov", 1)
         self._origin_pub = self.create_publisher(
@@ -265,33 +263,44 @@ class FlightCommander(rclpy.node.Node):
             ch = struct.unpack_from("<4H", raw, 4)
             self._last_motor_pwm = ch
 
-    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float) -> None:
+    def set_ekf_origin(self, lat: float, lon: float, alt_msl_m: float,
+                       timeout: float = 60.0) -> bool:
         """
-        Publish GPS global origin via /mavros/global_position/set_gp_origin.
-        MAVROS2's global_position plugin converts GeoPointStamped → SET_GPS_GLOBAL_ORIGIN.
+        Publish GPS global origin and REQUIRE confirmation via GPS_GLOBAL_ORIGIN echo
+        before returning True.  Without confirmation, position setpoints will use
+        the wrong EKF coordinate frame and the drone will fly to the wrong location.
 
-        GPS_GLOBAL_ORIGIN echo (msg 49) is unreliable in MAVROS2 Jazzy 2.14 on
-        subsequent runs — ArduPilot may accept the command without echoing.
-        Publish 10× over 2 s and continue regardless of confirmation.
+        Retries every 2 s for up to `timeout` seconds. Returns False if unconfirmed.
+        EKF needs ~5 s to initialise after SITL starts; this loop handles that.
         """
         self.get_logger().info(
             f"Setting EKF origin: {lat:.6f}°N {lon:.6f}°E {alt_msl_m:.1f} m MSL")
+        self._gps_origin_received = False
 
         origin_msg = GeoPointStamped()
         origin_msg.position.latitude  = lat
         origin_msg.position.longitude = lon
         origin_msg.position.altitude  = alt_msl_m
 
-        for _ in range(10):
+        deadline = time.time() + timeout
+        attempt  = 0
+        while time.time() < deadline:
+            attempt += 1
             origin_msg.header.stamp = self.get_clock().now().to_msg()
             self._origin_pub.publish(origin_msg)
-            t_end = time.time() + 0.2
+
+            t_end = time.time() + 2.0
             while time.time() < t_end:
                 rclpy.spin_once(self, timeout_sec=0.05)
                 if self._gps_origin_received:
-                    self.get_logger().info("EKF origin confirmed via GPS_GLOBAL_ORIGIN ✓")
-                    return
-        self.get_logger().info("EKF origin sent (no echo — ArduPilot may have accepted silently)")
+                    self.get_logger().info(
+                        f"EKF origin confirmed via GPS_GLOBAL_ORIGIN ✓ (attempt {attempt})")
+                    return True
+
+        self.get_logger().error(
+            f"EKF origin NOT confirmed after {timeout:.0f} s — "
+            "position setpoints will be wrong. Restart SITL with --wipe.")
+        return False
 
     # ── Blocking helpers ──────────────────────────────────────────────────────
 
@@ -386,24 +395,16 @@ class FlightCommander(rclpy.node.Node):
         self.get_logger().warn("Arm failed (regular + force)")
         return False
 
-    def takeoff(self, alt_m: float, climb_rate: float = 1.0,
-                timeout: float = 180.0) -> bool:
+    def takeoff(self, alt_m: float, timeout: float = 180.0) -> bool:
         """
-        Altitude P-controller via SET_ATTITUDE_TARGET.
+        Send NAV_TAKEOFF and wait — ArduPilot handles the climb and holds at alt_m.
 
-        NAV_TAKEOFF sets auto_armed=True so GUIDED attitude mode allows full
-        throttle.  SET_ATTITUDE_TARGET then directly controls thrust, bypassing
-        both the land-detector deadlock (which keeps position-control motors at
-        GROUND_IDLE 1100 PWM) and the position-controller instability that caused
-        oscillation when switching from attitude to position setpoints at liftoff.
-
-        Thrust: max(LIFTOFF_THRUST, HOVER + KP * error) while below LIFTOFF_AGL;
-                clamped to [MIN, MAX] above LIFTOFF_AGL.
+        With DISARM_DELAY=0, ArduPilot's spool-up timer completes (0.5 s) and the
+        altitude controller commands full throttle to reach the target.  We just
+        monitor EKF altitude and return when done.
         """
-        self.get_logger().info(
-            f"Climbing to {alt_m:.0f} m AGL at {climb_rate:.1f} m/s …")
+        self.get_logger().info(f"Climbing to {alt_m:.0f} m AGL …")
 
-        # NAV_TAKEOFF sets auto_armed=True inside ArduPilot.
         req = CommandTOL.Request()
         req.altitude = alt_m
         future = self._tof_cli.call_async(req)
@@ -414,57 +415,33 @@ class FlightCommander(rclpy.node.Node):
             self.get_logger().info(
                 f"NAV_TAKEOFF {'accepted' if future.result().success else 'rejected'}")
         else:
-            self.get_logger().warn("NAV_TAKEOFF service timed out — continuing anyway")
-
-        # P-controller constants
-        # AGL source: /drone/state (kinematic truth from drone_sim.py) avoids EKF
-        # barometric divergence that corrupts /mavros/local_position/pose altitude.
-        HOVER_THRUST   = 0.50   # matches MOT_THST_HOVER = 0.5
-        LIFTOFF_THRUST = 0.65   # minimum thrust near ground to break land detector
-        LIFTOFF_AGL    = 2.0    # m — use at least LIFTOFF_THRUST below this
-        ALT_KP         = 0.004  # thrust per metre altitude error
-        MAX_THRUST     = 0.70   # conservative max — prevents aggressive attitude corrections
-        MIN_THRUST     = 0.30
+            self.get_logger().warn("NAV_TAKEOFF timed out — continuing anyway")
 
         deadline   = time.time() + timeout
         last_print = time.time()
-        agl        = 0.0
 
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.1)
 
-            # Read AGL from kinematic model directly (position.z = MSL altitude)
-            if self._drone_state is not None:
-                agl = self._drone_state.pose.position.z - HOME_ALT_MSL
-            elif self._local_pos is not None:
-                agl = self._local_pos.pose.position.z  # EKF fallback
-
-            alt_error = alt_m - agl
-            p_thrust  = HOVER_THRUST + ALT_KP * alt_error
-            if agl < LIFTOFF_AGL:
-                thrust = max(LIFTOFF_THRUST, p_thrust)
-            else:
-                thrust = max(MIN_THRUST, min(MAX_THRUST, p_thrust))
-
-            att = AttitudeTarget()
-            att.header.stamp    = self.get_clock().now().to_msg()
-            att.header.frame_id = "map"
-            att.type_mask = (AttitudeTarget.IGNORE_ROLL_RATE |
-                             AttitudeTarget.IGNORE_PITCH_RATE |
-                             AttitudeTarget.IGNORE_YAW_RATE)
-            att.orientation.w = 1.0   # level attitude
-            att.thrust = thrust
-            self._att_pub.publish(att)
+            agl = (self._drone_state.pose.position.z - HOME_ALT_MSL
+                   if self._drone_state else
+                   (self._local_pos.pose.position.z if self._local_pos else 0.0))
 
             now = time.time()
-            if now - last_print > 2.0:
+            if now - last_print > 3.0:
                 mot = self._last_motor_pwm
                 mot_str = f"  motors={list(mot)}" if mot else ""
-                print(f"[Commander] AGL={agl:.1f} m  target={alt_m:.0f} m"
-                      f"  thrust={thrust:.0%}{mot_str}")
+                print(f"[Commander] AGL={agl:.1f} m  target={alt_m:.0f} m{mot_str}")
                 last_print = now
 
-            if abs(agl - alt_m) < 5.0:
+                # If still on ground after 30 s, land detector deadlock — abort
+                if now - deadline + timeout > 30.0 and agl < 2.0:
+                    self.get_logger().warn(
+                        "Drone not lifting after 30 s — land detector issue, "
+                        "check DISARM_DELAY=0 loaded (param show DISARM_DELAY)")
+                    return False
+
+            if agl >= alt_m - 2.0:
                 self.get_logger().info(f"Reached {alt_m:.0f} m AGL ✓")
                 return True
 
@@ -474,25 +451,27 @@ class FlightCommander(rclpy.node.Node):
     def go_to_ned(self, north: float, east: float, down: float,
                   timeout=60.0) -> bool:
         """
-        Send position setpoint and wait until the drone reaches it.
+        Send EKF position setpoint and wait until drone reaches it.
 
-        Distance check uses /drone/state (kinematic truth from drone_sim.py)
-        rather than EKF local_position to avoid EKF horizontal-reference errors
-        when GPS_GLOBAL_ORIGIN is unconfirmed.
+        Uses Guided_Pos mode (position setpoints) with the already-reduced PSC
+        gains (PSC_POSXY_P=0.3, WPNAV_SPEED=100 cm/s) for stability at altitude.
+        Requires confirmed EKF origin for correct horizontal reference.
 
-        /drone/state frame: x=East(m), y=North(m), z=MSL altitude(m) from home.
-        Waypoints are NED offsets: north(m), east(m), down(m) where down=-AGL.
+        Distance check uses /drone/state (kinematic truth) to avoid EKF drift.
+        /drone/state frame: x=East(m), y=North(m), z=MSL altitude(m).
         """
         msg = PoseStamped()
         msg.header.frame_id = "map"
         msg.pose.orientation.w = 1.0
 
-        # /mavros/setpoint_position/local expects ENU: x=east, y=north, z=up
-        enu_x = east      # east offset from home (m)
-        enu_y = north     # north offset from home (m)
-        enu_z = -down     # AGL (m)
+        # /mavros/setpoint_position/local expects ENU: x=east, y=north, z=up(AGL)
+        enu_x = east
+        enu_y = north
+        enu_z = -down   # up = -down
 
-        deadline = time.time() + timeout
+        deadline   = time.time() + timeout
+        last_print = time.time()
+
         try:
             while time.time() < deadline:
                 msg.header.stamp    = self.get_clock().now().to_msg()
@@ -502,7 +481,6 @@ class FlightCommander(rclpy.node.Node):
                 self._pos_pub.publish(msg)
                 rclpy.spin_once(self, timeout_sec=0.1)
 
-                # Use kinematic altitude directly; fall back to EKF if drone_state unavailable
                 if self._drone_state is not None:
                     ds = self._drone_state.pose.position
                     dx = ds.x - enu_x
@@ -510,13 +488,20 @@ class FlightCommander(rclpy.node.Node):
                     dz = (ds.z - HOME_ALT_MSL) - enu_z
                 elif self._local_pos is not None:
                     p  = self._local_pos.pose.position
-                    dx = p.x - enu_x
-                    dy = p.y - enu_y
-                    dz = p.z - enu_z
+                    dx, dy, dz = p.x - enu_x, p.y - enu_y, p.z - enu_z
                 else:
                     continue
 
-                if math.sqrt(dx**2 + dy**2 + dz**2) <= WAYPOINT_RADIUS:
+                dist = math.sqrt(dx**2 + dy**2 + dz**2)
+                now  = time.time()
+                if now - last_print > 5.0:
+                    agl = (self._drone_state.pose.position.z - HOME_ALT_MSL
+                           if self._drone_state else float("nan"))
+                    print(f"[Commander] WP  err N={dy:+.1f} E={dx:+.1f}"
+                          f"  AGL={agl:.1f} m  dist={dist:.1f} m")
+                    last_print = now
+
+                if dist <= WAYPOINT_RADIUS:
                     return True
         except Exception:
             pass
@@ -551,8 +536,19 @@ def main():
                   "Restart SITL with --wipe before running.")
             stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 4: send EKF global origin (published 10× over 2 s; no blocking confirmation)
-    cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL)
+    # Step 4: wait for SITL EKF to initialize, then confirm EKF global origin.
+    # Without confirmed origin, position setpoints use the wrong coordinate frame
+    # and the drone flies to the wrong location (observed: 664 m displacement).
+    # EKF typically needs 5-10 s to initialize after SITL starts; set_ekf_origin
+    # retries every 2 s for up to 60 s and aborts if not confirmed.
+    print("[Commander] Waiting 8 s for SITL EKF to initialize …")
+    t_wait = time.time() + 8.0
+    while time.time() < t_wait:
+        rclpy.spin_once(cmd, timeout_sec=0.1)
+
+    if not cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=60.0):
+        print("[Commander] ABORT: EKF origin not confirmed. Restart SITL with --wipe.")
+        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
     # Step 5: arm in STABILIZE first — only needs EKF attitude, not position.
     # This bypasses the GPS/VisOdom position requirement that blocks GUIDED arming.
@@ -577,10 +573,11 @@ def main():
         print("[Commander] Takeoff failed")
         stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Hold altitude for 3 s with continuous setpoints — GUIDED mode needs a
-    # steady stream of position targets or the drone drifts after NAV_TAKEOFF.
-    print(f"[Commander] Holding {TAKEOFF_ALT:.0f} m …")
-    cmd.go_to_ned(0.0, 0.0, -TAKEOFF_ALT, timeout=3.0)
+    # Brief pause — ArduPilot GUIDED mode holds last position after NAV_TAKEOFF.
+    print("[Commander] Holding 5 s …")
+    t_hold = time.time() + 5.0
+    while time.time() < t_hold:
+        rclpy.spin_once(cmd, timeout_sec=0.1)
 
     # Step 8: Waypoints
     try:
@@ -602,8 +599,14 @@ def main():
         print(f"[Commander] Mission aborted: {exc}")
     finally:
         stop_ev.set()
-        cmd.destroy_node()
-        rclpy.shutdown()
+        try:
+            cmd.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

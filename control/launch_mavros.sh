@@ -22,6 +22,13 @@
 
 source /opt/ros/jazzy/setup.bash
 
+# Kill any stale MAVROS2 instance (prevents "Promise already satisfied" crash)
+pkill -f mavros_node 2>/dev/null; sleep 1
+
+# Wait for SITL to be ready before connecting (prevents race condition on startup)
+echo "[mavros] Waiting 5 s for SITL to be ready..."
+sleep 5
+
 ros2 run mavros mavros_node \
     --ros-args \
     -p fcu_url:="udp://:14550@" \
