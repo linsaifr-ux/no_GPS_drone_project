@@ -141,10 +141,11 @@ def main():
                 _kthrust = _mean_p * 2.0 * _K_GRAVITY   # 0 – 2 g
 
                 # Motor differential → target roll/pitch
-                # roll right (+): left motors (M2+M3) > right motors (M1+M4)
-                # pitch up  (+): front motors (M1+M3) > rear  motors (M2+M4)
-                _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
-                _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+                # ArduCopter X-frame FRAME_TYPE=1: ch1=M1(FR), ch2=M2(RL), ch3=M3(RR), ch4=M4(FL)
+                # roll right (+): left  motors (M2-RL + M4-FL) > right motors (M1-FR + M3-RR)
+                # pitch up  (+): front  motors (M1-FR + M4-FL) > rear  motors (M2-RL + M3-RR)
+                _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
+                _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
 
                 # First-order attitude dynamics
                 _ka = _kdt / (_K_TILT_TAU + _kdt)

@@ -174,9 +174,17 @@ class FlightCommander(rclpy.node.Node):
                 t0 = time.time()
 
                 # Current AGL from EKF local position (ENU z = up from home = AGL)
+                # Used only for Phase 1/2 switch; VPE altitude uses kinematic truth below.
                 agl = 0.0
                 if self._local_pos is not None:
                     agl = max(0.0, self._local_pos.pose.position.z)
+
+                # True AGL from drone_sim.py kinematic state — sent as VPE z so ArduPilot's
+                # EKF3 altitude estimate (EK3_SRC1_POSZ=6 ExternalNav) tracks the sim.
+                # Without this, SIM_JSON barometer stays at 0 and ArduPilot climbs forever.
+                drone_agl = 0.0
+                if self._drone_state is not None:
+                    drone_agl = max(0.0, self._drone_state.pose.position.z - HOME_ALT_MSL)
 
                 # ── Phase 2: above localisation altitude — read AnyLoc estimate ──
                 if agl >= MIN_LOCALISATION_AGL:
@@ -221,13 +229,13 @@ class FlightCommander(rclpy.node.Node):
                 msg.header.frame_id = "map"   # ENU: x=East, y=North, z=Up
                 msg.pose.pose.position.x    = east_v
                 msg.pose.pose.position.y    = north_v
-                msg.pose.pose.position.z    = 0.0   # z irrelevant — huge cov below
+                msg.pose.pose.position.z    = drone_agl   # kinematic AGL → EKF altitude
                 msg.pose.pose.orientation.z = math.sin(hy)
                 msg.pose.pose.orientation.w = math.cos(hy)
                 cov = [0.0] * 36
                 cov[0]  = cov_xy  # x variance
                 cov[7]  = cov_xy  # y variance
-                cov[14] = 1e6     # z → EKF ignores VPE altitude, uses barometer
+                cov[14] = 0.25    # z: 0.5 m std dev — EK3_SRC1_POSZ=6 uses this
                 cov[21] = 0.09    # roll  (0.3 rad std)
                 cov[28] = 0.09    # pitch
                 cov[35] = 0.09    # yaw

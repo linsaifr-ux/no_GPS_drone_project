@@ -24,7 +24,7 @@ SCHED_LOOP_RATE 50
 
 EK3_SRC1_POSXY  6       # horizontal position from ExternalNav (VISION_POSITION_ESTIMATE)
 EK3_SRC1_VELXY  0       # no horizontal velocity source
-EK3_SRC1_POSZ   1       # altitude from barometer
+EK3_SRC1_POSZ   6       # altitude from ExternalNav (VPE z = kinematic AGL from drone_sim.py)
 EK3_SRC1_YAW    6       # yaw from ExternalNav (VPE yaw) — avoids compass field mismatch in SITL
 VISO_TYPE       1       # enable MAVLink ExternalNav processing
 

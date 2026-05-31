@@ -130,28 +130,25 @@ Run:
 
 ### 5. Flight Control (`control/flight_commander.py`)
 
-**Status:** TAKEOFF WORKING ✓ — drone reached 90 m AGL (2026-05-31). Waypoints pending EKF horizontal fix.
+**Status:** TAKEOFF WORKING ✓ — NAV_TAKEOFF to 90 m AGL (milestone 6i). Waypoints: altitude runaway and 90° course-error bugs fixed (2026-06-01); clean run pending.
 
 ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming and flight sequence:
 
 1. Start VPE thread — Phase 1: home position (0,0) at 0.1 m² cov; Phase 2: AnyLoc above 50 m AGL
 2. Wait for MAVROS2 connection (`/mavros/state.connected`)
-3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; confirm via GPS_GLOBAL_ORIGIN (msg 49) on `/uas1/mavlink_source`
+3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; block up to 60 s waiting for GPS_GLOBAL_ORIGIN (msg 49) echo on `/uas1/mavlink_source`; abort if unconfirmed
 4. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm; only needs IMU attitude)
 5. Switch to GUIDED
 6. Wait for `EKF_POS_HORIZ_ABS` (bit 4) from EKF_STATUS_REPORT (msg 193) on `/uas1/mavlink_source` — flags at byte offset 20
-7. Send `MAV_CMD_NAV_TAKEOFF` — sets `auto_armed=True` so GUIDED attitude mode allows full throttle
-8. Publish `SET_ATTITUDE_TARGET` (level, P-controlled thrust) to `/mavros/setpoint_raw/attitude`; read altitude from `/drone/state` (kinematic truth, not EKF)
-9. P-controller: `thrust = 0.50 + 0.004 × (target_agl − agl)`, clamped [0.30, 0.70]; LIFTOFF_THRUST=0.65 near ground
-10. Square waypoint pattern → RTL (go_to_ned sends position setpoints; land detector already released at altitude)
-
-**Why attitude control for takeoff (not position setpoints):** Position setpoints switch ArduPilot from Guided_TakeOff → Guided_Pos. The position controller then adds aggressive attitude corrections (motors 1950 vs 1150 PWM) causing crash at ~5 m AGL. SET_ATTITUDE_TARGET in Guided_Attitude mode calls `set_desired_spool_state(THROTTLE_UNLIMITED)` directly, bypassing the land-detector deadlock.
+7. Send `MAV_CMD_NAV_TAKEOFF` — ArduPilot's own altitude controller climbs to target AGL and holds. With `DISARM_DELAY=0`, spool-up completes in ~0.5 s. Monitor `/drone/state` AGL; abort if still on ground after 30 s.
+8. Square waypoint pattern → RTL (go_to_ned sends position setpoints)
 
 **VPE covariance design:**
 - `frame_id = "map"` (ENU): x = East, y = North, z = Up
 - Phase 1 x/y covariance = **0.1 m²** (EKF sets POS_HORIZ_ABS immediately at ground)
 - Phase 2 x/y covariance = **max(1, error_m²)** (scales with AnyLoc confidence)
-- z covariance = **1e6 m²** (EKF ignores VPE altitude, uses barometer)
+- z = kinematic AGL from `/drone/state` (`_drone_state.pose.position.z − HOME_ALT_MSL`)
+- z covariance = **0.25 m²** (0.5 m std dev); `EK3_SRC1_POSZ=6` routes this to EKF altitude
 
 **MAVROS2 (UDP):**
 - `launch_mavros.sh` uses `fcu_url:="udp://:14550@"` (binds local port 14550)
@@ -164,19 +161,24 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming an
 |-------|-------|--------|
 | `GPS_TYPE` | 0 | disable GPS |
 | `EK3_SRC1_POSXY` | 6 | ExternalNav horizontal position |
-| `EK3_SRC1_POSZ` | 1 | barometer altitude |
+| `EK3_SRC1_POSZ` | 6 | ExternalNav altitude (VPE z = kinematic AGL; barometer unreliable in SIM_JSON without `position` field) |
 | `EK3_SRC1_YAW` | 6 | ExternalNav yaw |
 | `VISO_TYPE` | 1 | MAVLink vision odometry |
 | `FS_GPS_ENABLE` | 0 | no GPS failsafe |
 | `ARMING_CHECK` | 0 | skip pre-arm (SITL only) |
 | `MOT_THST_HOVER` | 0.5 | kinematic hover PWM = 1500 |
 | `SCHED_LOOP_RATE` | 50 | matches Isaac Sim frame rate |
-| `DISARM_DELAY` | 0 | prevent auto-disarm during takeoff |
+| `DISARM_DELAY` | 0 | enables NAV_TAKEOFF path (removes land-detector deadlock) |
 | `WPNAV_SPEED` | 100 | 1 m/s horizontal max (default 500 → runaway tilt at altitude) |
 | `PSC_POSXY_P` | 0.3 | horizontal position P (default 1.0) |
 | `PSC_VELXY_P` | 0.5 | horizontal velocity P (default 2.0) |
 | `PSC_VELXY_I` | 0.3 | horizontal velocity I (default 1.0) |
 | `PSC_VELXY_D` | 0.0 | horizontal velocity D (removed — unstable at 50 Hz) |
+| `ATC_ANG_RLL_P` | 1.5 | roll angle P (default 4.5 — causes I-term windup → drift) |
+| `ATC_ANG_PIT_P` | 1.5 | pitch angle P (default 4.5) |
+| `ATC_RAT_RLL_P/I` | 0.04 | roll rate P/I (default 0.135) |
+| `ATC_RAT_PIT_P/I` | 0.04 | pitch rate P/I (default 0.135) |
+| `ATC_RAT_RLL/PIT_D` | 0.0 | rate D removed — oscillates with kinematic IMU |
 
 ---
 
@@ -251,7 +253,10 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6e | ROS2 migration: all IPC via topics + MAVROS2 | Done |
 | 6f | Separate drone physics (drone_sim.py) from Isaac Sim | Done |
 | 6g | Fix VPE: ENU coordinate order + 1 m² covariance for EKF POS_ABS | Done |
-| 6h | Remove pymavlink; MAVROS2 raw MAVLink; attitude P-ctrl takeoff to 90 m AGL | **Done ✓** |
+| 6h | Remove pymavlink; MAVROS2 raw MAVLink; DISARM_DELAY=0 | Done ✓ |
+| 6i | NAV_TAKEOFF replaces P-controller; EKF origin blocking; reduced ATC gains | Done ✓ |
+| 6j | Fix altitude runaway (EK3_SRC1_POSZ→ExternalNav) + fix 90° course error (motor layout) | **Done ✓** |
+| 6j-wp | Waypoints via position setpoints — clean run pending | WIP |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

@@ -1,5 +1,86 @@
 # Project History
 
+## 2026-06-01 — Two critical flight bugs fixed: altitude runaway + 90° waypoint error
+
+### Bug 1: AGL ascends forever (never stabilises at 90 m)
+
+**Symptom:** After NAV_TAKEOFF, the kinematic drone climbed past 90 m with no sign of ArduPilot reducing throttle.
+
+**Root cause:** `EK3_SRC1_POSZ = 1` (barometer). In SIM_JSON mode, the barometric altitude derives from the `"position"` field in the JSON state. That field is intentionally omitted (it acts as a GPS substitute and disrupts EKF3 ExtNav fusion). Without it, the simulated barometer stays permanently at 0 m AGL. ArduPilot's altitude controller always sees `current = 0, target = 90` and commands maximum climb indefinitely.
+
+**Fix:**
+- `EK3_SRC1_POSZ 1 → 6` (ExternalNav) in `no_gps.parm`
+- VPE thread (`flight_commander.py`): send kinematic AGL as `position.z` (from `_drone_state`); `cov[14] = 1e6 → 0.25` (0.5 m std dev)
+
+ArduPilot's EKF now receives the true altitude via the existing VPE channel and correctly throttles back at 90 m.
+
+---
+
+### Bug 2: Waypoint navigation 90° off course
+
+**Symptom:** `WP 1/4 N=+20 E=+0 ALT=90 m` → `err N=+2.7 E=−42.0 dist=42.1 m`. North command → east movement.
+
+**Root cause:** `drone_sim.py` motor groupings assumed the wrong ArduCopter X-frame layout. Actual assignments from `AP_Motors_Matrix.cpp` (angles from forward/north, clockwise positive):
+- ch1 / `pwm[0]` = M1 Front-Right (45°)
+- ch2 / `pwm[1]` = M2 Rear-Left (−135°)
+- ch3 / `pwm[2]` = M3 **Rear**-Right (−45°) ← code assumed Front-Left
+- ch4 / `pwm[3]` = M4 **Front**-Left (135°) ← code assumed Rear-Right
+
+With M3 and M4 positions swapped, the "roll formula" actually computed `rear − front` (pitch differential) and the "pitch formula" computed `right − left` (roll differential). When ArduPilot pitched nose-down to go north, the kinematic model applied it as roll-right — drone moved east. This also caused the 42 m east drift during the 90 m climb (90 s of swapped corrections).
+
+**Fix:** `drone_sim.py` — corrected groupings:
+
+```python
+# Before (wrong — M3/M4 positions assumed incorrectly):
+_roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT  # was rear − front
+_pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT  # was right − left
+
+# After (correct — ch1=M1 FR, ch2=M2 RL, ch3=M3 RR, ch4=M4 FL):
+_roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT  # left(RL+FL) − right(FR+RR)
+_pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT  # front(FR+FL) − rear(RL+RR)
+```
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/no_gps.parm` | `EK3_SRC1_POSZ 1 → 6` (barometer → ExternalNav) |
+| `control/flight_commander.py` | VPE thread: `position.z = drone_agl` (kinematic AGL from `_drone_state`), `cov[14] = 0.25` |
+| `control/drone_sim.py` | Roll/pitch motor groupings corrected for ArduCopter X-frame FRAME_TYPE=1 |
+
+---
+
+## 2026-05-31 — Milestone 6i: NAV_TAKEOFF replaces hand-rolled P-controller
+
+### What was done
+
+**Removed SET_ATTITUDE_TARGET P-controller from takeoff()**
+
+With `DISARM_DELAY=0` (added in milestone 6h), the land-detector deadlock no longer occurs. ArduPilot's built-in altitude controller handles the climb to 90 m AGL via NAV_TAKEOFF (CommandTOL). `takeoff()` now only monitors progress and returns when AGL reaches the target. `AttitudeTarget` import, `_att_pub` publisher, and `climb_rate` parameter removed.
+
+**EKF origin now blocking**
+
+`set_ekf_origin()` now retries every 2 s for up to 60 s and aborts the mission if GPS_GLOBAL_ORIGIN (msg 49) echo is not received. Previously it published 10× over 2 s without requiring confirmation, which allowed the drone to fly to the wrong location when the origin was silently rejected (observed: 664 m displacement on subsequent SITL runs).
+
+**Attitude controller gains reduced in no_gps.parm**
+
+Default gains (ATC_ANG_*_P=4.5, ATC_RAT_*=0.135) caused I-term windup with the kinematic drone model, producing motor imbalances and 180 m horizontal drift. Reduced to ATC_ANG_RLL/PIT_P=1.5, ATC_RAT_*_P/I=0.04, D=0.
+
+**launch_mavros.sh hardened**
+
+`pkill -f mavros_node` before launch prevents "Promise already satisfied" crash on repeated runs. `sleep 5` after kill waits for SITL to be ready before MAVROS2 connects.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/flight_commander.py` | Removed P-controller, AttitudeTarget import, _att_pub, climb_rate; set_ekf_origin() now blocking; 30s ground abort check in takeoff(); waypoint progress logging |
+| `control/no_gps.parm` | Added ATC_ANG_RLL/PIT_P=1.5, ATC_RAT_*_P/I=0.04, D=0 |
+| `control/launch_mavros.sh` | pkill stale mavros_node; 5s wait before connecting |
+| `README.md`, `instructions/project_plan.md`, `instructions/history.md` | Updated takeoff section, milestone table |
+
+---
+
 ## 2026-05-31 — Waypoint instability: position controller runaway + fixes
 
 ### What was done
