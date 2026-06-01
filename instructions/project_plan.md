@@ -12,8 +12,10 @@ Build a drone system that can localize itself and detect objects without GPS, us
 no_GPS_drone_project/
 ├── instructions/               # Plans, notes, contest references
 ├── simulator/
-│   ├── cesium_scene.py         # Pure Isaac Sim visualiser — subscribes /drone/state
-│   │                           #   publishes /drone/camera/image_raw + /drone/pose + /drone/agl
+│   ├── cesium_scene.py         # Physics engine + visualiser
+│   │                           #   100 Hz background thread: 6-DOF kinematic model + SITLBridge (UDP 9002)
+│   │                           #   render loop (~13 Hz): reads state, updates mesh, captures camera
+│   │                           #   publishes /drone/state (100 Hz) + /drone/camera/image_raw + /drone/pose + /drone/agl
 │   └── run_chiayi.sh           # Launch: sources ROS2 Jazzy, runs in conda env
 ├── anyloc/
 │   ├── build_database.py       # Build VLAD database (run once)
@@ -25,10 +27,11 @@ no_GPS_drone_project/
 │   ├── detector.py             # YOLODetector (auto class-map)
 │   └── ros2_node.py            # ROS2: sub /drone/camera → pub /yolo/detections
 ├── control/
-│   ├── drone_sim.py            # ★ 6-DOF kinematic physics + SITL bridge (UDP 9002)
-│   │                           #   publishes /drone/state (PoseStamped, ENU, 100 Hz)
+│   ├── drone_sim.py            # Headless-only fallback: kinematic physics + SITL bridge
+│   │                           #   publishes /drone/state; NOT used when Isaac Sim runs
 │   ├── sitl_bridge.py          # UDP :9002 server — binary servo in → JSON physics out
-│   ├── stub_bridge.py          # DEPRECATED — use drone_sim.py
+│   │                           #   shared by cesium_scene.py and drone_sim.py
+│   ├── stub_bridge.py          # DEPRECATED
 │   ├── flight_commander.py     # ROS2: arm → NAV_TAKEOFF → waypoints → RTL
 │   ├── launch_mavros.sh        # MAVROS2 on UDP 14550 (fcu_url=udp://:14550@)
 │   ├── no_gps.parm             # SITL: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
@@ -43,117 +46,112 @@ no_GPS_drone_project/
 ## System Architecture
 
 ```
-ArduPilot SITL  ◄─UDP 9002─►  control/drone_sim.py
-                               (6-DOF kinematic physics)
-                               publishes /drone/state
-                                         │
-                               simulator/cesium_scene.py
-                               (pure visualiser — optional)
-                               publishes /drone/camera/image_raw
-                                         │
-                               anyloc/ros2_node.py
-                               → /mavros/vision_pose/pose_cov (VPE)
+simulator/cesium_scene.py
+  100 Hz background thread: kinematic model + SITLBridge
+  UDP 9002 ◄──PWM──► ArduPilot SITL
+  publishes /drone/state (ENU PoseStamped, 100 Hz)
+            │
+            ├── flight_commander.py  (reads AGL truth from /drone/state)
+            │
+            └── anyloc/ros2_node.py
+                → /mavros/vision_pose/pose_cov (VPE, ENU via vision_pose plugin)
 
 ArduPilot SITL
-  ─UDP 14550──► MAVROS2  ◄──/mavros/vision_pose/pose_cov (EKF3 fusion)
-                │          └── /uas1/mavlink_source (BEST_EFFORT) → flight_commander.py
-                │              (EKF origin confirm, EKF status flags, motor PWM)
-                ├─ /mavros/global_position/set_gp_origin → MAVROS2 → SET_GPS_GLOBAL_ORIGIN
-                ├─ /mavros/setpoint_position/local  → MAVROS2 → ArduPilot
-                └─ MAV_CMD_NAV_TAKEOFF              → MAVROS2 → ArduPilot
+  ─UDP 14550──► MAVROS2  ◄── /mavros/vision_pose/pose_cov (EKF3 VPE fusion)
+                │           └── /uas1/mavlink_source (BEST_EFFORT)
+                │               EKF origin confirm (msg 49) + EKF status (msg 193) + motor PWM (msg 36)
+                ├─ /mavros/global_position/set_gp_origin → SET_GPS_GLOBAL_ORIGIN
+                ├─ /mavros/setpoint_position/local  → SET_POSITION_TARGET_LOCAL_NED (NED coords)
+                └─ MAV_CMD_NAV_TAKEOFF              → ArduPilot altitude controller
 ```
+
+### Coordinate conventions
+
+| Frame | x | y | z | Used by |
+|-------|---|---|---|---------|
+| Isaac Sim / ENU | East | North | Up | cesium_scene.py, /drone/state, vision_pose VPE |
+| ArduPilot NED | North | East | Down (−=alt) | SET_POSITION_TARGET_LOCAL_NED, VISION_POSITION_ESTIMATE |
+| MAVROS2 vision_pose | ENU in, NED out | | | converts correctly |
+| MAVROS2 setpoint_position/local | **NED passthrough** | | | does NOT convert; send NED directly |
 
 ### Port map
 
 | Port | Protocol | Owner |
 |------|----------|-------|
 | TCP 5760 | MAVLink | MAVProxy ↔ ArduPilot SITL (internal; single client only) |
-| UDP 9002 | JSON SITL | drone_sim.py ↔ ArduPilot physics |
+| UDP 9002 | JSON SITL | cesium_scene.py (or drone_sim.py headless) ↔ ArduPilot |
 | UDP 14550 | MAVLink | MAVROS2 listens (MAVProxy → MAVROS2) |
 
 ---
 
 ## Modules
 
-### 1. Simulator (`simulator/cesium_scene.py`)
+### 1. Simulator / Physics (`simulator/cesium_scene.py`)
 
-**Status:** Working — pure visualiser; drone position driven by `/drone/state`
+**Status:** Working — 100 Hz kinematic physics thread; owns SITL bridge; publishes /drone/state
 
 Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
-- **Imagery:** Taiwan NLSC PHOTO2 orthophoto WMTS (zoom 18, resized to 4096×4096)
 - **Buildings:** Cesium OSM Buildings (asset 96188) — B3DM, ~83 buildings
-- **Drone mesh:** `/World/Drone` Xform — position driven by `/drone/state` from `drone_sim.py`
+- **Imagery:** Taiwan NLSC PHOTO2 orthophoto WMTS (zoom 18, resized to 4096×4096)
+- **Physics thread (100 Hz):** `_run_physics()` — kinematic 6-DOF model + `SITLBridge`; publishes `/drone/state`; rate decoupled from render loop
+- **Render loop (~13 Hz):** reads shared kinematic state under lock; updates `/World/Drone` mesh position/orientation; captures nadir camera frames
+- **Motor layout:** ArduCopter X-frame ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
+- **SITLBridge:** `control/sitl_bridge.py` on UDP 9002 — binary servo in, JSON physics out
 - **Camera:** `/World/Drone/Camera` — nadir, 18 mm / 36×27 mm, 90°×73.7° FOV, 640×480
 - **HUD:** `omni.ui` overlay showing live LAT / LON / ALT MSL / AGL
 - **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` every 5 sim steps
-- **ROS2 publishers:** `/drone/camera/image_raw`, `/drone/pose` (WGS84), `/drone/agl`
-- **ROS2 subscriber:** `/drone/state` (ENU PoseStamped from `drone_sim.py`)
+- **ROS2 publishers:** `/drone/state`, `/drone/camera/image_raw`, `/drone/pose` (WGS84), `/drone/agl`
 
-Keyboard controls: **removed** (drone is ArduPilot-commanded via `drone_sim.py`).
+### 2. Drone Simulator Fallback (`control/drone_sim.py`)
 
-### 2. Drone Simulator (`control/drone_sim.py`)
+**Status:** Headless fallback — not used when Isaac Sim is running
 
-**Status:** Done — replaces `stub_bridge.py` with full 6-DOF + ROS2
+Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the same `/drone/state` topic and `SITLBridge` connection as `cesium_scene.py`.
 
-Standalone ROS2 node running 6-DOF kinematic physics and the ArduPilot SITL bridge.
+- 6-DOF kinematic physics: PWM → thrust → roll/pitch → NED acceleration → ENU position
+- Ground friction: horizontal velocity zeroed on ground contact (no sliding during motor spool-up)
+- `SITLBridge` on UDP 9002: same protocol as used by `cesium_scene.py`
+- Publishes `/drone/state` (`PoseStamped`, `frame_id="local_enu"`)
 
-- Reads `control/home_elevation.json` (written by `cesium_scene.py`); falls back to 28.17 m
-- Physics loop at 100 Hz: integrates PWM → thrust → roll/pitch → NED acceleration → ENU position
-- `SITLBridge` on UDP 9002: sends JSON physics state to ArduPilot, receives servo PWM
-- Publishes `/drone/state` (`PoseStamped`, `frame_id="local_enu"`, 100 Hz)
-- **Isaac Sim is NOT required** — `drone_sim.py` + `flight_commander.py` is a valid headless config
-
-Run:
-```bash
-source /opt/ros/jazzy/setup.bash
-python3 control/drone_sim.py
-```
+**Do not run alongside `cesium_scene.py`** — both bind UDP 9002.
 
 ### 3. Localisation (`anyloc/`)
 
 **Status:** Working — AnyLoc + VO; 2,821-entry database; ~15–20 m anchor error
 
-(Architecture unchanged — see previous plan for full details.)
-
-Run:
-```bash
-./anyloc/run_ros2_localizer.sh
-```
-
 ### 4. Object Detection (`detection/`)
 
 **Status:** Working — `yolov8l_visdrone.pt` (VisDrone-trained), 10 aerial classes
 
-(Architecture unchanged — see previous plan for full details.)
-
 ### 5. Flight Control (`control/flight_commander.py`)
 
-**Status:** TAKEOFF WORKING ✓ — NAV_TAKEOFF to 90 m AGL (milestone 6i). Waypoints: altitude runaway and 90° course-error bugs fixed (2026-06-01); clean run pending.
+**Status:** Takeoff working ✓; waypoint direction and altitude bugs fixed; clean run with Isaac Sim physics pending
 
-ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming and flight sequence:
+ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 
-1. Start VPE thread — Phase 1: home position (0,0) at 0.1 m² cov; Phase 2: AnyLoc above 50 m AGL
+**Full arming and flight sequence:**
+
+1. Start VPE thread — Phase 1: kinematic position (from `/drone/state`) at 0.1 m² cov; Phase 2: AnyLoc above 50 m AGL
 2. Wait for MAVROS2 connection (`/mavros/state.connected`)
-3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; block up to 60 s waiting for GPS_GLOBAL_ORIGIN (msg 49) echo on `/uas1/mavlink_source`; abort if unconfirmed
+3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; block up to 60 s waiting for GPS_GLOBAL_ORIGIN (msg 49) echo; abort if unconfirmed
 4. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm; only needs IMU attitude)
 5. Switch to GUIDED
-6. Wait for `EKF_POS_HORIZ_ABS` (bit 4) from EKF_STATUS_REPORT (msg 193) on `/uas1/mavlink_source` — flags at byte offset 20
-7. Send `MAV_CMD_NAV_TAKEOFF` — ArduPilot's own altitude controller climbs to target AGL and holds. With `DISARM_DELAY=0`, spool-up completes in ~0.5 s. Monitor `/drone/state` AGL; abort if still on ground after 30 s.
-8. Square waypoint pattern → RTL (go_to_ned sends position setpoints)
+6. Wait for `EKF_POS_HORIZ_ABS` (bit 4) from EKF_STATUS_REPORT (msg 193) on `/uas1/mavlink_source`
+7. Send `MAV_CMD_NAV_TAKEOFF` — ArduPilot's own altitude controller climbs to 90 m AGL. Monitor `/drone/state` AGL; abort if still on ground after 30 s.
+8. Hold 5 s at takeoff altitude (send current-position setpoints in NED to maintain altitude through the transition)
+9. Send waypoint position setpoints in NED; wait until within 5 m radius
+10. RTL on Ctrl-C
+
+**MAVROS2 setpoint coordinate bug:**  
+`setpoint_position/local` plugin in MAVROS2 Jazzy passes coordinates **directly** into `SET_POSITION_TARGET_LOCAL_NED` without ENU→NED axis swap. Position setpoints must be sent in NED: `x=north, y=east, z=down` (negative = altitude above origin).
 
 **VPE covariance design:**
-- `frame_id = "map"` (ENU): x = East, y = North, z = Up
+- `frame_id = "map"` (ENU): x = East, y = North, z = Up — the `vision_pose` plugin converts correctly to NED
 - Phase 1 x/y covariance = **0.1 m²** (EKF sets POS_HORIZ_ABS immediately at ground)
 - Phase 2 x/y covariance = **max(1, error_m²)** (scales with AnyLoc confidence)
-- z = kinematic AGL from `/drone/state` (`_drone_state.pose.position.z − HOME_ALT_MSL`)
-- z covariance = **0.25 m²** (0.5 m std dev); `EK3_SRC1_POSZ=6` routes this to EKF altitude
-
-**MAVROS2 (UDP):**
-- `launch_mavros.sh` uses `fcu_url:="udp://:14550@"` (binds local port 14550)
-- MAVProxy sends to 14550 via `--out udp:127.0.0.1:14550`
-- `/mavros/estimator_status` is advertised but publishes no messages in MAVROS2 Jazzy 2.14; use `/uas1/mavlink_source` instead
+- z = kinematic AGL from `/drone/state`; z covariance = **0.25 m²**; `EK3_SRC1_POSZ=6` routes to EKF altitude
 
 **no_gps.parm highlights:**
 
@@ -166,25 +164,48 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively. Full arming an
 | `VISO_TYPE` | 1 | MAVLink vision odometry |
 | `FS_GPS_ENABLE` | 0 | no GPS failsafe |
 | `ARMING_CHECK` | 0 | skip pre-arm (SITL only) |
-| `MOT_THST_HOVER` | 0.5 | kinematic hover PWM = 1500 |
+| `MOT_THST_HOVER` | 0.5 | hover PWM = 1500 (matches Isaac Sim k_T and kinematic model) |
 | `SCHED_LOOP_RATE` | 50 | matches Isaac Sim frame rate |
 | `DISARM_DELAY` | 0 | enables NAV_TAKEOFF path (removes land-detector deadlock) |
-| `WPNAV_SPEED` | 100 | 1 m/s horizontal max (default 500 → runaway tilt at altitude) |
+| `WPNAV_SPEED` | 100 | 1 m/s horizontal max |
 | `PSC_POSXY_P` | 0.3 | horizontal position P (default 1.0) |
 | `PSC_VELXY_P` | 0.5 | horizontal velocity P (default 2.0) |
-| `PSC_VELXY_I` | 0.3 | horizontal velocity I (default 1.0) |
-| `PSC_VELXY_D` | 0.0 | horizontal velocity D (removed — unstable at 50 Hz) |
-| `ATC_ANG_RLL_P` | 1.5 | roll angle P (default 4.5 — causes I-term windup → drift) |
-| `ATC_ANG_PIT_P` | 1.5 | pitch angle P (default 4.5) |
-| `ATC_RAT_RLL_P/I` | 0.04 | roll rate P/I (default 0.135) |
-| `ATC_RAT_PIT_P/I` | 0.04 | pitch rate P/I (default 0.135) |
-| `ATC_RAT_RLL/PIT_D` | 0.0 | rate D removed — oscillates with kinematic IMU |
+| `PSC_VELXY_I` | 0.0 | horizontal velocity I — zeroed to prevent windup during 90 s climb |
+| `ATC_ANG_RLL_P` | 1.5 | roll angle P (default 4.5 → I-term windup → drift) |
+| `ATC_ANG_PIT_P` | 1.5 | pitch angle P |
+| `ATC_RAT_RLL_P/I` | 0.10 / 0.02 | roll rate gains |
+| `ATC_RAT_PIT_P/I` | 0.10 / 0.02 | pitch rate gains |
 
 ---
 
 ## Run order
 
-### Headless (no GPU, no Isaac Sim)
+### With Isaac Sim (standard)
+
+```bash
+# T1 — Isaac Sim (physics + visualiser; writes home_elevation.json; start first)
+cd simulator && ./run_chiayi.sh
+
+# T2 — ArduPilot SITL
+python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
+    -v ArduCopter --model=JSON --no-rebuild \
+    -l 23.450868,120.286135,28.17,0 \
+    --add-param-file=control/no_gps.parm --wipe \
+    --out udp:127.0.0.1:14550
+
+# T3 — MAVROS2
+bash control/launch_mavros.sh
+
+# T4 — AnyLoc
+./anyloc/run_ros2_localizer.sh
+
+# T5 — Flight commander
+source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
+```
+
+> Do **not** run `drone_sim.py` alongside `cesium_scene.py` — both bind UDP 9002.
+
+### Headless (no Isaac Sim)
 
 ```bash
 # T1 — ArduPilot SITL
@@ -204,33 +225,7 @@ bash control/launch_mavros.sh
 source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 ```
 
-> **Note:** Restart all three (SITL + drone_sim + MAVROS2) after any failed run.
-
-### Full (with Isaac Sim)
-
-```bash
-# T1 — Isaac Sim (writes home_elevation.json; start first)
-cd simulator && ./run_chiayi.sh
-
-# T2 — ArduPilot SITL
-python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
-    -v ArduCopter --model=JSON --no-rebuild \
-    -l 23.450868,120.286135,28.17,0 \
-    --add-param-file=control/no_gps.parm --wipe \
-    --out udp:127.0.0.1:14550
-
-# T3 — Drone physics
-source /opt/ros/jazzy/setup.bash && python3 control/drone_sim.py
-
-# T4 — MAVROS2
-bash control/launch_mavros.sh
-
-# T5 — AnyLoc
-./anyloc/run_ros2_localizer.sh
-
-# T6 — Flight commander
-source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
-```
+> Restart all processes (SITL + physics + MAVROS2) after any failed run.
 
 ---
 
@@ -255,8 +250,10 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6g | Fix VPE: ENU coordinate order + 1 m² covariance for EKF POS_ABS | Done |
 | 6h | Remove pymavlink; MAVROS2 raw MAVLink; DISARM_DELAY=0 | Done ✓ |
 | 6i | NAV_TAKEOFF replaces P-controller; EKF origin blocking; reduced ATC gains | Done ✓ |
-| 6j | Fix altitude runaway (EK3_SRC1_POSZ→ExternalNav) + fix 90° course error (motor layout) | **Done ✓** |
-| 6j-wp | Waypoints via position setpoints — clean run pending | WIP |
+| 6j | Fix altitude runaway (EK3_SRC1_POSZ→ExternalNav) + fix 90° course error | Done ✓ |
+| 6k | Fix waypoint direction inversion (MAVROS2 NED passthrough) + altitude drop on hold | Done ✓ |
+| 6l | Integrate kinematic physics into cesium_scene.py (100 Hz thread); eliminate drone_sim.py | Done ✓ |
+| 6k-wp | Waypoints clean run with Isaac Sim physics | WIP |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

@@ -1,5 +1,79 @@
 # Project History
 
+## 2026-06-01 — Physics thread at 100 Hz; fix altitude oscillation; debug MAVROS/EKF startup
+
+### Bug: Drone oscillates 0–4 m AGL, never reaches 90 m
+
+**Symptom:** After NAV_TAKEOFF accepted, motors cycle between ~1950 (max) and ~1150 (ground-idle). AGL bounces between 0 and 4 m, never climbs toward 90 m target.
+
+**Root cause:** The kinematic model + SITL bridge ran in Isaac Sim's render loop (~13 Hz). ArduPilot saw physics replies at 13 Hz instead of 100 Hz. The altitude PID I-term (`PSC_ACCZ_I=0.3`) accumulated too aggressively at 13 Hz steps (77 ms each), causing bang-bang oscillation between max and minimum throttle.
+
+**Fix:** Moved the kinematic model and bridge to a dedicated background thread (`_run_physics`, daemon) that runs at 100 Hz using `time.sleep(0.01)`. The render loop now only reads the current state under a `threading.Lock` and updates the drone mesh. `/drone/state` is published from the physics thread at 100 Hz.
+
+### Bug: Isaac Sim PhysX `apply_force_at_pos` silently failed
+
+Earlier in this session, milestone 6l was implemented using `UsdPhysics.RigidBodyAPI` + `omni.physx.apply_force_at_pos`. The drone spawn height stayed frozen at exactly the initial value (0.3 m AGL) — neither gravity nor motor thrust moved it. The exception from `apply_force_at_pos` was silently swallowed by `except Exception: pass`.
+
+**Fix:** Abandoned PhysX force API (incompatible with Isaac Sim 6.0 in this configuration). Replaced with the 6-DOF kinematic model from `drone_sim.py` inlined into `cesium_scene.py`. This avoids the PhysX C++ API entirely while achieving the same result — one fewer process, same physics fidelity.
+
+### Startup lessons learned
+
+| Issue | Root cause | Fix |
+|-------|-----------|-----|
+| MAVROS not connected | Old `cesium_scene.py` (no bridge on UDP 9002); ArduPilot had no physics state | Restart Isaac Sim with new code; or run `drone_sim.py` as temp fallback |
+| EKF flags 0x000 | `VISO_TYPE=1` not active after `--wipe` (needs second boot) | Type `reboot` in MAVProxy console after `--wipe`; wait for "Saved N params" |
+| EKF flags 0x000 | ArduPilot SITL not running (`/drone/state` frozen, no ardupilot process) | Start SITL before flight_commander |
+| `drone_sim.py` conflict | Both `drone_sim.py` and new `cesium_scene.py` try to bind UDP 9002 | Never run `drone_sim.py` when Isaac Sim is up |
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `simulator/cesium_scene.py` | Removed PhysX RigidBodyAPI + apply_force_at_pos; added 100 Hz `_run_physics` thread; render loop simplified to state-read + mesh-update |
+
+---
+
+## 2026-06-01 — Waypoint direction inverted + altitude drop + Isaac Sim physics (milestones 6k, 6l)
+
+### Bug 1: Waypoint flies in opposite direction (NW target → SE movement)
+
+**Symptom:** After reaching 90 m AGL and commanding WP N=+531 E=−454, the drone flew SE with growing error (N=−737→−916, E=+487→+561) and dropped to 0 m AGL.
+
+**Root cause — direction:** MAVROS2 Jazzy `setpoint_position/local` plugin passes the `PoseStamped` x,y,z directly into `SET_POSITION_TARGET_LOCAL_NED` **without** performing the ENU→NED axis swap that the `vision_pose` plugin does correctly. Sending ENU (x=east=−453.9, y=north=531.2, z=+90) arrived at ArduPilot as NED (north=−453.9=south, east=531.2, down=+90=underground), causing the drone to fly in the exact opposite horizontal direction and descend to ground.
+
+**Root cause — altitude drop:** The 5-second post-takeoff hold loop sent no position setpoints. Some ArduPilot firmware variants interpret "no setpoint" as "descend to z=0". Combined with the first waypoint setpoint arriving with z=+90 treated as 90 m underground, the drone immediately hit the ground constraint.
+
+**Root cause — SE drift before liftoff:** `drone_sim.py` ground constraint zeroed vertical velocity but not horizontal velocity. Motor imbalance during spool-up caused horizontal sliding before liftoff.
+
+**Fixes:**
+
+| File | Change |
+|------|--------|
+| `control/flight_commander.py` | `go_to_ned`: send NED coords (x=north, y=east, z=down); distance check uses ENU drone_state unchanged |
+| `control/flight_commander.py` | Post-takeoff hold loop now publishes current-position setpoints in NED at ~10 Hz |
+| `control/drone_sim.py` | Ground constraint: zero `_kvn` and `_kve` when on ground (friction — stops pre-liftoff sliding) |
+
+---
+
+### Milestone 6l: Replace drone_sim.py with Isaac Sim PhysX rigid body
+
+**Motivation:** Since Isaac Sim is always running, maintaining a separate kinematic physics process (`drone_sim.py`) added complexity and introduced bugs (missing ground friction, approximate motor model). Isaac Sim's PhysX engine handles all of this correctly for free.
+
+**Changes to `simulator/cesium_scene.py`:**
+
+- Drone root `/World/Drone` gains `UsdPhysics.RigidBodyAPI` (mass=1 kg, diagonal inertia) and an invisible collision sphere (r=0.2 m). PhysX now integrates gravity and thrust forces each simulation step.
+- `SITLBridge` instantiated directly in `cesium_scene.py`; each render frame: read rigid body state → send to ArduPilot → receive PWM → apply 4 per-motor thrust forces via `omni.physx.apply_force_at_pos`.
+- Publishes `/drone/state` (ENU PoseStamped from PhysX position + quaternion orientation).
+- Removed `/drone/state` subscription and `_cb_drone_state` callback (no longer reads from `drone_sim.py`).
+- Added `_quat_to_rpy()` and `_quat_rotate_vec()` helpers for attitude extraction and force rotation.
+- Motor thrust coefficient: `k_T = M·g/2 = 4.905 N` per unit normalised PWM, hover at p_norm=0.5 (PWM 1500), matching `MOT_THST_HOVER=0.5`.
+
+**drone_sim.py:** Retained as headless-only fallback. Do not run alongside `cesium_scene.py` (both bind UDP 9002).
+
+**New run order (with Isaac Sim):** T1=cesium_scene.py, T2=ArduPilot SITL, T3=MAVROS2, T4=AnyLoc, T5=flight_commander.py. `drone_sim.py` is not in this sequence.
+
+---
+
 ## 2026-06-01 — Two critical flight bugs fixed: altitude runaway + 90° waypoint error
 
 ### Bug 1: AGL ascends forever (never stabilises at 90 m)

@@ -50,11 +50,11 @@ MOT_THST_HOVER  0.5
 # Reducing these makes corrections gentler and prevents runaway.
 ATC_ANG_RLL_P   1.5     # roll angle P (default 4.5)
 ATC_ANG_PIT_P   1.5     # pitch angle P (default 4.5)
-ATC_RAT_RLL_P   0.04    # roll rate P (default 0.135)
-ATC_RAT_RLL_I   0.04    # roll rate I (default 0.135) — low I prevents windup
+ATC_RAT_RLL_P   0.10    # roll rate P — raised from 0.04; needed to generate motor differential for tilt
+ATC_RAT_RLL_I   0.02    # roll rate I — small I holds steady-state tilt; safe because PSC_VELXY_I=0
 ATC_RAT_RLL_D   0.0     # roll rate D (removed — causes oscillation with kinematic IMU)
-ATC_RAT_PIT_P   0.04    # pitch rate P
-ATC_RAT_PIT_I   0.04    # pitch rate I
+ATC_RAT_PIT_P   0.10    # pitch rate P
+ATC_RAT_PIT_I   0.02    # pitch rate I — same reasoning
 ATC_RAT_PIT_D   0.0     # pitch rate D
 
 # Altitude PID gains — default values are tuned for ~100 Hz physics.
@@ -72,7 +72,7 @@ WPNAV_SPEED     100     # max horizontal speed cm/s (default 500) — prevent ru
 # Horizontal position controller — reduce from defaults to prevent flyaway
 PSC_POSXY_P     0.3     # horizontal position P (default 1.0)
 PSC_VELXY_P     0.5     # horizontal velocity P (default 2.0)
-PSC_VELXY_I     0.3     # horizontal velocity I (default 1.0)
+PSC_VELXY_I     0.0     # horizontal velocity I — zeroed to prevent windup over 90s climb
 PSC_VELXY_D     0.0     # horizontal velocity D (removed — unstable at 50 Hz)
 
 # Prevent auto-disarm while debugging takeoff (10 s default causes disarm before liftoff)

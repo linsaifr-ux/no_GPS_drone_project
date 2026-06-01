@@ -65,17 +65,15 @@ except (FileNotFoundError, KeyError):
 
 # ── Mission parameters ─────────────────────────────────────────────────────────
 TAKEOFF_ALT          = 90.0   # metres AGL
-WAYPOINT_RADIUS      =  3.0   # metres — how close counts as reached
-WAYPOINT_TIMEOUT     = 120.0  # seconds per waypoint (longer to allow for takeoff drift)
+WAYPOINT_RADIUS      =  5.0   # metres — how close counts as reached
+WAYPOINT_TIMEOUT     = 900.0  # seconds per waypoint (699 m at 1 m/s ≈ 12 min)
 MIN_LOCALISATION_AGL = 50.0   # metres AGL — below this, VPE is locked to home position;
                                # above this, AnyLoc estimates are used
 
-# NED waypoints (north m, east m, down m) — down = -alt_agl
+# Target: 23.45564°N, 120.28169°E  (computed from HOME_LAT/LON below)
+# N=+531.2 m  E=−453.9 m  dist≈699 m  AGL=90 m
 WAYPOINTS = [
-    ( 20.0,   0.0, -90.0),
-    ( 20.0,  20.0, -90.0),
-    (  0.0,  20.0, -90.0),
-    (  0.0,   0.0, -90.0),
+    (531.2, -453.9, -90.0),
 ]
 
 COS_LAT   = math.cos(math.radians(HOME_LAT))
@@ -197,20 +195,28 @@ class FlightCommander(rclpy.node.Node):
                         if mtime != last_mtime:
                             with open(ESTIMATE_JSON) as fh:
                                 est = json.load(fh)
-                            # Only accept estimates taken at altitude (not the ground stub)
-                            if est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL:
+                            err_m = est.get("error_m", 999.0)
+                            # Require: taken at altitude AND error < 100 m.
+                            # Estimates worse than 100 m are discarded — the EKF jump would
+                            # destabilise the position controller mid-climb.
+                            if (est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL
+                                    and err_m < 100.0):
                                 lat  = est["est_lat"]; lon = est["est_lon"]
                                 yaw  = math.radians(est.get("yaw_deg", 0.0))
                                 north = (lat - HOME_LAT) * M_PER_DEG
                                 east  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
-                                cov_xy = max(1.0, est.get("error_m", 10.0) ** 2)
+                                cov_xy = max(1.0, err_m ** 2)
                                 anyloc_est = (east, north, yaw, cov_xy)
                                 last_mtime = mtime
                                 n_anyloc += 1
                                 if n_anyloc == 1:
                                     print(f"[Commander] First AnyLoc VPE: "
                                           f"N={north:+.1f} E={east:+.1f} m  "
-                                          f"err={est.get('error_m', 0):.1f} m")
+                                          f"err={err_m:.1f} m")
+                            elif est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL:
+                                last_mtime = mtime  # advance mtime so we log once per file
+                                print(f"[Commander] AnyLoc estimate rejected: "
+                                      f"err={err_m:.1f} m ≥ 100 m — staying on Phase 1 VPE")
                     except (FileNotFoundError, KeyError, json.JSONDecodeError):
                         pass
 
@@ -218,9 +224,20 @@ class FlightCommander(rclpy.node.Node):
                 if agl >= MIN_LOCALISATION_AGL and anyloc_est is not None:
                     east_v, north_v, yaw_v, cov_xy = anyloc_est
                 else:
-                    # Phase 1 — home position.  The drone is at the known home point;
-                    # use 0.1 m² so EKF marks POS_HORIZ_ABS "good" immediately.
-                    east_v, north_v, yaw_v, cov_xy = 0.0, 0.0, 0.0, 0.1
+                    # Phase 1 — track actual kinematic position from drone_sim.
+                    # Sending fixed (0,0) caused EKF/kinematic mismatch: the drone
+                    # drifted but ArduPilot believed it was still at home, making
+                    # waypoints converge in the wrong frame.
+                    # On the ground drone_state = (0,0) so EKF still inits at home;
+                    # once airborne the VPE follows the real trajectory so the
+                    # position controller can hold position and waypoints work.
+                    if self._drone_state is not None:
+                        east_v  = self._drone_state.pose.position.x
+                        north_v = self._drone_state.pose.position.y
+                    else:
+                        east_v, north_v = 0.0, 0.0
+                    yaw_v  = 0.0
+                    cov_xy = 0.1
 
                 # ── Publish VPE ───────────────────────────────────────────────────
                 hy  = yaw_v / 2.0
@@ -246,7 +263,7 @@ class FlightCommander(rclpy.node.Node):
                     print("[Commander] VPE thread started — Phase 1 (home position)")
 
                 elapsed = time.time() - t0
-                time.sleep(max(0.0, 0.2 - elapsed))   # 5 Hz
+                time.sleep(max(0.0, 0.05 - elapsed))  # 20 Hz — 5 Hz caused EKF dead-reckoning gaps
 
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
@@ -461,21 +478,24 @@ class FlightCommander(rclpy.node.Node):
         """
         Send EKF position setpoint and wait until drone reaches it.
 
-        Uses Guided_Pos mode (position setpoints) with the already-reduced PSC
-        gains (PSC_POSXY_P=0.3, WPNAV_SPEED=100 cm/s) for stability at altitude.
-        Requires confirmed EKF origin for correct horizontal reference.
+        MAVROS2 Jazzy setpoint_position/local does NOT convert ENU→NED — it
+        passes the message x,y,z directly into SET_POSITION_TARGET_LOCAL_NED.
+        Send NED coordinates: x=north, y=east, z=down (negative = altitude).
+        The vision_pose plugin DOES convert correctly, so ArduPilot's EKF has
+        correct NED positions — the setpoint must match that convention.
 
-        Distance check uses /drone/state (kinematic truth) to avoid EKF drift.
-        /drone/state frame: x=East(m), y=North(m), z=MSL altitude(m).
+        Distance check uses /drone/state ENU truth (x=East, y=North, z=MSL).
         """
         msg = PoseStamped()
         msg.header.frame_id = "map"
         msg.pose.orientation.w = 1.0
 
-        # /mavros/setpoint_position/local expects ENU: x=east, y=north, z=up(AGL)
-        enu_x = east
-        enu_y = north
-        enu_z = -down   # up = -down
+        # NED setpoint — passed through as-is to SET_POSITION_TARGET_LOCAL_NED
+        ned_x = north        # NED x = north
+        ned_y = east         # NED y = east
+        ned_z = down         # NED z = down; negative value = altitude above origin
+
+        target_agl = -down   # AGL metres for distance check
 
         deadline   = time.time() + timeout
         last_print = time.time()
@@ -483,20 +503,20 @@ class FlightCommander(rclpy.node.Node):
         try:
             while time.time() < deadline:
                 msg.header.stamp    = self.get_clock().now().to_msg()
-                msg.pose.position.x = enu_x
-                msg.pose.position.y = enu_y
-                msg.pose.position.z = enu_z
+                msg.pose.position.x = ned_x
+                msg.pose.position.y = ned_y
+                msg.pose.position.z = ned_z
                 self._pos_pub.publish(msg)
                 rclpy.spin_once(self, timeout_sec=0.1)
 
                 if self._drone_state is not None:
                     ds = self._drone_state.pose.position
-                    dx = ds.x - enu_x
-                    dy = ds.y - enu_y
-                    dz = (ds.z - HOME_ALT_MSL) - enu_z
+                    dx = ds.x - east               # ENU east  error
+                    dy = ds.y - north              # ENU north error
+                    dz = (ds.z - HOME_ALT_MSL) - target_agl
                 elif self._local_pos is not None:
                     p  = self._local_pos.pose.position
-                    dx, dy, dz = p.x - enu_x, p.y - enu_y, p.z - enu_z
+                    dx, dy, dz = p.x - east, p.y - north, p.z - target_agl
                 else:
                     continue
 
@@ -581,11 +601,22 @@ def main():
         print("[Commander] Takeoff failed")
         stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Brief pause — ArduPilot GUIDED mode holds last position after NAV_TAKEOFF.
-    print("[Commander] Holding 5 s …")
+    # Brief pause — keep sending the current position as setpoint so GUIDED mode
+    # has an explicit target during the NAV_TAKEOFF→position-setpoint transition.
+    # Without this, some firmware versions descend to z=0 (no commanded target).
+    print(f"[Commander] Holding 5 s at {TAKEOFF_ALT:.0f} m …")
+    _hold = PoseStamped()
+    _hold.header.frame_id = "map"
+    _hold.pose.orientation.w = 1.0
     t_hold = time.time() + 5.0
     while time.time() < t_hold:
         rclpy.spin_once(cmd, timeout_sec=0.1)
+        if cmd._drone_state is not None:
+            _hold.header.stamp = cmd.get_clock().now().to_msg()
+            _hold.pose.position.x =   cmd._drone_state.pose.position.y        # NED north = ENU north
+            _hold.pose.position.y =   cmd._drone_state.pose.position.x        # NED east  = ENU east
+            _hold.pose.position.z = -(cmd._drone_state.pose.position.z - HOME_ALT_MSL)  # NED down = -AGL
+            cmd._pos_pub.publish(_hold)
 
     # Step 8: Waypoints
     try:
@@ -596,13 +627,16 @@ def main():
             print(f"[Commander] WP {i+1} {'✓' if reached else 'timeout'}")
             time.sleep(1.0)
 
-        # Step 9: RTL
-        print("[Commander] Mission complete — RTL")
-        cmd.set_mode("RTL")
-
-        # Wait for disarm — 90 m AGL descent at ~1.5 m/s takes ~60 s + landing buffer
-        cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
-        print("[Commander] Disarmed — landed ✓")
+        # Step 9: hold at target indefinitely (Ctrl-C to RTL)
+        print("[Commander] Holding at 23.45564°N 120.28169°E — Ctrl-C to RTL")
+        try:
+            while True:
+                rclpy.spin_once(cmd, timeout_sec=0.1)
+        except KeyboardInterrupt:
+            print("[Commander] Ctrl-C — RTL")
+            cmd.set_mode("RTL")
+            cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
+            print("[Commander] Disarmed — landed ✓")
     except Exception as exc:
         print(f"[Commander] Mission aborted: {exc}")
     finally:

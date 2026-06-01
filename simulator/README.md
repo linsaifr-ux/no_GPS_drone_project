@@ -1,16 +1,48 @@
 # Isaac Sim — Simulator README
 
-`cesium_scene.py` is a **pure visualiser** for the no-GPS drone project. It subscribes to `/drone/state` published by `control/drone_sim.py` and moves the USD drone mesh; it publishes `/drone/camera/image_raw`, `/drone/pose`, and `/drone/agl` for the AnyLoc and detection nodes.
+`cesium_scene.py` is the **physics engine and visualiser** for the no-GPS drone project. It runs a 100 Hz background physics thread (same 6-DOF kinematic model as `drone_sim.py`) + the ArduPilot SITL bridge, and publishes `/drone/state` for the flight commander and AnyLoc nodes. The render loop (~13 Hz) reads the current physics state and updates the drone mesh.
 
-**drone_sim.py must be running** for the drone to move in the viewport.
+**`drone_sim.py` is not used when Isaac Sim is running.** Both bind UDP 9002 — run only one at a time.
 
 Launch: `cd simulator && ./run_chiayi.sh`
 
 ---
 
+## Architecture inside cesium_scene.py
+
+```
+Background thread (100 Hz)          Render loop (~13 Hz)
+─────────────────────────────        ─────────────────────────────
+bridge.step() ←→ ArduPilot SITL     read _k* state under lock
+kinematic 6-DOF integration          update drone_pos_op / drone_orient_op
+publish /drone/state                 HUD, frame capture, ROS2 spin
+```
+
+## What the physics thread does each step (100 Hz)
+
+1. Send current kinematic state to ArduPilot SITL via `SITLBridge` (UDP 9002)
+2. Receive latest motor PWM from ArduPilot
+3. Integrate 6-DOF kinematic model: PWM → thrust → roll/pitch → NED velocity → ENU position
+4. Apply ground constraint (no sliding on ground)
+5. Update shared state variables (protected by `threading.Lock`)
+6. Publish `/drone/state` (ENU PoseStamped, frame `local_enu`)
+
+## Kinematic physics constants
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Mass | 1.0 kg | Sets hover at PWM 1500 matching `MOT_THST_HOVER=0.5` |
+| Max tilt | 0.35 rad (~20°) | From PWM differential |
+| Attitude τ | 0.15 s | First-order response |
+| Drag | 0.35 s⁻¹ | Aerodynamic drag |
+| Physics rate | 100 Hz | Background thread — ArduPilot sees 100 Hz physics |
+| Motor layout | ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW) | ArduCopter X-frame FRAME_TYPE=1 |
+
+---
+
 # Isaac Sim Environment Setup
 
-A Python environment for running NVIDIA Isaac Sim 6.0.0.0 simulations.
+A Python environment for running NVIDIA Isaac Sim 6.0.0 simulations.
 
 ## Requirements
 
@@ -95,6 +127,14 @@ done
 
 ## Usage
 
+### Launch the full simulator (standard)
+
+```bash
+cd simulator && ./run_chiayi.sh
+```
+
+This sources ROS2 Jazzy and runs `cesium_scene.py` in the `isaac_sim_test` conda environment.
+
 ### Run the headless test
 
 ```bash
@@ -103,89 +143,24 @@ done
 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python test_isaac.py
 ```
 
-### Launch the full GUI simulator
+### Launch the full GUI simulator standalone
 
 ```bash
 DISPLAY=:0 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test isaacsim
 ```
 
-Replace `:0` with your active X display (check with `echo $DISPLAY`). This launches the full Isaac Sim GUI (`isaacsim.exp.full` experience).
-
-> **Note:** Do **not** use `python -m isaacsim` — that runs a VS Code settings generator, not the simulator.
-
-### Write your own headless script
-
-```python
-from isaacsim import SimulationApp
-
-simulation_app = SimulationApp({"headless": True})
-
-from isaacsim.core.api import World
-
-world = World()
-world.reset()
-
-for i in range(100):
-    world.step(render=False)
-
-simulation_app.close()
-```
-
-Always run with:
-
-```bash
-OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python your_script.py
-```
-
-### Write your own GUI script
-
-```python
-from isaacsim import SimulationApp
-
-simulation_app = SimulationApp({"headless": False})
-
-from isaacsim.core.api import World
-
-world = World()
-world.reset()
-
-for i in range(100):
-    world.step(render=True)
-
-simulation_app.close()
-```
-
-Run with a display set:
-
-```bash
-DISPLAY=:0 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python your_script.py
-```
-
-### Run the city scene
-
-```bash
-DISPLAY=:0 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python city_scene.py
-```
-
-Opens the full Isaac Sim GUI with:
-- Two-lane asphalt road with yellow centre dashes and white edge lines
-- 14 office buildings of varying heights with glass window bands
-- Red car (chassis + cabin + 4 wheels) placed as a rigid body on the road
-- 8 street lights with warm point lights
-- 6 trees
-- Directional sun + sky dome lighting
-- Viewport camera pre-aimed at the car from a 45° angle
-
-The car has mass and gravity — it rests on its wheels. You can pause and apply forces or extend the script with vehicle controls.
+Replace `:0` with your active X display (check with `echo $DISPLAY`).
 
 ## Project structure
 
 ```
-isaac_sim_test/
+simulator/
 ├── README.md           # This file
+├── cesium_scene.py     # Physics + visualiser: Cesium terrain, 100 Hz kinematic thread, SITL bridge
+├── run_chiayi.sh       # Launch script (sources ROS2 Jazzy, runs in conda env)
 ├── test_isaac.py       # Headless test: creates a World and steps 5 times
-├── city_scene.py       # GUI city scene with car, buildings, lights and trees
-├── run_test.sh         # Convenience wrapper (sets OMNI_KIT_ACCEPT_EULA=Y)
+├── city_scene.py       # GUI city scene (standalone demo — not used in flight pipeline)
+├── geo_utils.py        # Geo helpers shared between scene scripts
 └── create_stubs.py     # One-time script to stub missing test extensions
 ```
 

@@ -175,6 +175,8 @@ def main():
                 if _kz <= HOME_ALT_MSL:   # ground constraint
                     _kz  = HOME_ALT_MSL
                     _kvd = min(0.0, _kvd)
+                    _kvn = 0.0   # ground friction — no horizontal sliding
+                    _kve = 0.0
 
             # ── Publish /drone/state ───────────────────────────────────────────
             qx, qy, qz, qw = _euler_to_quat(_kroll, _kpitch, _kyaw_rad)

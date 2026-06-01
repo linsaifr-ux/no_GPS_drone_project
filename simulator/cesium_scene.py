@@ -14,10 +14,26 @@ Run:
     DISPLAY=:2 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python cesium_scene.py
 """
 
-import io as _io, json, math, os, struct, sys, time, urllib.parse, urllib.request
+import io as _io, json, math, os, struct, sys, threading, time, urllib.parse, urllib.request
 
 # Project root on path so control/ package is importable from simulator/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from control.sitl_bridge import SITLBridge
+
+# ── Drone physics constants ────────────────────────────────────────────────────
+DRONE_MASS  = 1.0          # kg — hover at PWM 1500 (p_norm=0.5) matches MOT_THST_HOVER=0.5
+_K_THRUST   = DRONE_MASS * 9.81 / 2.0   # N per unit normalized PWM per motor
+_MOTOR_ARM  = 0.40         # m from centre to motor (matches visual arm length)
+_SQ2        = math.sqrt(2.0) / 2.0
+# ArduCopter X-frame FRAME_TYPE=1: ch1=FR, ch2=RL, ch3=RR, ch4=FL
+# In scene ENU body frame (x=East-local, y=North-local, z=Up)
+_MOTOR_LOCAL = [
+    ( _MOTOR_ARM * _SQ2,  _MOTOR_ARM * _SQ2, 0.0),  # ch1 M1 Front-Right NE
+    (-_MOTOR_ARM * _SQ2, -_MOTOR_ARM * _SQ2, 0.0),  # ch2 M2 Rear-Left   SW
+    ( _MOTOR_ARM * _SQ2, -_MOTOR_ARM * _SQ2, 0.0),  # ch3 M3 Rear-Right  SE
+    (-_MOTOR_ARM * _SQ2,  _MOTOR_ARM * _SQ2, 0.0),  # ch4 M4 Front-Left  NW
+]
 
 # ROS2 Jazzy Python packages (Python 3.12) — compatible with Isaac Sim 6.0 (Python 3.12).
 # run_chiayi.sh sources /opt/ros/jazzy/setup.bash so ROS2 shared libs are on LD_LIBRARY_PATH.
@@ -760,33 +776,12 @@ with open(_home_cfg, "w") as _f:
     json.dump({"centre_elev_m": centre_elev,
                "lat": CENTER_LAT, "lon": CENTER_LON}, _f)
 
-# ── ROS2 publishers + /drone/state subscriber ─────────────────────────────────
-_ros2_node  = None
-_img_pub    = None
-_pose_pub   = None
-_agl_pub    = None
-
-# Shared drone position received from drone_sim.py via /drone/state.
-# Initialised to ground level; updated by the callback below once connected.
-_drone_x = 0.0
-_drone_y = 0.0
-_drone_z = centre_elev   # MSL altitude (m)
-_drone_yaw_deg = 0.0
-
-def _cb_drone_state(msg):
-    """Apply position + yaw from drone_sim.py to the Isaac Sim drone mesh."""
-    global _drone_x, _drone_y, _drone_z, _drone_yaw_deg
-    _drone_x = msg.pose.position.x
-    _drone_y = msg.pose.position.y
-    _drone_z = msg.pose.position.z
-    # Extract yaw from quaternion (ZYX, yaw = rotation about world Z)
-    qx = msg.pose.orientation.x; qy = msg.pose.orientation.y
-    qz = msg.pose.orientation.z; qw = msg.pose.orientation.w
-    siny = 2.0 * (qw * qz + qx * qy)
-    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
-    _drone_yaw_deg = math.degrees(math.atan2(siny, cosy))
-    drone_pos_op.Set(Gf.Vec3d(_drone_x, _drone_y, _drone_z))
-    drone_yaw_op.Set(_drone_yaw_deg)
+# ── ROS2 publishers — cesium_scene now PUBLISHES /drone/state (no subscription) ──
+_ros2_node = None
+_img_pub   = None
+_pose_pub  = None
+_agl_pub   = None
+_state_pub = None   # replaces drone_sim.py's /drone/state publisher
 
 if _ROS2_OK:
     try:
@@ -795,9 +790,8 @@ if _ROS2_OK:
         _img_pub   = _ros2_node.create_publisher(RosImage,    "/drone/camera/image_raw", 1)
         _pose_pub  = _ros2_node.create_publisher(PoseStamped, "/drone/pose",              1)
         _agl_pub   = _ros2_node.create_publisher(Float64,     "/drone/agl",               1)
-        _ros2_node.create_subscription(PoseStamped, "/drone/state", _cb_drone_state, 1)
-        print("[ROS2] Publishers ready: /drone/camera/image_raw, /drone/pose, /drone/agl")
-        print("[ROS2] Subscribed to /drone/state (from drone_sim.py)")
+        _state_pub = _ros2_node.create_publisher(PoseStamped, "/drone/state",             1)
+        print("[ROS2] Publishers ready: /drone/camera/image_raw, /drone/pose, /drone/agl, /drone/state")
     except Exception as _e:
         print(f"[ROS2] Node init failed: {_e} — falling back to file output")
         _ros2_node = None
@@ -869,12 +863,12 @@ except Exception:
 # ── DRONE + DRONE CAMERA ───────────────────────────────────────────────────────
 os.makedirs(DRONE_FRAME_DIR, exist_ok=True)
 
-# Root Xform — starts 50 m AGL at scene centre
-drone_root   = UsdGeom.Xform.Define(stage, "/World/Drone")
-drone_pos_op = drone_root.AddTranslateOp()
-drone_yaw_op = drone_root.AddRotateZOp()          # yaw about world-up (Z)
+# Root Xform — position and orientation set each frame from the kinematic model.
+drone_root      = UsdGeom.Xform.Define(stage, "/World/Drone")
+drone_pos_op    = drone_root.AddTranslateOp()
+drone_orient_op = drone_root.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
 drone_pos_op.Set(Gf.Vec3d(0.0, 0.0, centre_elev))
-drone_yaw_op.Set(0.0)
+drone_orient_op.Set(Gf.Quatd(1, 0, 0, 0))
 
 # Quadcopter: central body + 4 arms + motor pods + propeller discs
 # Overall span ≈ 0.8 m (realistic DJI Phantom class)
@@ -942,6 +936,125 @@ _rgb.attach([_rp])
 
 print(f"[DRONE] Nadir camera {DRONE_CAM_W}×{DRONE_CAM_H}  →  {DRONE_FRAME_DIR}/")
 
+# ── Kinematic physics constants ────────────────────────────────────────────────
+_K_GRAVITY  = 9.81
+_K_MAX_VEL  = 15.0
+_K_MAX_TILT = 0.35    # rad — max tilt from PWM differential
+_K_TILT_TAU = 0.15    # s   — attitude first-order time constant
+_K_DRAG     = 0.35    # s⁻¹ — aerodynamic drag coefficient
+
+# Kinematic state — ENU (x=East m, y=North m, z=MSL altitude m)
+# Protected by _kin_lock; written by physics thread, read by render loop.
+_kin_lock                   = threading.Lock()
+_kx, _ky                    = 0.0, 0.0
+_kz                         = float(centre_elev)
+_kvn, _kve, _kvd            = 0.0, 0.0, 0.0
+_kroll, _kpitch, _kyaw_rad  = 0.0, 0.0, 0.0
+_kqx, _kqy, _kqz, _kqw     = 0.0, 0.0, 0.0, 1.0   # quaternion for mesh
+
+# ── SITL bridge ───────────────────────────────────────────────────────────────
+_bridge     = SITLBridge(listen_port=9002, centre_elev=centre_elev)
+_bridge.debug_hz = 0.2
+_latest_pwm = [1000] * 16   # motors off until ArduPilot connects and arms
+
+# ── 100 Hz physics thread — decoupled from Isaac Sim render rate (~13 Hz) ────
+def _run_physics():
+    """Run kinematic model + SITL bridge at 100 Hz in background thread."""
+    global _kx, _ky, _kz, _kvn, _kve, _kvd
+    global _kroll, _kpitch, _kyaw_rad
+    global _kqx, _kqy, _kqz, _kqw, _latest_pwm
+
+    _kprev_t_loc = None
+
+    while True:
+        t_now = time.time()
+        _kdt_loc = min(t_now - _kprev_t_loc, 0.05) if _kprev_t_loc is not None else 0.0
+        _kprev_t_loc = t_now
+
+        with _kin_lock:
+            kx = _kx;  ky = _ky;  kz = _kz
+            kvn = _kvn; kve = _kve; kvd = _kvd
+            kroll = _kroll; kpitch = _kpitch; kyaw = _kyaw_rad
+            pwm = list(_latest_pwm)
+
+        servos = _bridge.step(kx, ky, kz,
+                              math.degrees(-kyaw), kroll, kpitch, t_now)
+        if servos is not None:
+            pwm = servos["pwm"]
+
+        if _kdt_loc > 0:
+            _p4      = [max(0.0, (v - 1000) / 1000.0) for v in pwm[:4]]
+            _mean_p  = sum(_p4) / 4.0
+            _kthrust = _mean_p * 2.0 * _K_GRAVITY
+
+            _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
+            _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
+
+            _ka       = _kdt_loc / (_K_TILT_TAU + _kdt_loc)
+            new_roll  = kroll  + _ka * (_roll_tgt  - kroll)
+            new_pitch = kpitch + _ka * (_pitch_tgt - kpitch)
+
+            _kcy, _ksy = math.cos(kyaw), math.sin(kyaw)
+            _kbfwd = -_kthrust * math.sin(new_pitch)
+            _kbrgt =  _kthrust * math.sin(new_roll)
+            _kan   = _kbfwd * _kcy - _kbrgt * _ksy
+            _kae   = _kbfwd * _ksy + _kbrgt * _kcy
+            _kad   = _K_GRAVITY - _kthrust * math.cos(new_roll) * math.cos(new_pitch)
+
+            new_kvn = max(-_K_MAX_VEL, min(_K_MAX_VEL, kvn + _kan * _kdt_loc))
+            new_kve = max(-_K_MAX_VEL, min(_K_MAX_VEL, kve + _kae * _kdt_loc))
+            new_kvd = max(-_K_MAX_VEL, min(_K_MAX_VEL, kvd + _kad * _kdt_loc))
+
+            _drag = 1.0 - _K_DRAG * _kdt_loc
+            new_kvn *= _drag; new_kve *= _drag; new_kvd *= _drag
+
+            new_ky = ky + new_kvn * _kdt_loc
+            new_kx = kx + new_kve * _kdt_loc
+            new_kz = kz - new_kvd * _kdt_loc
+
+            if new_kz <= centre_elev:
+                new_kz  = float(centre_elev)
+                new_kvd = min(0.0, new_kvd)
+                new_kvn = 0.0; new_kve = 0.0
+
+            _yaw_CCW_loc = -kyaw
+            _cy = math.cos(_yaw_CCW_loc / 2); _sy = math.sin(_yaw_CCW_loc / 2)
+            _cr = math.cos(new_roll  / 2);    _sr = math.sin(new_roll  / 2)
+            _cp = math.cos(new_pitch / 2);    _sp = math.sin(new_pitch / 2)
+            nqx = _sr*_cp*_cy - _cr*_sp*_sy
+            nqy = _cr*_sp*_cy + _sr*_cp*_sy
+            nqz = _cr*_cp*_sy - _sr*_sp*_cy
+            nqw = _cr*_cp*_cy + _sr*_sp*_sy
+
+            with _kin_lock:
+                _kx, _ky, _kz       = new_kx, new_ky, new_kz
+                _kvn, _kve, _kvd    = new_kvn, new_kve, new_kvd
+                _kroll, _kpitch     = new_roll, new_pitch
+                _latest_pwm         = pwm
+                _kqx, _kqy, _kqz, _kqw = nqx, nqy, nqz, nqw
+
+        # Publish /drone/state at physics rate (100 Hz)
+        if _state_pub is not None and _ros2_node is not None:
+            _sm = PoseStamped()
+            _sm.header.stamp    = _ros2_node.get_clock().now().to_msg()
+            _sm.header.frame_id = "local_enu"
+            with _kin_lock:
+                _sm.pose.position.x    = _kx
+                _sm.pose.position.y    = _ky
+                _sm.pose.position.z    = _kz
+                _sm.pose.orientation.w = _kqw
+                _sm.pose.orientation.x = _kqx
+                _sm.pose.orientation.y = _kqy
+                _sm.pose.orientation.z = _kqz
+            _state_pub.publish(_sm)
+
+        elapsed = time.time() - t_now
+        time.sleep(max(0.0, 0.01 - elapsed))   # 100 Hz
+
+_physics_thread = threading.Thread(target=_run_physics, daemon=True)
+_physics_thread.start()
+print("[DRONE] Physics thread started at 100 Hz — drone_sim.py no longer needed")
+
 # Write geo metadata
 stage.SetMetadata("customLayerData", {
     "geo:centerLat":   CENTER_LAT,   "geo:centerLon":   CENTER_LON,
@@ -998,21 +1111,29 @@ simulation_app.update()
 
 _step = 0
 while simulation_app.is_running():
-    simulation_app.update()
+    simulation_app.update()   # advances physics + rendering
     _step += 1
 
-    # Drain /drone/state messages — updates drone_pos_op and drone_yaw_op
+    # ── Read physics state from background thread ──────────────────────────────
+    with _kin_lock:
+        _x_enu = _kx;  _y_enu = _ky;  _z_abs = _kz
+        _qx = _kqx;  _qy = _kqy;  _qz = _kqz;  _qw = _kqw
+        _yaw_CCW = -_kyaw_rad
+
+    # ── Update drone mesh ──────────────────────────────────────────────────────
+    drone_pos_op.Set(Gf.Vec3d(_x_enu, _y_enu, _z_abs))
+    drone_orient_op.Set(Gf.Quatd(_qw, _qx, _qy, _qz))
+
+    # ── Drain pending ROS2 events ──────────────────────────────────────────────
     if _ros2_node is not None:
         rclpy.spin_once(_ros2_node, timeout_sec=0.0)
 
-    # ── Current drone geo position (shared by HUD + frame capture) ───────────
-    _p   = drone_pos_op.Get()
-    _lat, _lon = to_latlon(float(_p[0]), float(_p[1]))
-    _alt = float(_p[2])
-    _agl = _alt - centre_elev
-    _yaw_deg = float(drone_yaw_op.Get())
+    # ── HUD + geo coordinates ──────────────────────────────────────────────────
+    _lat, _lon = to_latlon(_x_enu, _y_enu)
+    _alt     = _z_abs
+    _agl     = _alt - centre_elev
+    _yaw_deg = math.degrees(-_kyaw_rad)   # CCW-positive for HUD / meta.json
 
-    # ── HUD update ────────────────────────────────────────────────────────────
     if _hud_ok:
         _lbl_latlon.text = f"  LAT  {_lat:.5f}°N    LON  {_lon:.5f}°E"
         _lbl_alt.text    = f"  ALT  {_alt:.1f} m MSL    AGL  {_agl:.1f} m"
@@ -1031,7 +1152,6 @@ while simulation_app.is_running():
             else:
                 rgb_arr = arr[:, :, :3].astype(np.uint8)
 
-                # ── Always write files (legacy run_localizer.py polls these) ──
                 Image.fromarray(rgb_arr, "RGB").save(
                     os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
                 with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
@@ -1049,7 +1169,6 @@ while simulation_app.is_running():
                 if _step == DRONE_SAVE_EVERY:
                     print(f"[DRONE] Frame capture working — saving to {DRONE_FRAME_DIR}/")
 
-                # ── Additionally publish to ROS2 when available ───────────────
                 if _ros2_node is not None:
                     _now = _ros2_node.get_clock().now().to_msg()
 
@@ -1069,7 +1188,7 @@ while simulation_app.is_running():
                     pose_msg.pose.position.x = _lat
                     pose_msg.pose.position.y = _lon
                     pose_msg.pose.position.z = _alt
-                    _hy = math.radians(_yaw_deg) / 2.0
+                    _hy = _yaw_CCW / 2.0
                     pose_msg.pose.orientation.z = math.sin(_hy)
                     pose_msg.pose.orientation.w = math.cos(_hy)
                     _pose_pub.publish(pose_msg)
