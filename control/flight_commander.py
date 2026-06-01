@@ -478,11 +478,10 @@ class FlightCommander(rclpy.node.Node):
         """
         Send EKF position setpoint and wait until drone reaches it.
 
-        MAVROS2 Jazzy setpoint_position/local does NOT convert ENU→NED — it
-        passes the message x,y,z directly into SET_POSITION_TARGET_LOCAL_NED.
-        Send NED coordinates: x=north, y=east, z=down (negative = altitude).
-        The vision_pose plugin DOES convert correctly, so ArduPilot's EKF has
-        correct NED positions — the setpoint must match that convention.
+        MAVROS2 Jazzy setpoint_position/local passes PoseStamped x,y,z directly
+        into SET_POSITION_TARGET_LOCAL_NED without ENU→NED conversion (NED
+        passthrough).  The vision_pose plugin DOES convert ENU→NED correctly.
+        Send NED: x=north, y=east, z=down (negative z = altitude above origin).
 
         Distance check uses /drone/state ENU truth (x=East, y=North, z=MSL).
         """
@@ -613,8 +612,8 @@ def main():
         rclpy.spin_once(cmd, timeout_sec=0.1)
         if cmd._drone_state is not None:
             _hold.header.stamp = cmd.get_clock().now().to_msg()
-            _hold.pose.position.x =   cmd._drone_state.pose.position.y        # NED north = ENU north
-            _hold.pose.position.y =   cmd._drone_state.pose.position.x        # NED east  = ENU east
+            _hold.pose.position.x =   cmd._drone_state.pose.position.y        # NED north = ENU y
+            _hold.pose.position.y =   cmd._drone_state.pose.position.x        # NED east  = ENU x
             _hold.pose.position.z = -(cmd._drone_state.pose.position.z - HOME_ALT_MSL)  # NED down = -AGL
             cmd._pos_pub.publish(_hold)
 

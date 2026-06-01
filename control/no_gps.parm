@@ -51,10 +51,10 @@ MOT_THST_HOVER  0.5
 ATC_ANG_RLL_P   1.5     # roll angle P (default 4.5)
 ATC_ANG_PIT_P   1.5     # pitch angle P (default 4.5)
 ATC_RAT_RLL_P   0.10    # roll rate P — raised from 0.04; needed to generate motor differential for tilt
-ATC_RAT_RLL_I   0.02    # roll rate I — small I holds steady-state tilt; safe because PSC_VELXY_I=0
+ATC_RAT_RLL_I   0.0     # roll rate I — zeroed: even 0.02 accumulates over 45 s climb → motor imbalance
 ATC_RAT_RLL_D   0.0     # roll rate D (removed — causes oscillation with kinematic IMU)
 ATC_RAT_PIT_P   0.10    # pitch rate P
-ATC_RAT_PIT_I   0.02    # pitch rate I — same reasoning
+ATC_RAT_PIT_I   0.0     # pitch rate I — zeroed: same reason as roll
 ATC_RAT_PIT_D   0.0     # pitch rate D
 
 # Altitude PID gains — default values are tuned for ~100 Hz physics.
@@ -77,3 +77,8 @@ PSC_VELXY_D     0.0     # horizontal velocity D (removed — unstable at 50 Hz)
 
 # Prevent auto-disarm while debugging takeoff (10 s default causes disarm before liftoff)
 DISARM_DELAY    0
+
+# Crash-check disarm (default 1) fires at ~30 deg tilt during position corrections.
+# Kinematic model + VPE position hold requires tilt angles that exceed this threshold.
+# Disabled here; re-enable on real hardware.
+FS_CRASH_CHECK  0
