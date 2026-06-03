@@ -83,6 +83,14 @@ def _zoom_for_agl(agl_m, lat_deg, img_w=640):
 
 _tile_cache: dict = {}   # (z, tx, ty) → PIL Image, shared across all samples
 
+
+def _is_blank_tile(tile: Image.Image, std_threshold: float = 8.0) -> bool:
+    """Return True if the tile is a gray 'Map data not yet available' placeholder."""
+    import numpy as np
+    arr = np.array(tile, dtype=np.float32)
+    return float(arr.std()) < std_threshold
+
+
 def _fetch_tile(z, tx, ty, retries=3):
     """Download one Esri World Imagery tile, with in-memory cache."""
     key = (z, tx, ty)
@@ -109,9 +117,12 @@ def fetch_esri_image(lat, lon, agl_m, img_w=640, img_h=480):
     Build a nadir-view image centred at (lat, lon) from Esri World Imagery tiles.
 
     The zoom level is chosen so the pixel resolution matches the drone camera
-    footprint at agl_m.  Returns (PIL RGB Image, zoom).
+    footprint at agl_m.  If tiles at the computed zoom are gray 'not available'
+    placeholders, the zoom is decremented until real imagery is found (min zoom 14).
+    Returns (PIL RGB Image, zoom).
     """
     zoom = _zoom_for_agl(agl_m, lat, img_w)
+    min_zoom = 14
 
     # Footprint half-extents in degrees
     half_w_m = agl_m * math.tan(math.radians(HFOV_DEG / 2.0))
@@ -122,39 +133,56 @@ def fetch_esri_image(lat, lon, agl_m, img_w=640, img_h=480):
     north, south = lat + d_lat, lat - d_lat
     west,  east  = lon - d_lon, lon + d_lon
 
-    # Tile range covering the footprint (NW → SE)
-    tx_min, ty_min = _deg2tile(north, west, zoom)
-    tx_max, ty_max = _deg2tile(south, east, zoom)
+    while zoom >= min_zoom:
+        # Tile range covering the footprint (NW → SE)
+        tx_min, ty_min = _deg2tile(north, west, zoom)
+        tx_max, ty_max = _deg2tile(south, east, zoom)
 
-    # Download and stitch
-    nx = tx_max - tx_min + 1
-    ny = ty_max - ty_min + 1
-    mosaic = Image.new('RGB', (nx * TILE_PX, ny * TILE_PX))
-    for tx in range(tx_min, tx_max + 1):
-        for ty in range(ty_min, ty_max + 1):
-            tile = _fetch_tile(zoom, tx, ty)
-            mosaic.paste(tile, ((tx - tx_min) * TILE_PX, (ty - ty_min) * TILE_PX))
+        # Download and stitch
+        nx = tx_max - tx_min + 1
+        ny = ty_max - ty_min + 1
+        mosaic = Image.new('RGB', (nx * TILE_PX, ny * TILE_PX))
+        blank_count = 0
+        for tx in range(tx_min, tx_max + 1):
+            for ty in range(ty_min, ty_max + 1):
+                tile = _fetch_tile(zoom, tx, ty)
+                if _is_blank_tile(tile):
+                    blank_count += 1
+                mosaic.paste(tile, ((tx - tx_min) * TILE_PX, (ty - ty_min) * TILE_PX))
 
-    # Geographic extent of the mosaic
-    nw_lat, nw_lon = _tile2deg(tx_min,     ty_min,     zoom)
-    se_lat, se_lon = _tile2deg(tx_max + 1, ty_max + 1, zoom)
-    lon_span = se_lon - nw_lon
-    lat_span = nw_lat - se_lat   # positive (north − south)
-    mw, mh   = mosaic.size
+        total_tiles = nx * ny
+        if blank_count > total_tiles // 2:
+            print(f"  [zoom {zoom}] {blank_count}/{total_tiles} blank tiles — trying zoom {zoom - 1}")
+            # Evict blank tiles from cache so they are re-fetched at the new zoom
+            for tx in range(tx_min, tx_max + 1):
+                for ty in range(ty_min, ty_max + 1):
+                    _tile_cache.pop((zoom, tx, ty), None)
+            zoom -= 1
+            continue
 
-    # Crop to the exact footprint
-    x1 = int((west  - nw_lon) / lon_span * mw)
-    x2 = int((east  - nw_lon) / lon_span * mw)
-    y1 = int((nw_lat - north) / lat_span * mh)
-    y2 = int((nw_lat - south) / lat_span * mh)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(mw, x2), min(mh, y2)
+        # Geographic extent of the mosaic
+        nw_lat, nw_lon = _tile2deg(tx_min,     ty_min,     zoom)
+        se_lat, se_lon = _tile2deg(tx_max + 1, ty_max + 1, zoom)
+        lon_span = se_lon - nw_lon
+        lat_span = nw_lat - se_lat   # positive (north − south)
+        mw, mh   = mosaic.size
 
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        raise RuntimeError(f"Footprint crop too small at zoom {zoom}: "
-                           f"({x1},{y1})→({x2},{y2}) in {mw}×{mh} mosaic")
+        # Crop to the exact footprint
+        x1 = int((west  - nw_lon) / lon_span * mw)
+        x2 = int((east  - nw_lon) / lon_span * mw)
+        y1 = int((nw_lat - north) / lat_span * mh)
+        y2 = int((nw_lat - south) / lat_span * mh)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(mw, x2), min(mh, y2)
 
-    return mosaic.crop((x1, y1, x2, y2)).resize((img_w, img_h), Image.LANCZOS), zoom
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            raise RuntimeError(f"Footprint crop too small at zoom {zoom}: "
+                               f"({x1},{y1})→({x2},{y2}) in {mw}×{mh} mosaic")
+
+        return mosaic.crop((x1, y1, x2, y2)).resize((img_w, img_h), Image.LANCZOS), zoom
+
+    raise RuntimeError(f"No Esri imagery available for ({lat:.5f}, {lon:.5f}) "
+                       f"down to zoom {min_zoom}")
 
 
 # ── Geo helpers ────────────────────────────────────────────────────────────────
