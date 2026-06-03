@@ -134,7 +134,58 @@ This runs inference only — no ROS2 or MAVROS2 needed.
 
 ---
 
-## 5. Full System on Windows via WSL2
+## 5. Accuracy Benchmark (Esri World Imagery)
+
+`test_accuracy_esri.py` measures localizer accuracy against known ground-truth
+coordinates. It fetches **Esri World Imagery** tiles (no API key required),
+feeds each image to AnyLoc, and reports the Euclidean error in metres between
+the true and estimated position.
+
+**Build the database first** (Section 3), then run from the project root:
+
+```bat
+conda activate anyloc
+python anyloc\test_accuracy_esri.py
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--samples N` | 20 | Number of random test points |
+| `--agl N` | 80 | Drone altitude AGL in metres. Pass `0` to randomise across [60, 120] m |
+| `--seed N` | 42 | Random seed for reproducible test points |
+| `--output FILE` | — | Save full results to a JSON file |
+| `--plot` | off | Show error histogram and spatial error map |
+
+Examples:
+
+```bat
+:: Quick 10-point check at 80 m AGL
+python anyloc\test_accuracy_esri.py --samples 10
+
+:: 50 samples, mixed altitudes, save results, show plot
+python anyloc\test_accuracy_esri.py --samples 50 --agl 0 --output results.json --plot
+```
+
+### Sample output
+
+```
+  #    True lat    True lon     Est lat     Est lon   Err (m)   Score  AGL
+  -----------------------------------------------------------------------
+   1  23.447201  120.282031  23.447650  120.282500      63.2   0.821  80 m
+   2  23.453819  120.290174  23.453400  120.289800      52.7   0.847  80 m
+  ...
+
+  Mean error   :    58.40 m
+  Median error :    55.10 m
+  RMSE         :    64.20 m
+  Std dev      :    26.80 m
+```
+
+---
+
+## 6. Full System on Windows via WSL2
 
 The ROS2 node (`ros2_node.py`) and the complete flight stack require Linux.
 The recommended approach on Windows is **WSL2 with Ubuntu 24.04**.
