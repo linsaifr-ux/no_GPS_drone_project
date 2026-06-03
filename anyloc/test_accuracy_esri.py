@@ -189,9 +189,73 @@ def _stats(values):
                 rmse=rmse, min=min(values), max=max(values))
 
 
+# ── Live viewport ─────────────────────────────────────────────────────────────
+
+class _Viewport:
+    """
+    Live side-by-side window updated after every test sample.
+    Left  — Esri World Imagery at the true coordinate (validation image).
+    Right — AnyLoc database match at the estimated coordinate.
+    """
+
+    def __init__(self, n_samples):
+        import matplotlib
+        matplotlib.use('TkAgg')
+        import matplotlib.pyplot as plt
+        self._plt = plt
+
+        self.fig, (self.ax_val, self.ax_match) = plt.subplots(
+            1, 2, figsize=(12, 5.5))
+        self.fig.canvas.manager.set_window_title('AnyLoc Accuracy Test')
+        self.fig.suptitle(
+            f'AnyLoc Accuracy Test — Esri World Imagery  |  0 / {n_samples}',
+            fontsize=11)
+        for ax in (self.ax_val, self.ax_match):
+            ax.axis('off')
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.01)
+        self._n = n_samples
+
+    def update(self, idx, val_img, match_img,
+               true_lat, true_lon, est_lat, est_lon,
+               err_m, score, agl_m):
+        plt = self._plt
+
+        err_color = ('limegreen' if err_m < 100
+                     else 'orange' if err_m < 250 else 'tomato')
+
+        self.ax_val.clear()
+        self.ax_val.imshow(val_img)
+        self.ax_val.set_title(
+            f"Esri validation image  [{idx} / {self._n}]\n"
+            f"True:  {true_lat:.6f},  {true_lon:.6f}   AGL {agl_m:.0f} m",
+            fontsize=9)
+        self.ax_val.axis('off')
+
+        self.ax_match.clear()
+        self.ax_match.imshow(match_img)
+        self.ax_match.set_title(
+            f"AnyLoc match\n"
+            f"Est:  {est_lat:.6f},  {est_lon:.6f}   "
+            f"Err: {err_m:.1f} m   Score: {score:.3f}",
+            fontsize=9, color=err_color)
+        self.ax_match.axis('off')
+
+        self.fig.suptitle(
+            f'AnyLoc Accuracy Test — Esri World Imagery  |  {idx} / {self._n}',
+            fontsize=11)
+        plt.tight_layout()
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def close(self):
+        self._plt.ioff()
+
+
 # ── Benchmark ──────────────────────────────────────────────────────────────────
 
-def run_benchmark(n_samples, agl_m, seed, output_path, plot):
+def run_benchmark(n_samples, agl_m, seed, output_path, plot, show_viewport):
     rng = random.Random(seed)
 
     sys.path.insert(0, os.path.dirname(HERE))
@@ -229,6 +293,13 @@ def run_benchmark(n_samples, agl_m, seed, output_path, plot):
     results  = []
     errors_m = []
 
+    viewport = None
+    if show_viewport:
+        try:
+            viewport = _Viewport(n_samples)
+        except Exception as exc:
+            print(f"  [viewport] could not open window: {exc}")
+
     for pt in test_points:
         i, true_lat, true_lon, h = pt['idx'], pt['true_lat'], pt['true_lon'], pt['agl_m']
 
@@ -241,7 +312,7 @@ def run_benchmark(n_samples, agl_m, seed, output_path, plot):
 
         # ── AnyLoc localization ───────────────────────────────────────────────
         t0 = time.perf_counter()
-        est_lat, est_lon, _, _match, score, db_idx = loc.localize(img, agl_m=h)
+        est_lat, est_lon, _, match_img, score, db_idx = loc.localize(img, agl_m=h)
         elapsed = time.perf_counter() - t0
 
         # ── Euclidean error in metres ─────────────────────────────────────────
@@ -260,6 +331,14 @@ def run_benchmark(n_samples, agl_m, seed, output_path, plot):
         print(f"  {i:>3}  {true_lat:>10.6f}  {true_lon:>11.6f}  "
               f"{est_lat:>10.6f}  {est_lon:>11.6f}  "
               f"{err_m:>8.1f}  {score:>6.3f}  {h} m")
+
+        if viewport is not None:
+            viewport.update(i, img, match_img,
+                            true_lat, true_lon, est_lat, est_lon,
+                            err_m, score, h)
+
+    if viewport is not None:
+        viewport.close()
 
     if not errors_m:
         print("\nNo successful localizations.")
@@ -360,6 +439,9 @@ def _plot_results(results, st):
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
+    global DB_DIR
+    _default_db = DB_DIR   # snapshot before parse_args touches the global
+
     parser = argparse.ArgumentParser(
         description='AnyLoc accuracy test — Esri World Imagery, no API key required.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -375,11 +457,12 @@ def main():
                         help='Save results to this JSON file (default: none)')
     parser.add_argument('--plot', action='store_true',
                         help='Show error histogram and spatial map after benchmark')
-    parser.add_argument('--db-dir', default=DB_DIR,
-                        help=f'AnyLoc database directory (default: {DB_DIR})')
+    parser.add_argument('--no-viewport', action='store_true',
+                        help='Disable the live side-by-side image viewport')
+    parser.add_argument('--db-dir', default=_default_db,
+                        help=f'AnyLoc database directory (default: {_default_db})')
     args = parser.parse_args()
 
-    global DB_DIR
     DB_DIR = args.db_dir
 
     run_benchmark(
@@ -388,6 +471,7 @@ def main():
         seed=args.seed,
         output_path=args.output or None,
         plot=args.plot,
+        show_viewport=not args.no_viewport,
     )
 
 
