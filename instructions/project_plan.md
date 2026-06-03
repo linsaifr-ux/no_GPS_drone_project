@@ -18,11 +18,13 @@ no_GPS_drone_project/
 │   │                           #   publishes /drone/state (100 Hz) + /drone/camera/image_raw + /drone/pose + /drone/agl
 │   └── run_chiayi.sh           # Launch: sources ROS2 Jazzy, runs in conda env
 ├── anyloc/
-│   ├── build_database.py       # Build VLAD database (run once)
-│   ├── localizer.py            # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
-│   ├── vo_refiner.py           # VORefiner (LK optical flow)
-│   ├── ros2_node.py            # ROS2: sub camera/pose → pub VPE + detections
-│   └── run_ros2_localizer.sh   # Launch script
+│   ├── build_database.py             # Build VLAD database (run once)
+│   ├── localizer.py                  # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
+│   ├── vo_refiner.py                 # VORefiner (LK optical flow)
+│   ├── ros2_node.py                  # ROS2: sub camera/pose → pub VPE + detections
+│   ├── run_ros2_localizer.sh         # Launch script
+│   ├── test_accuracy_esri.py         # accuracy benchmark — random points, Esri imagery
+│   └── test_accuracy_constrained.py  # benchmark — anchor-chain constrained search vs global (no VO)
 ├── detection/
 │   ├── detector.py             # YOLODetector (auto class-map)
 │   └── ros2_node.py            # ROS2: sub /drone/camera → pub /yolo/detections

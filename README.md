@@ -54,12 +54,14 @@ no_GPS_drone_project/
 │   │                         #   publishes /drone/state (100 Hz) + camera + pose + agl
 │   └── run_chiayi.sh         # launch script (sources ROS2 Jazzy before conda)
 ├── anyloc/                   # AnyLoc visual localisation — WORKING
-│   ├── build_database.py     # build VLAD database from satellite orthophoto (run once)
-│   ├── localizer.py          # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
-│   ├── vo_refiner.py         # VORefiner (LK optical flow)
-│   ├── ros2_node.py          # ROS2: pub /anyloc/pose_estimate + /mavros/vision_pose/pose_cov
-│   ├── run_ros2_localizer.sh # launch script (sources ROS2, runs in conda env)
-│   └── database/             # 2821-entry VLAD database (49152-dim, 50 m grid)
+│   ├── build_database.py             # build VLAD database from satellite orthophoto (run once)
+│   ├── localizer.py                  # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
+│   ├── vo_refiner.py                 # VORefiner (LK optical flow)
+│   ├── ros2_node.py                  # ROS2: pub /anyloc/pose_estimate + /mavros/vision_pose/pose_cov
+│   ├── run_ros2_localizer.sh         # launch script (sources ROS2, runs in conda env)
+│   ├── test_accuracy_esri.py         # accuracy benchmark — random points, Esri imagery
+│   ├── test_accuracy_constrained.py  # benchmark — anchor-chain constrained search vs global (no VO)
+│   └── database/                     # 36673-entry VLAD database (49152-dim, 50 m grid)
 ├── detection/                # YOLO — WORKING
 │   ├── detector.py           # YOLODetector (auto-detects COCO / VisDrone class maps)
 │   ├── ros2_node.py          # ROS2: sub /drone/camera → pub /yolo/detections
