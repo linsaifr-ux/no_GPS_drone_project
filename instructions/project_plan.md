@@ -94,7 +94,7 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
 - **Buildings:** Cesium OSM Buildings (asset 96188) — B3DM, ~83 buildings
-- **Imagery:** Taiwan NLSC PHOTO2 orthophoto WMTS (zoom 18, resized to 4096×4096)
+- **Imagery:** Taiwan NLSC PHOTO2 orthophoto WMTS (zoom 18); `satellite_ground.jpg` 11264×11264 px, 0.60 m/px, 28 MB; `MAX_TEX=16384` (raised from 8192 to preserve native resolution)
 - **Physics thread (100 Hz):** `_run_physics()` — kinematic 6-DOF model + `SITLBridge`; publishes `/drone/state`; rate decoupled from render loop
 - **Render loop (~13 Hz):** reads shared kinematic state under lock; updates `/World/Drone` mesh position/orientation; captures nadir camera frames
 - **Motor layout:** ArduCopter X-frame ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
@@ -119,7 +119,14 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 3. Localisation (`anyloc/`)
 
-**Status:** Working — AnyLoc + VO; 2,821-entry database; ~15–20 m anchor error
+**Status:** Working — AnyLoc + VO; 36,673-entry database (60–120 m AGL, step 5 m); ~15–20 m anchor error
+
+**Database build** (`anyloc/build_database.py`) — self-contained, no Isaac Sim required:
+- Downloads NLSC PHOTO2 tiles automatically if `satellite_ground.jpg` missing
+- Multi-AGL: `--agl-min 60 --agl-max 120 --agl-step 5` (13 levels × ~2821 positions)
+- 3-pass memory-safe: crop→disk, sample 2000 for codebook, batch VLADs (peak ~4.5 GB RAM)
+- `db_meta.json` cache: Pass 1 skipped on subsequent `--rebuild` runs
+- Runtime fully offline: `database.pt` + `satellite_ground.jpg` + cached DINOv2 weights
 
 ### 4. Object Detection (`detection/`)
 
@@ -133,7 +140,7 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 
 **Full arming and flight sequence:**
 
-1. Start VPE thread — Phase 1: kinematic position (from `/drone/state`) at 0.1 m² cov; Phase 2: AnyLoc above 50 m AGL
+1. Start VPE thread — Phase 1 (below 50 m AGL): kinematic XY truth from `/drone/state` at 0.1 m² cov (tracks actual position so EKF/controller frame stays consistent with reality); Phase 2 (above 50 m AGL): AnyLoc estimate
 2. Wait for MAVROS2 connection (`/mavros/state.connected`)
 3. Publish EKF origin to `/mavros/global_position/set_gp_origin`; block up to 60 s waiting for GPS_GLOBAL_ORIGIN (msg 49) echo; abort if unconfirmed
 4. Arm in STABILIZE (bypasses GPS/VisOdom pre-arm; only needs IMU attitude)
@@ -171,10 +178,13 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 | `PSC_POSXY_P` | 0.3 | horizontal position P (default 1.0) |
 | `PSC_VELXY_P` | 0.5 | horizontal velocity P (default 2.0) |
 | `PSC_VELXY_I` | 0.0 | horizontal velocity I — zeroed to prevent windup during 90 s climb |
-| `ATC_ANG_RLL_P` | 1.5 | roll angle P (default 4.5 → I-term windup → drift) |
+| `FS_CRASH_CHECK` | 0 | disable crash-detect disarm (kinematic model requires tilt angles that exceed the 30° threshold; re-enable on real hardware) |
+| `ATC_ANG_RLL_P` | 1.5 | roll angle P (default 4.5 → windup → drift) |
 | `ATC_ANG_PIT_P` | 1.5 | pitch angle P |
-| `ATC_RAT_RLL_P/I` | 0.10 / 0.02 | roll rate gains |
-| `ATC_RAT_PIT_P/I` | 0.10 / 0.02 | pitch rate gains |
+| `ATC_RAT_RLL_P` | 0.10 | roll rate P |
+| `ATC_RAT_RLL_I` | 0.0 | roll rate I — **zeroed**: even 0.02 accumulates over 45 s climb → motor imbalance → crash-detect disarm at ~80 m |
+| `ATC_RAT_PIT_P` | 0.10 | pitch rate P |
+| `ATC_RAT_PIT_I` | 0.0 | pitch rate I — zeroed for same reason |
 
 ---
 
@@ -253,7 +263,8 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6j | Fix altitude runaway (EK3_SRC1_POSZ→ExternalNav) + fix 90° course error | Done ✓ |
 | 6k | Fix waypoint direction inversion (MAVROS2 NED passthrough) + altitude drop on hold | Done ✓ |
 | 6l | Integrate kinematic physics into cesium_scene.py (100 Hz thread); eliminate drone_sim.py | Done ✓ |
-| 6k-wp | Waypoints clean run with Isaac Sim physics | WIP |
+| 6m | Fix crash-detect disarm at ~80 m AGL (FS_CRASH_CHECK=0, ATC I-terms=0) | Done ✓ |
+| 6m-wp | Waypoints clean run with Isaac Sim physics | WIP |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

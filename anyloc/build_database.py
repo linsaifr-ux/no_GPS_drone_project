@@ -11,13 +11,17 @@ Run once before starting the localizer:
 
 Options:
     --grid-step 50    grid spacing in metres (default 50)
-    --agl 50          drone AGL in metres (sets footprint size, default 50)
+    --agl-min 60      minimum AGL in metres (default 60)
+    --agl-max 120     maximum AGL in metres (default 120)
+    --agl-step 5      AGL increment in metres (default 5)
     --rebuild         overwrite existing database
 """
 
-import argparse, math, os, sys
+import argparse, io, json, math, os, sys, time
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
+Image.MAX_IMAGE_PIXELS = None   # suppress decompression bomb warning for large satellite mosaics
+import requests
 import torch
 import faiss
 
@@ -52,7 +56,56 @@ def to_latlon(x_enu, y_enu):
     return lat, lon
 
 
-# ── Satellite tile bounds (replicates fetch_satellite() in cesium_scene.py) ───
+# ── NLSC tile download ────────────────────────────────────────────────────────
+
+def fetch_satellite(sat_path, margin_factor=1.5):
+    """Download Taiwan NLSC PHOTO2 orthophoto tiles and stitch to sat_path."""
+    d_lat = RADIUS_M * margin_factor / 111_320.0
+    d_lon = RADIUS_M * margin_factor / (111_320.0 * COS_LAT)
+    tx_min, ty_min = _deg2tile(CENTER_LAT + d_lat, CENTER_LON - d_lon, SAT_ZOOM)
+    tx_max, ty_max = _deg2tile(CENTER_LAT - d_lat, CENTER_LON + d_lon, SAT_ZOOM)
+
+    nx = tx_max - tx_min + 1
+    ny = ty_max - ty_min + 1
+    TILE = 256
+    mosaic = Image.new("RGB", (nx * TILE, ny * TILE))
+
+    print(f"[DB] Downloading {nx}×{ny} NLSC PHOTO2 tiles at zoom {SAT_ZOOM} …")
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "AnyLocDB/1.0"})
+    total = nx * ny
+    done  = 0
+    for tx in range(tx_min, tx_max + 1):
+        for ty in range(ty_min, ty_max + 1):
+            url = (f"https://wmts.nlsc.gov.tw/wmts/PHOTO2/default"
+                   f"/GoogleMapsCompatible/{SAT_ZOOM}/{ty}/{tx}")
+            for attempt in range(3):
+                try:
+                    r = sess.get(url, timeout=15)
+                    r.raise_for_status()
+                    tile = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    mosaic.paste(tile, ((tx - tx_min) * TILE, (ty - ty_min) * TILE))
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"  [DB] skip tile {tx},{ty}: {e}")
+                    else:
+                        time.sleep(0.5)
+            done += 1
+            if done % 20 == 0 or done == total:
+                print(f"  [DB] tiles: {done}/{total}")
+            time.sleep(0.03)
+
+    MAX_TEX = 16384
+    if mosaic.width > MAX_TEX or mosaic.height > MAX_TEX:
+        scale = MAX_TEX / max(mosaic.width, mosaic.height)
+        mosaic = mosaic.resize((int(mosaic.width * scale), int(mosaic.height * scale)),
+                               Image.LANCZOS)
+    mosaic.save(sat_path, "JPEG", quality=92)
+    print(f"[DB] Satellite saved: {mosaic.width}×{mosaic.height} → {sat_path}")
+
+
+# ── Satellite tile bounds ─────────────────────────────────────────────────────
 
 def _deg2tile(lat, lon, z):
     n  = 1 << z
@@ -205,8 +258,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--grid-step', type=float, default=50.0,
                     help='Grid spacing in metres (default 50)')
-    ap.add_argument('--agl', type=float, default=50.0,
-                    help='Drone AGL in metres for footprint calculation (default 50)')
+    ap.add_argument('--agl-min',  type=float, default=60.0,
+                    help='Minimum AGL in metres (default 60)')
+    ap.add_argument('--agl-max',  type=float, default=120.0,
+                    help='Maximum AGL in metres (default 120)')
+    ap.add_argument('--agl-step', type=float, default=5.0,
+                    help='AGL step in metres (default 5)')
     ap.add_argument('--rebuild', action='store_true',
                     help='Rebuild even if database.pt already exists')
     args = ap.parse_args()
@@ -216,66 +273,103 @@ def main():
         print(f"[DB] {db_file} already exists.  Use --rebuild to regenerate.")
         return
 
-    # Load satellite image
+    agl_levels = np.arange(args.agl_min, args.agl_max + 1e-6, args.agl_step).tolist()
+    print(f"[DB] AGL levels: {[f'{a:.0f}' for a in agl_levels]} m  ({len(agl_levels)} levels)")
+
+    # Load satellite image — download from NLSC if not already on disk
     sat_path = os.path.join(SIM_DIR, 'satellite_ground.jpg')
     if not os.path.exists(sat_path):
-        sys.exit(f"[DB] Satellite image not found: {sat_path}\n"
-                 "     Run simulator/cesium_scene.py once to download it.")
+        fetch_satellite(sat_path)
     sat_img = Image.open(sat_path).convert('RGB')
     bounds  = compute_sat_bounds()
     print(f"[DB] Satellite: {sat_img.size[0]}×{sat_img.size[1]}")
     print(f"[DB] Bounds:  {bounds['nw_lat']:.5f}°N – {bounds['se_lat']:.5f}°N  "
           f"{bounds['nw_lon']:.5f}°E – {bounds['se_lon']:.5f}°E")
 
-    # Grid positions (filter to a circle that fits inside the satellite image)
+    # Grid positions (same XY grid reused for every AGL level)
     step  = args.grid_step
-    agl   = args.agl
     limit = RADIUS_M * 0.75
     coords = [(x, y)
               for x in np.arange(-limit, limit + 1, step)
               for y in np.arange(-limit, limit + 1, step)
               if math.hypot(x, y) <= limit]
-    print(f"[DB] Grid step={step} m  AGL={agl} m  →  {len(coords)} positions")
+    print(f"[DB] Grid step={step} m  →  {len(coords)} positions × {len(agl_levels)} AGL = "
+          f"{len(coords) * len(agl_levels)} entries max")
 
-    # Crop and save database images
+    # ── Pass 1: crop → disk (skipped if metadata cache exists) ──────────────
+    meta_file = os.path.join(DB_DIR, 'db_meta.json')
     os.makedirs(IMG_DIR, exist_ok=True)
-    db_lats, db_lons, db_alts = [], [], []
-    db_images = []
-    skipped   = 0
-    for x_enu, y_enu in coords:
-        lat, lon = to_latlon(x_enu, y_enu)
-        crop = get_satellite_crop(sat_img, bounds, lat, lon, agl)
-        if crop is None:
-            skipped += 1
-            continue
-        idx = len(db_images)
-        crop.save(os.path.join(IMG_DIR, f'{idx:06d}.jpg'), 'JPEG', quality=90)
-        db_lats.append(lat)
-        db_lons.append(lon)
-        db_alts.append(agl)
-        db_images.append(crop)
-    print(f"[DB] Cropped {len(db_images)} patches  ({skipped} outside bounds)")
 
-    if len(db_images) < VLAD_K:
-        sys.exit(f"[DB] Too few images ({len(db_images)}) to build a k={VLAD_K} codebook. "
-                 "Reduce --grid-step or --agl.")
+    if os.path.exists(meta_file) and not args.rebuild:
+        print(f"[DB] Loading existing crop metadata from {meta_file}")
+        with open(meta_file) as f:
+            meta = json.load(f)
+        db_lats  = meta['lats']
+        db_lons  = meta['lons']
+        db_alts  = meta['alts']
+        db_paths = meta['paths']
+        print(f"[DB] Loaded {len(db_paths)} entries from cache")
+    else:
+        db_lats, db_lons, db_alts, db_paths = [], [], [], []
+        skipped = 0
+        for agl in agl_levels:
+            level_count = 0
+            for x_enu, y_enu in coords:
+                lat, lon = to_latlon(x_enu, y_enu)
+                crop = get_satellite_crop(sat_img, bounds, lat, lon, agl)
+                if crop is None:
+                    skipped += 1
+                    continue
+                path = os.path.join(IMG_DIR, f'{len(db_paths):06d}.jpg')
+                crop.save(path, 'JPEG', quality=90)
+                db_lats.append(lat); db_lons.append(lon)
+                db_alts.append(agl); db_paths.append(path)
+                level_count += 1
+            print(f"[DB]   AGL={agl:.0f} m → {level_count} crops")
+        print(f"[DB] Total: {len(db_paths)} patches  ({skipped} outside bounds)")
+        with open(meta_file, 'w') as f:
+            json.dump({'lats': db_lats, 'lons': db_lons,
+                       'alts': db_alts, 'paths': db_paths}, f)
+        print(f"[DB] Metadata saved → {meta_file}")
 
-    # DINOv2 features (returned as torch CPU tensors)
+    n_total = len(db_paths)
+
+    if n_total < VLAD_K:
+        sys.exit(f"[DB] Too few images ({n_total}) for k={VLAD_K} codebook.")
+
+    # ── DINOv2 model ──────────────────────────────────────────────────────────
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model  = load_dino(device)
-    print(f"[DB] Extracting patch features …")
-    all_feats = extract_features(db_images, model, device)
 
-    # VLAD codebook
-    codebook = build_codebook(all_feats, k=VLAD_K)
+    # ── Pass 2: sample → codebook (load CODEBOOK_SAMPLE images, discard after) ─
+    CODEBOOK_SAMPLE = 2000
+    import random
+    sample_paths = random.sample(db_paths, min(CODEBOOK_SAMPLE, n_total))
+    print(f"[DB] Codebook sample: {len(sample_paths)} images …")
+    sample_imgs  = [Image.open(p).convert('RGB') for p in sample_paths]
+    sample_feats = extract_features(sample_imgs, model, device)
+    del sample_imgs
+    codebook = build_codebook(sample_feats, k=VLAD_K)
+    del sample_feats
     print(f"[DB] Codebook: {tuple(codebook.shape)}")
 
-    # VLAD descriptors for all database images
+    # ── Pass 3: all images → VLADs in batches (one batch in RAM at a time) ────
+    BATCH = 8
     print(f"[DB] Computing VLAD descriptors …")
-    vlads = torch.stack([compute_vlad(f, codebook) for f in all_feats])
+    vlad_list = []
+    for i in range(0, n_total, BATCH):
+        batch_imgs  = [Image.open(p).convert('RGB') for p in db_paths[i:i + BATCH]]
+        batch_feats = extract_features(batch_imgs, model, device, batch=BATCH)
+        for f in batch_feats:
+            vlad_list.append(compute_vlad(f, codebook))
+        del batch_imgs, batch_feats
+        done = min(i + BATCH, n_total)
+        if done % 500 < BATCH or done == n_total:
+            print(f"  vlad: {done}/{n_total}")
+    vlads = torch.stack(vlad_list)
     print(f"[DB] VLAD matrix: {tuple(vlads.shape)}  (dim={vlads.shape[1]})")
 
-    # Save using torch.save (avoids numpy savez issues)
+    # ── Save ──────────────────────────────────────────────────────────────────
     os.makedirs(DB_DIR, exist_ok=True)
     torch.save({
         'lats':     torch.tensor(db_lats, dtype=torch.float32),
@@ -285,7 +379,7 @@ def main():
         'codebook': codebook,
     }, db_file)
     print(f"[DB] Saved → {db_file}")
-    print(f"[DB] Done: {len(db_lats)} entries, VLAD dim={vlads.shape[1]}")
+    print(f"[DB] Done: {n_total} entries, VLAD dim={vlads.shape[1]}")
 
 
 if __name__ == '__main__':

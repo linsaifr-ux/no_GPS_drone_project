@@ -35,4 +35,5 @@ ros2 run mavros mavros_node \
     -p tgt_system:=1 \
     -p tgt_component:=1 \
     -p log_output:="screen" \
-    -p fcu_protocol:="v2.0"
+    -p fcu_protocol:="v2.0" \
+    -p plugin_denylist:="['param']"

@@ -322,7 +322,7 @@ def fetch_satellite(margin_factor=1.5):
                     else: time.sleep(0.5)
             time.sleep(0.03)
     # RTX renderer caps usable texture size at ~8192; resize if larger
-    MAX_TEX = 8192
+    MAX_TEX = 16384
     if mosaic.width > MAX_TEX or mosaic.height > MAX_TEX:
         scale = MAX_TEX / max(mosaic.width, mosaic.height)
         new_w, new_h = int(mosaic.width * scale), int(mosaic.height * scale)

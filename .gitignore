@@ -99,3 +99,7 @@ instructions/report/*.aux
 instructions/report/*.log
 instructions/report/*.out
 instructions/report/*.toc
+
+# ArduPilot crash dumps (written to project root by SITL)
+dumpcore.sh_*.out
+dumpstack.sh_*.out

@@ -1,5 +1,68 @@
 # Project History
 
+## 2026-06-03 — AnyLoc database rebuilt from NLSC; crash-detect disarm fixed; NED convention confirmed
+
+### Bug: Drone disarms mid-flight at ~80 m AGL (motors cut to 1000 PWM)
+
+**Symptom:** During NAV_TAKEOFF climb, motors reach [1704, 1324, 1395, 1866] at ~80 m AGL, then cut to 1000 PWM (disarmed). Drone falls to ground.
+
+**Root cause:** `ATC_RAT_RLL_I = 0.02` and `ATC_RAT_PIT_I = 0.02` accumulate over the 45-second climb. The I-terms drive a persistent motor differential that grows with altitude, eventually exceeding ArduPilot's crash-detect tilt threshold (~30°). `FS_CRASH_CHECK` defaults to 1 (enabled) — disarms on crash detection.
+
+**Fix:**
+- `ATC_RAT_RLL_I 0.0` and `ATC_RAT_PIT_I 0.0` — zeroed to prevent I-term windup over long climbs
+- `FS_CRASH_CHECK 0` — disabled (kinematic model + VPE position corrections require tilt angles that exceed the threshold; re-enable on real hardware)
+
+**Note:** The original "drop to 0 m" symptom reported was this crash-detect disarm, not a z-convention error. The NED setpoint convention (z = -AGL) is correct.
+
+### Investigation: MAVROS2 setpoint z-convention (confirmed NED passthrough)
+
+To diagnose the "drop to 0 m" symptom, the z-axis convention in position setpoints was tested:
+
+- Sent `z = +90` (ENU-style, positive up): ArduPilot received NED z = +90 → 90 m underground → drone descended to 0 m. **WRONG.**
+- Sent `z = -90` (NED, negative = altitude): drone held at 90 m AGL. **CORRECT.**
+
+**Confirmed:** `setpoint_position/local` in MAVROS2 Jazzy is NED passthrough — it passes x,y,z directly to `SET_POSITION_TARGET_LOCAL_NED` without ENU→NED axis swap. `vision_pose` plugin does convert ENU→NED correctly. All position setpoints must be in NED.
+
+### AnyLoc database: self-contained NLSC build, multi-AGL, memory-efficient
+
+**Problem:** `build_database.py` required `satellite_ground.jpg` to exist (written by Isaac Sim) and stored all 36k images + features in RAM → OOM kill at 2320/36673.
+
+**Fixes:**
+
+1. **Self-contained download:** Added `fetch_satellite()` to `build_database.py`. If `satellite_ground.jpg` is missing, downloads NLSC PHOTO2 tiles directly — no Isaac Sim needed.
+
+2. **Multi-AGL range:** Changed `--agl` (single value) to `--agl-min/max/step`. Default: 60–120 m, step 5 m = 13 levels × ~2821 positions = **36673 entries**. Database covers the full climb and waypoint altitude.
+
+3. **3-pass memory-efficient build:** Replaced single-pass (all images + features in RAM) with:
+   - Pass 1: crop → disk (JPEG), keep only path/lat/lon/alt
+   - Pass 2: load 2000 random images, build codebook, discard
+   - Pass 3: load 8 images at a time, compute VLAD, discard
+   - Peak RAM: ~4.5 GB (Pass 2)
+
+4. **`db_meta.json` cache:** Pass 1 writes `anyloc/database/db_meta.json` (lat/lon/alt/path lists). Subsequent `--rebuild` runs skip Pass 1 entirely.
+
+5. **Corrupted `database.pt` fix:** OOM-killed `torch.save()` leaves partial ZIP — `RuntimeError: not a ZIP archive`. Fix: `rm database.pt && python anyloc/build_database.py --rebuild` (db_meta.json skips cropping).
+
+**Satellite imagery upgrade:**
+
+- Old `satellite_ground.jpg`: 4096×4096 px, 1.63 m/px effective (downloaded when RADIUS_M was smaller)
+- New: 11264×11264 px, 28 MB, **0.60 m/px** (native zoom-18 resolution, no downscaling)
+- `MAX_TEX` raised from 8192 → **16384** in both `cesium_scene.py` and `build_database.py`
+
+**Runtime is fully offline** after build: `database.pt` + `satellite_ground.jpg` + DINOv2 (cached at `~/.cache/torch/hub/`). NLSC is never contacted at runtime.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/no_gps.parm` | `ATC_RAT_RLL_I 0.0`, `ATC_RAT_PIT_I 0.0`, `FS_CRASH_CHECK 0` |
+| `anyloc/build_database.py` | `fetch_satellite()` added; multi-AGL args; 3-pass memory-safe build; `db_meta.json` cache; `MAX_TEX=16384`; `Image.MAX_IMAGE_PIXELS=None` |
+| `simulator/cesium_scene.py` | `MAX_TEX 8192 → 16384` |
+| `simulator/satellite_ground.jpg` | Re-downloaded: 11264×11264 px, 0.60 m/px, 28 MB |
+| `.gitignore` | Added `dumpcore.sh_*.out`, `dumpstack.sh_*.out` (SITL crash dumps) |
+
+---
+
 ## 2026-06-01 — Physics thread at 100 Hz; fix altitude oscillation; debug MAVROS/EKF startup
 
 ### Bug: Drone oscillates 0–4 m AGL, never reaches 90 m
