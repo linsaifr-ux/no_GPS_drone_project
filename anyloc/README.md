@@ -282,6 +282,17 @@ constraint: values above ~90 % indicate the anchor-chain is stable.
 
 #### Interpreting the results
 
+**RMSE vs mean error:**
+RMSE (Root Mean Square Error) squares each per-step error before averaging,
+so a single badly-drifted step raises it far more than it raises the mean.
+It is the primary accuracy metric because it is sensitive to the outlier steps
+that matter most in practice — a localizer that is usually good but occasionally
+wildly wrong is dangerous for flight control.  Mean error masks those outliers.
+
+Concretely: `RMSE = sqrt( mean( error_m² ) )`.  A constrained RMSE lower than
+the global RMSE means the anchor-chain not only improves typical accuracy but
+also reduces catastrophic mismatches.
+
 **Accuracy (`Err_const − Err_glob`):**
 - Negative delta (constrained < global) — restricting the search eliminated
   far-away false positives; the closest correct match won.
