@@ -32,7 +32,7 @@ Autonomous drone system that localises itself and detects objects without GPS, v
                          │   (VISION_POSITION_ESTIMATE → EKF3)
                     MAVROS2
                          ▲
-                         │ /mavros/setpoint_position/local  (NED coords — MAVROS2 passes through)
+                         │ /mavros/setpoint_raw/local  (PositionTarget FRAME_LOCAL_NED — explicit NED)
                     flight_commander.py
                     (arm → NAV_TAKEOFF → waypoints → RTL)
 ```
@@ -108,7 +108,9 @@ no_GPS_drone_project/
 | 6j | Fix altitude runaway (EK3_SRC1_POSZ→6) + fix 90° course error (motor layout) | Done ✓ |
 | 6k | Fix waypoint direction inversion (MAVROS2 NED passthrough) + altitude drop | Done ✓ |
 | 6l | Integrate kinematic physics into cesium_scene.py (100 Hz thread); eliminate drone_sim.py | Done ✓ |
-| 6k-wp | Waypoints clean run — verify with Isaac Sim physics | WIP |
+| 6m | Fix crash-detect disarm at ~80 m AGL (FS_CRASH_CHECK=0, ATC I-terms=0) | Done ✓ |
+| 6n | database.pt truncation fix (_safe_save + split files); setpoint_raw/local FRAME_LOCAL_NED; launch scripts | Done ✓ |
+| 6m-wp | Waypoints clean run — setpoint direction resolved; end-to-end run pending | WIP |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline integrated in simulation | TODO |
@@ -157,10 +159,18 @@ cd ../..
 ## Run order — with Isaac Sim (standard)
 
 ```bash
-# T1 — Isaac Sim (physics + visualiser; writes home_elevation.json; start first)
+# Quickest: use the top-level tmux launcher
+bash run.sh --tmux          # normal run
+bash run.sh --tmux --wipe   # first run or after parameter change (auto-sends reboot)
+
+# Or manually (cesium_scene.py MUST start before SITL to open UDP 9002 first):
+
+# T1 — Isaac Sim (physics + visualiser; writes home_elevation.json; start FIRST)
 cd simulator && ./run_chiayi.sh
 
 # T2 — ArduPilot SITL (start after Isaac Sim is showing the scene)
+bash control/launch_sitl.sh
+# or manually:
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild \
     -l 23.450868,120.286135,28.17,0 \
@@ -170,15 +180,15 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
 # T3 — MAVROS2
 bash control/launch_mavros.sh
 
-# T4 — AnyLoc localiser
+# T4 — AnyLoc localiser (startup ~20 min; use python3 -u for unbuffered output)
 ./anyloc/run_ros2_localizer.sh
 
 # T5 — Flight commander
-source /opt/ros/jazzy/setup.bash
-python3 control/flight_commander.py
+bash control/launch_commander.sh
+# or: source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 ```
 
-> **Note:** Isaac Sim now owns the physics bridge (UDP 9002). Do **not** run `drone_sim.py` when Isaac Sim is running — both would try to bind UDP 9002.
+> **Note:** Isaac Sim owns the physics bridge (UDP 9002). Do **not** run `drone_sim.py` when Isaac Sim is running — both would try to bind UDP 9002. Always start `cesium_scene.py` before SITL.
 
 ## Run order — headless (no Isaac Sim)
 
@@ -234,8 +244,10 @@ Motor layout (ArduCopter X-frame FRAME_TYPE=1): ch1=FR(NE), ch2=RL(SW), ch3=RR(S
 
 ### MAVROS2 setpoint coordinate convention
 
-MAVROS2 Jazzy's `setpoint_position/local` plugin passes `PoseStamped` x,y,z directly into `SET_POSITION_TARGET_LOCAL_NED` **without** ENU→NED axis conversion (the `vision_pose` plugin does convert correctly). Position setpoints in `flight_commander.py` therefore send **NED coordinates** directly:
-- `x = north`, `y = east`, `z = down` (negative value = altitude)
+`flight_commander.py` uses `setpoint_raw/local` with a `PositionTarget` message and `coordinate_frame = FRAME_LOCAL_NED` (= 1). This is an unambiguous direct passthrough to `SET_POSITION_TARGET_LOCAL_NED` with no coordinate conversion in MAVROS2:
+- `position.x = north`, `position.y = east`, `position.z = down` (negative value = altitude above origin)
+
+`setpoint_position/local` (`PoseStamped`) was abandoned because its coordinate-frame behaviour in MAVROS2 Jazzy was ambiguous in practice even after NED passthrough was confirmed for the z-axis.
 
 ### VPE (vision position estimate)
 

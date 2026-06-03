@@ -119,6 +119,10 @@ class AnyLocLocalizer:
                 "  conda run -n isaac_sim_test python anyloc/build_database.py"
             )
         db = torch.load(db_file, map_location='cpu', weights_only=False)
+        if db.get('_split'):
+            meta  = torch.load(db['meta'],   map_location='cpu', weights_only=False)
+            vlads = torch.load(db['vlads'],  map_location='cpu', weights_only=False)
+            db = {**meta, 'vlads': vlads}
         self.lats     = db['lats']       # (N,) float32 tensor
         self.lons     = db['lons']
         self.alts     = db['alts']

@@ -367,17 +367,44 @@ def main():
         if done % 500 < BATCH or done == n_total:
             print(f"  vlad: {done}/{n_total}")
     vlads = torch.stack(vlad_list)
+    del vlad_list
     print(f"[DB] VLAD matrix: {tuple(vlads.shape)}  (dim={vlads.shape[1]})")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # Free GPU model memory before the large disk write
+    del model
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+
+    # ── Save ─────────────────────────────────────────────────────────────────────
+    # PyTorch's miniz has a signed-32-bit overflow bug when the file path contains
+    # multibyte (non-ASCII) characters — it silently caps writes at 2 GB.
+    # Workaround: save to /tmp (ASCII path) then move into place.
+    import shutil, tempfile
     os.makedirs(DB_DIR, exist_ok=True)
-    torch.save({
+    meta_pt  = db_file.replace('database.pt', 'database_meta.pt')
+    vlads_pt = db_file.replace('database.pt', 'database_vlads.pt')
+
+    def _safe_save(obj, dst):
+        tmp = tempfile.mktemp(suffix='.pt', dir='/tmp')
+        torch.save(obj, tmp)
+        shutil.move(tmp, dst)
+
+    _safe_save({
         'lats':     torch.tensor(db_lats, dtype=torch.float32),
         'lons':     torch.tensor(db_lons, dtype=torch.float32),
         'alts':     torch.tensor(db_alts, dtype=torch.float32),
-        'vlads':    vlads,
         'codebook': codebook,
-    }, db_file)
+    }, meta_pt)
+    print(f"[DB] Meta saved → {meta_pt}  ({os.path.getsize(meta_pt)/1e6:.1f} MB)")
+
+    _safe_save(vlads, vlads_pt)
+    saved_size = os.path.getsize(vlads_pt)
+    expected   = vlads.numel() * 4
+    print(f"[DB] VLADs saved → {vlads_pt}  ({saved_size/1e9:.2f} GB, expected ~{expected/1e9:.2f} GB)")
+    if saved_size < expected * 0.99:
+        raise RuntimeError(f"database_vlads.pt is truncated: {saved_size} < {expected}")
+
+    _safe_save({'_split': True, 'meta': meta_pt, 'vlads': vlads_pt}, db_file)
     print(f"[DB] Saved → {db_file}")
     print(f"[DB] Done: {n_total} entries, VLAD dim={vlads.shape[1]}")
 

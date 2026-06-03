@@ -61,7 +61,7 @@ ArduPilot SITL
                 │           └── /uas1/mavlink_source (BEST_EFFORT)
                 │               EKF origin confirm (msg 49) + EKF status (msg 193) + motor PWM (msg 36)
                 ├─ /mavros/global_position/set_gp_origin → SET_GPS_GLOBAL_ORIGIN
-                ├─ /mavros/setpoint_position/local  → SET_POSITION_TARGET_LOCAL_NED (NED coords)
+                ├─ /mavros/setpoint_raw/local (PositionTarget FRAME_LOCAL_NED) → SET_POSITION_TARGET_LOCAL_NED
                 └─ MAV_CMD_NAV_TAKEOFF              → ArduPilot altitude controller
 ```
 
@@ -72,7 +72,7 @@ ArduPilot SITL
 | Isaac Sim / ENU | East | North | Up | cesium_scene.py, /drone/state, vision_pose VPE |
 | ArduPilot NED | North | East | Down (−=alt) | SET_POSITION_TARGET_LOCAL_NED, VISION_POSITION_ESTIMATE |
 | MAVROS2 vision_pose | ENU in, NED out | | | converts correctly |
-| MAVROS2 setpoint_position/local | **NED passthrough** | | | does NOT convert; send NED directly |
+| MAVROS2 setpoint_raw/local (PositionTarget) | **explicit FRAME_LOCAL_NED** | | | unambiguous NED; x=north, y=east, z=down |
 
 ### Port map
 
@@ -151,8 +151,8 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 9. Send waypoint position setpoints in NED; wait until within 5 m radius
 10. RTL on Ctrl-C
 
-**MAVROS2 setpoint coordinate bug:**  
-`setpoint_position/local` plugin in MAVROS2 Jazzy passes coordinates **directly** into `SET_POSITION_TARGET_LOCAL_NED` without ENU→NED axis swap. Position setpoints must be sent in NED: `x=north, y=east, z=down` (negative = altitude above origin).
+**MAVROS2 setpoint coordinate — final fix:**  
+`setpoint_position/local` (`PoseStamped`) showed ambiguous behaviour in MAVROS2 Jazzy even after confirming NED passthrough. Switched to `setpoint_raw/local` with `PositionTarget` and `coordinate_frame = FRAME_LOCAL_NED` (= 1). This is an unambiguous direct passthrough — MAVROS passes `x=north, y=east, z=down` directly to `SET_POSITION_TARGET_LOCAL_NED` with no coordinate conversion. `z` is NED down; negative = altitude above origin.
 
 **VPE covariance design:**
 - `frame_id = "map"` (ENU): x = East, y = North, z = Up — the `vision_pose` plugin converts correctly to NED
@@ -193,10 +193,18 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 ### With Isaac Sim (standard)
 
 ```bash
-# T1 — Isaac Sim (physics + visualiser; writes home_elevation.json; start first)
+# Quickest: use the top-level tmux launcher
+bash run.sh --tmux          # normal run
+bash run.sh --tmux --wipe   # first run or parameter change (auto-sends reboot)
+
+# Or manually:
+
+# T1 — Isaac Sim (physics + visualiser; start FIRST — must open UDP 9002 before SITL)
 cd simulator && ./run_chiayi.sh
 
 # T2 — ArduPilot SITL
+bash control/launch_sitl.sh          # uses arducopter binary directly; MAVProxy --out udp:127.0.0.1:14550
+# or manually:
 python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
     -v ArduCopter --model=JSON --no-rebuild \
     -l 23.450868,120.286135,28.17,0 \
@@ -206,14 +214,16 @@ python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
 # T3 — MAVROS2
 bash control/launch_mavros.sh
 
-# T4 — AnyLoc
+# T4 — AnyLoc (startup ~20 min; use python3 -u for unbuffered output; check ros2 node list)
 ./anyloc/run_ros2_localizer.sh
 
 # T5 — Flight commander
-source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
+bash control/launch_commander.sh
+# or: source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 ```
 
 > Do **not** run `drone_sim.py` alongside `cesium_scene.py` — both bind UDP 9002.
+> Start `cesium_scene.py` **before** SITL so UDP 9002 is open when ArduPilot starts.
 
 ### Headless (no Isaac Sim)
 
@@ -264,7 +274,8 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6k | Fix waypoint direction inversion (MAVROS2 NED passthrough) + altitude drop on hold | Done ✓ |
 | 6l | Integrate kinematic physics into cesium_scene.py (100 Hz thread); eliminate drone_sim.py | Done ✓ |
 | 6m | Fix crash-detect disarm at ~80 m AGL (FS_CRASH_CHECK=0, ATC I-terms=0) | Done ✓ |
-| 6m-wp | Waypoints clean run with Isaac Sim physics | WIP |
+| 6n | database.pt truncation fix (_safe_save + split files); setpoint_raw/local FRAME_LOCAL_NED; launch scripts | Done ✓ |
+| 6m-wp | Waypoints clean run with Isaac Sim physics (setpoint direction resolved; end-to-end run pending) | WIP |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |

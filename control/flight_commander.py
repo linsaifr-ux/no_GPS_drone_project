@@ -41,7 +41,7 @@ import rclpy.node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from mavros_msgs.msg import Mavlink, State
+from mavros_msgs.msg import Mavlink, PositionTarget, State
 from mavros_msgs.srv import CommandBool, CommandLong, CommandTOL, SetMode
 
 _SENSOR_QOS = QoSProfile(
@@ -128,7 +128,7 @@ class FlightCommander(rclpy.node.Node):
 
         # Publishers
         self._pos_pub    = self.create_publisher(
-            PoseStamped, "/mavros/setpoint_position/local", 1)
+            PositionTarget, "/mavros/setpoint_raw/local", 1)
         self._vpe_pub    = self.create_publisher(
             PoseWithCovarianceStamped, "/mavros/vision_pose/pose_cov", 1)
         self._origin_pub = self.create_publisher(
@@ -498,22 +498,25 @@ class FlightCommander(rclpy.node.Node):
         """
         Send EKF position setpoint and wait until drone reaches it.
 
-        MAVROS2 Jazzy setpoint_position/local passes PoseStamped x,y,z directly
-        into SET_POSITION_TARGET_LOCAL_NED without ENU→NED conversion (NED
-        passthrough).  The vision_pose plugin DOES convert ENU→NED correctly.
-        Send NED: x=north, y=east, z=down (negative z = altitude above origin).
+        Uses setpoint_raw/local with MAV_FRAME_LOCAL_NED so MAVROS passes
+        x,y,z directly to ArduPilot with no coordinate conversion.
+        NED: x=north, y=east, z=down (negative z = above origin).
+        The vision_pose plugin converts ENU→NED correctly.
 
         Distance check uses /drone/state ENU truth (x=East, y=North, z=MSL).
         """
-        # setpoint_position/local uses ENU frame: x=East, y=North, z=Up.
-        # Waypoint is given in NED (north, east, down=-altitude).
-        # Convert: sp_x=East, sp_y=North, sp_z=+altitude (Up).
-        msg = PoseStamped()
-        msg.header.frame_id = "map"
-        msg.pose.orientation.w = 1.0
-        sp_x =  east    # ENU x = East
-        sp_y =  north   # ENU y = North
-        sp_z = -down    # ENU z = Up = +altitude
+        # Use setpoint_raw/local with MAV_FRAME_LOCAL_NED (frame=1) so MAVROS
+        # passes x,y,z directly to ArduPilot without any ENU↔NED conversion.
+        # type_mask: ignore velocity, accel, yaw, yaw_rate (position-only).
+        msg = PositionTarget()
+        msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED   # = 1
+        msg.type_mask = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
+                         PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
+                         PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                         PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+        msg.position.x = float(north)   # NED x = North
+        msg.position.y = float(east)    # NED y = East
+        msg.position.z = float(down)    # NED z = Down  (negative = above origin)
 
         target_agl = -down   # AGL metres
 
@@ -522,10 +525,7 @@ class FlightCommander(rclpy.node.Node):
 
         try:
             while time.time() < deadline:
-                msg.header.stamp    = self.get_clock().now().to_msg()
-                msg.pose.position.x = sp_x
-                msg.pose.position.y = sp_y
-                msg.pose.position.z = sp_z
+                msg.header.stamp = self.get_clock().now().to_msg()
                 self._pos_pub.publish(msg)
                 rclpy.spin_once(self, timeout_sec=0.1)
 
@@ -626,20 +626,23 @@ def main():
     # be near 0,0 since we took off from home); fall back to exact home if the
     # topic is momentarily unavailable.  Altitude is latched from TAKEOFF_ALT —
     # more reliable than recomputing from MSL each iteration.
-    # drone_state is ENU (x=East, y=North). Hold at current horizontal, 90m Up.
+    # drone_state is ENU (x=East, y=North). Hold at current horizontal position.
     if cmd._drone_state is not None:
-        _hold_east  = cmd._drone_state.pose.position.x   # ENU x = East
-        _hold_north = cmd._drone_state.pose.position.y   # ENU y = North
+        _hold_north = cmd._drone_state.pose.position.y   # ENU y = North → NED x
+        _hold_east  = cmd._drone_state.pose.position.x   # ENU x = East  → NED y
     else:
-        _hold_east, _hold_north = 0.0, 0.0
+        _hold_north, _hold_east = 0.0, 0.0
 
-    # PoseStamped ENU: x=East, y=North, z=Up (+90 m)
-    _hold = PoseStamped()
-    _hold.header.frame_id = "map"
-    _hold.pose.orientation.w = 1.0
-    _hold.pose.position.x =  _hold_east    # ENU East
-    _hold.pose.position.y =  _hold_north   # ENU North
-    _hold.pose.position.z =  TAKEOFF_ALT   # ENU Up = +90 m
+    _IGNORE = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
+               PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
+               PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+               PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+    _hold = PositionTarget()
+    _hold.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+    _hold.type_mask        = _IGNORE
+    _hold.position.x       = float(_hold_north)   # NED North
+    _hold.position.y       = float(_hold_east)    # NED East
+    _hold.position.z       = -TAKEOFF_ALT         # NED Down (negative = above home)
 
     # Hold for 10 s — publish on every iteration so there is never a gap.
     print(f"[Commander] Holding 10 s at {TAKEOFF_ALT:.0f} m …")

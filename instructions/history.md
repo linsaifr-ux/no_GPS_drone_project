@@ -63,6 +63,97 @@ To diagnose the "drop to 0 m" symptom, the z-axis convention in position setpoin
 
 ---
 
+## 2026-06-03 (continued) — database.pt truncation bug; AnyLoc node startup; launch scripts; setpoint_raw/local fix
+
+### Bug: database.pt silently truncated to ~2.1 GB (PyTorch/miniz multibyte-path overflow)
+
+**Symptom:** Every rebuild produced a `database.pt` of ~2.1 GB instead of the expected ~7.2 GB. Loading it gave a FAISS index with far fewer entries than 36673, or a silent partial load.
+
+**Root cause:** PyTorch bundles the `miniz` compression library. When the output file path contains multibyte UTF-8 characters (the project lives under `文件/`), a signed 32-bit integer overflow in miniz silently caps writes at ~2 GB and returns success — no exception is raised.
+
+**Fix in `anyloc/build_database.py`:**
+- Added `_safe_save(obj, dest_path)` helper: saves to `tempfile.mktemp(dir='/tmp')` (ASCII path, no overflow risk) then uses `shutil.move()` to the final destination.
+- Split the save into two files to keep each well under the 2 GB limit:
+  - `database_meta.pt` — lats/lons/alts/codebook (~0.6 MB)
+  - `database_vlads.pt` — VLAD matrix (7.21 GB, saved via `_safe_save`)
+  - `database.pt` — thin wrapper `{'_split': True, 'meta': 'database_meta.pt', 'vlads': 'database_vlads.pt'}` pointing to the two files
+- Also frees the model from GPU before saving (`del model; torch.cuda.empty_cache()`) and calls `del vlad_list` before stacking to reduce peak RAM.
+
+**Fix in `anyloc/localizer.py`:**
+- `_load_db()` detects `_split=True` in the wrapper dict and loads `database_meta.pt` and `database_vlads.pt` separately before merging.
+
+---
+
+### AnyLoc ROS2 node startup — output buffering and startup time
+
+**Symptom:** After launching the AnyLoc node via `conda run`, the terminal showed 0 bytes of output for the full ~20-minute startup period (loading 6.8 GB VLADs + building FAISS index + loading DINOv2 on GPU). It was impossible to tell whether the node had started or crashed.
+
+**Root cause:** Python output is block-buffered when stdout is a pipe (as in `conda run ... | anything`). All `print()` calls are held in a 4 kB buffer until the node emits a large burst.
+
+**Fix:** Launch with `python3 -u` (unbuffered stdout/stderr). Alternatively, confirm the node is live with `ros2 node list` — `/anyloc_localizer` appears as soon as ROS2 spins up, before the heavy model load completes.
+
+**Confirmed working node output (once ready):**
+```
+[AnyLoc] DB: 36673 entries, VLAD dim=49152
+[AnyLoc] FAISS index: 49152D × 36673
+[AnyLoc] Model ready on cuda
+[PostView] Waiting for first frame
+```
+
+---
+
+### New launch scripts
+
+Three new convenience scripts added to simplify startup:
+
+**`control/launch_sitl.sh`**
+Starts ArduPilot SITL directly (calling the `arducopter` binary rather than `sim_vehicle.py`, which corrupts the `--out` port argument). Starts MAVProxy separately with explicit `--out udp:127.0.0.1:14550`.
+
+**`control/launch_commander.sh`**
+Sources ROS2 Jazzy and runs `flight_commander.py`. Equivalent to the manual `source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py` step.
+
+**`run.sh` — top-level tmux launcher**
+`--tmux` mode: creates a tmux session and auto-starts cesium_scene.py → SITL → MAVROS2 → flight_commander.py in separate panes.
+`--wipe` flag: auto-sends `reboot` to the MAVProxy pane and waits for the second boot (needed for `VISO_TYPE` and `SCHED_LOOP_RATE` to activate after a `--wipe` run).
+
+> **Important:** `cesium_scene.py` must be started **before** SITL. It needs to open UDP 9002 first; if SITL starts first and finds no listener it exits immediately.
+
+---
+
+### Bug: waypoint direction wrong — setpoint_raw/local replaces setpoint_position/local
+
+**Symptom:** After takeoff, drone flew SE (distance increasing) instead of NW toward waypoint N=+531 m, E=−454 m. Multiple NED/ENU swap attempts (sp_x=east/sp_y=north and vice versa) both produced SE motion.
+
+**Root cause uncertainty:** `setpoint_position/local` (via `PoseStamped` on `/mavros/setpoint_position/local`) has contradictory behaviour in MAVROS2 Jazzy. Even after confirming the NED convention (2026-06-01 entry), the waypoint direction remained wrong. The exact mapping of PoseStamped fields to `SET_POSITION_TARGET_LOCAL_NED` is ambiguous in this MAVROS2 version.
+
+**Fix:** Switched `_pos_pub` from `PoseStamped` on `/mavros/setpoint_position/local` to `PositionTarget` on `/mavros/setpoint_raw/local` with:
+- `coordinate_frame = PositionTarget.FRAME_LOCAL_NED` (= 1) — explicit, unambiguous NED
+- `type_mask` set to ignore velocity, acceleration, yaw, and yaw rate (position-only)
+- `position.x = north`, `position.y = east`, `position.z = down` (negative = above origin)
+
+This is a direct `SET_POSITION_TARGET_LOCAL_NED` passthrough with no coordinate conversion at all — the frame is declared explicitly in the message itself, removing all ambiguity.
+
+The hold block was also updated to use `PositionTarget` with `position.z = -TAKEOFF_ALT` (NED down, negative = above origin).
+
+`PositionTarget` was added to the `mavros_msgs.msg` import in `flight_commander.py`.
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `anyloc/build_database.py` | `_safe_save()` workaround for PyTorch/miniz multibyte-path truncation; split save into `database_meta.pt` + `database_vlads.pt` + thin wrapper `database.pt`; free GPU model before save; `del vlad_list` before stack |
+| `anyloc/localizer.py` | `_load_db()` handles `_split=True` wrapper format |
+| `control/flight_commander.py` | `_pos_pub` → `setpoint_raw/local` with `PositionTarget FRAME_LOCAL_NED`; `go_to_ned` and hold block use `position.x=north, y=east, z=down`; `PositionTarget` imported from `mavros_msgs.msg` |
+| `control/launch_sitl.sh` | New — starts ArduPilot SITL directly + MAVProxy with explicit UDP out |
+| `control/launch_commander.sh` | New — sources ROS2 and runs flight_commander.py |
+| `run.sh` | New — tmux launcher with `--wipe` auto-reboot support |
+
+### Current milestone status
+
+- **6m-wp (WIP):** Drone takes off ✓, holds at 90 m ✓, waypoint direction bug fixed via `setpoint_raw/local FRAME_LOCAL_NED`; clean end-to-end run not yet confirmed.
+
+---
+
 ## 2026-06-01 — Physics thread at 100 Hz; fix altitude oscillation; debug MAVROS/EKF startup
 
 ### Bug: Drone oscillates 0–4 m AGL, never reaches 90 m

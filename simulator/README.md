@@ -4,6 +4,8 @@
 
 **`drone_sim.py` is not used when Isaac Sim is running.** Both bind UDP 9002 — run only one at a time.
 
+**Start `cesium_scene.py` before ArduPilot SITL.** `cesium_scene.py` must open UDP 9002 (the SITL physics bridge) before SITL starts — if SITL finds no listener on 9002 it exits immediately.
+
 Launch: `cd simulator && ./run_chiayi.sh`
 
 ---
