@@ -75,6 +75,7 @@ class SITLBridge:
         self._centre_elev = centre_elev
         self._ap_addr     = None     # ArduPilot's address, learned from first servo packet
         self._connected   = False
+        self._last_fc     = None     # last ArduPilot frame_count — drops on reboot
 
         # Server socket — listens for ArduPilot servo data, replies with physics
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -132,9 +133,26 @@ class SITLBridge:
             except (BlockingIOError, OSError):
                 break
 
-        if latest_servos is not None and not self._connected:
-            print(f"[SITL] ArduPilot connected from {self._ap_addr}")
-            self._connected = True
+        if latest_servos is not None:
+            # The FDM timestamp we send is (t - _start_t).  ArduPilot's JSON backend
+            # expects this to start near 0 for each session and advance monotonically;
+            # a large initial value or a backwards jump makes SITL reboot in a loop.
+            # Re-zero the physics clock on a fresh connection AND whenever ArduPilot's
+            # frame_count drops (it restarts near 0 on every boot) so SITL can be
+            # restarted without restarting the simulator.
+            fc = latest_servos.get("frame_count", 0)
+            if not self._connected:
+                print(f"[SITL] ArduPilot connected from {self._ap_addr} — "
+                      f"zeroing physics clock")
+                self._connected = True
+                self._start_t   = t
+                self._n_sent    = 0
+            elif self._last_fc is not None and fc < self._last_fc - 50:
+                print(f"[SITL] ArduPilot reboot detected "
+                      f"(frame_count {self._last_fc}→{fc}) — re-zeroing physics clock")
+                self._start_t = t
+                self._n_sent  = 0
+            self._last_fc = fc
 
         # ── Build physics state ────────────────────────────────────────────
         state = self._build_state(x_enu, y_enu, z_abs, yaw_deg, roll_rad, pitch_rad, t)

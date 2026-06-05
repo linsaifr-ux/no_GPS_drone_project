@@ -19,7 +19,12 @@ import io as _io, json, math, os, struct, sys, threading, time, urllib.parse, ur
 # Project root on path so control/ package is importable from simulator/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from control.sitl_bridge import SITLBridge
+# PX4_SIM=1 → talk to PX4 SITL (MAVLink HIL on TCP 4560); else ArduPilot (JSON UDP 9002)
+_PX4_SIM = bool(os.environ.get("PX4_SIM"))
+if _PX4_SIM:
+    from control.px4_sim_bridge import PX4SimBridge
+else:
+    from control.sitl_bridge import SITLBridge
 
 # ── Drone physics constants ────────────────────────────────────────────────────
 DRONE_MASS  = 1.0          # kg — hover at PWM 1500 (p_norm=0.5) matches MOT_THST_HOVER=0.5
@@ -64,7 +69,7 @@ COS_LAT    = math.cos(math.radians(CENTER_LAT))
 HERE             = os.path.dirname(os.path.abspath(__file__))
 DRONE_FRAME_DIR  = os.path.join(HERE, "drone_frames")
 DRONE_CAM_W, DRONE_CAM_H = 640, 480
-DRONE_SAVE_EVERY = 5    # capture a frame every N sim steps
+DRONE_SAVE_EVERY = 1    # capture a frame every N sim steps
 DRONE_SPEED_M    = 5.0  # keyboard move step (m)
 
 # WGS-84
@@ -783,6 +788,16 @@ _pose_pub  = None
 _agl_pub   = None
 _state_pub = None   # replaces drone_sim.py's /drone/state publisher
 
+def _cb_drone_reset(msg):
+    """Reset drone to home position (E=0, N=0, AGL=0) without restarting Isaac Sim."""
+    global _kx, _ky, _kz, _kvn, _kve, _kvd, _kroll, _kpitch, _kyaw_rad
+    with _kin_lock:
+        _kx, _ky    = 0.0, 0.0
+        _kz         = float(centre_elev)
+        _kvn, _kve, _kvd = 0.0, 0.0, 0.0
+        _kroll, _kpitch  = 0.0, 0.0
+    print("[DRONE] Reset to home position (0, 0, ground)")
+
 if _ROS2_OK:
     try:
         rclpy.init()
@@ -791,7 +806,10 @@ if _ROS2_OK:
         _pose_pub  = _ros2_node.create_publisher(PoseStamped, "/drone/pose",              1)
         _agl_pub   = _ros2_node.create_publisher(Float64,     "/drone/agl",               1)
         _state_pub = _ros2_node.create_publisher(PoseStamped, "/drone/state",             1)
+        from std_msgs.msg import Bool as _BoolMsg
+        _ros2_node.create_subscription(_BoolMsg, "/drone/reset", lambda msg: _cb_drone_reset(msg), 1)
         print("[ROS2] Publishers ready: /drone/camera/image_raw, /drone/pose, /drone/agl, /drone/state")
+        print("[ROS2] Subscriber ready: /drone/reset (publish any Bool to reset to home)")
     except Exception as _e:
         print(f"[ROS2] Node init failed: {_e} — falling back to file output")
         _ros2_node = None
@@ -953,9 +971,12 @@ _kroll, _kpitch, _kyaw_rad  = 0.0, 0.0, 0.0
 _kqx, _kqy, _kqz, _kqw     = 0.0, 0.0, 0.0, 1.0   # quaternion for mesh
 
 # ── SITL bridge ───────────────────────────────────────────────────────────────
-_bridge     = SITLBridge(listen_port=9002, centre_elev=centre_elev)
-_bridge.debug_hz = 0.2
-_latest_pwm = [1000] * 16   # motors off until ArduPilot connects and arms
+if _PX4_SIM:
+    _bridge = PX4SimBridge(listen_port=4560, centre_elev=centre_elev)
+else:
+    _bridge = SITLBridge(listen_port=9002, centre_elev=centre_elev)
+    _bridge.debug_hz = 0.2
+_latest_pwm = [1000] * 16   # motors off until autopilot connects and arms
 
 # ── 100 Hz physics thread — decoupled from Isaac Sim render rate (~13 Hz) ────
 def _run_physics():
@@ -977,18 +998,35 @@ def _run_physics():
             kroll = _kroll; kpitch = _kpitch; kyaw = _kyaw_rad
             pwm = list(_latest_pwm)
 
-        servos = _bridge.step(kx, ky, kz,
-                              math.degrees(-kyaw), kroll, kpitch, t_now)
-        if servos is not None:
-            pwm = servos["pwm"]
+        ret = _bridge.step(kx, ky, kz,
+                           math.degrees(-kyaw), kroll, kpitch, t_now)
+        if _PX4_SIM:
+            # PX4 bridge returns a list of 4 normalised motor outputs [0,1]
+            _p4 = [float(v) for v in ret[:4]] if ret else [0.0, 0.0, 0.0, 0.0]
+        else:
+            if ret is not None:
+                pwm = ret["pwm"]
+            _p4 = [max(0.0, (v - 1000) / 1000.0) for v in pwm[:4]]
 
         if _kdt_loc > 0:
-            _p4      = [max(0.0, (v - 1000) / 1000.0) for v in pwm[:4]]
             _mean_p  = sum(_p4) / 4.0
             _kthrust = _mean_p * 2.0 * _K_GRAVITY
 
-            _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
-            _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
+            if _PX4_SIM:
+                # PX4 quad-X control allocation (none_iris CA_ROTOR geometry): control[i]
+                # → motor at (PX=fwd, PY=right):  0=FR(+,+) 1=RL(-,-) 2=FL(+,-) 3=RR(-,+).
+                # From rotor positions (torque = pos × thrust):
+                #   roll  (+=bank right→+East)   = left(RL,FL) − right(FR,RR) = (m1+m2)−(m0+m3)
+                #   pitch (+=nose up→−North accel)= front(FR,FL) − rear(RL,RR) = (m0+m2)−(m1+m3)
+                _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
+                _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+            else:
+                # ArduCopter QUAD X servo order (AP_MotorsMatrix MOTOR_FRAME_TYPE_X):
+                # ch1=FR(45°), ch2=RR(135°), ch3=RL(-135°), ch4=FL(-45°).
+                # roll = left(FL,RL) − right(FR,RR) = (ch4+ch3) − (ch1+ch2)  [+roll → +East]
+                # pitch = front(FR,FL) − rear(RR,RL) = (ch1+ch4) − (ch2+ch3) [+pitch → −North]
+                _roll_tgt  = ((_p4[2] + _p4[3]) - (_p4[0] + _p4[1])) * _K_MAX_TILT
+                _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
 
             _ka       = _kdt_loc / (_K_TILT_TAU + _kdt_loc)
             new_roll  = kroll  + _ka * (_roll_tgt  - kroll)

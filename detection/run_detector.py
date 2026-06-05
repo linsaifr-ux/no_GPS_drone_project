@@ -51,6 +51,7 @@ def main():
     plt.show()
 
     last_mtime = 0.0
+    frame_times: list[float] = []  # timestamps of recent processed frames
     print(f"[YOLO] Watching {FRAME_JPG}")
     print("[YOLO] Close the window or press Ctrl-C to quit.")
 
@@ -78,6 +79,15 @@ def main():
             detections = det.detect(frame)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+            # rolling FPS over last 30 frames
+            frame_times.append(t0)
+            if len(frame_times) > 30:
+                frame_times.pop(0)
+            if len(frame_times) >= 2:
+                fps = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
+            else:
+                fps = 0.0
+
             annotated = det.draw(frame.resize((640, 480), Image.LANCZOS), detections)
             im.set_data(pil_to_rgb_array(annotated))
 
@@ -86,16 +96,16 @@ def main():
             lon = meta.get('lon', 0.0)
             ax.set_title(
                 f'YOLO  {n} vehicle{"s" if n != 1 else ""}  —  '
-                f'{elapsed_ms:.0f} ms  |  {lat:.5f} N  {lon:.5f} E',
+                f'{elapsed_ms:.0f} ms  {fps:.1f} fps  |  {lat:.5f} N  {lon:.5f} E',
                 color='#50ff50' if n > 0 else 'white', fontsize=11, pad=4)
 
             if detections:
                 for d in detections:
                     print(f"[YOLO] {d['label']:12s}  conf={d['conf']:.2f}  "
                           f"box=({d['x1']:.0f},{d['y1']:.0f},"
-                          f"{d['x2']:.0f},{d['y2']:.0f})")
+                          f"{d['x2']:.0f},{d['y2']:.0f})  {fps:.1f} fps")
             else:
-                print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms")
+                print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms  {fps:.1f} fps")
 
             fig.canvas.draw()
             fig.canvas.flush_events()

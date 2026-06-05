@@ -103,3 +103,15 @@ instructions/report/*.toc
 # ArduPilot crash dumps (written to project root by SITL)
 dumpcore.sh_*.out
 dumpstack.sh_*.out
+
+# Stray files accidentally created by redirecting to a module name
+# (e.g. `python … > np`); these are junk, not source — delete if present.
+detection/matplotlib
+detection/np
+detection/torch
+
+# PX4 SITL runtime artefacts (PX4 itself lives in ~/PX4-Autopilot, but logs/
+# params may land here if run from the project tree)
+*.ulg
+parameters*.bson
+rootfs/

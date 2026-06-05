@@ -4,9 +4,20 @@
 
 **`drone_sim.py` is not used when Isaac Sim is running.** Both bind UDP 9002 — run only one at a time.
 
-**Start `cesium_scene.py` before ArduPilot SITL.** `cesium_scene.py` must open UDP 9002 (the SITL physics bridge) before SITL starts — if SITL finds no listener on 9002 it exits immediately.
+**Start `cesium_scene.py` before the autopilot SITL.** It must open the bridge port before SITL starts, or SITL exits immediately.
 
 Launch: `cd simulator && ./run_chiayi.sh`
+
+### Autopilot toggle: ArduPilot (default) vs PX4 (`PX4_SIM=1`)
+`cesium_scene.py` honours the `PX4_SIM` env var (same as `control/drone_sim.py`):
+- **unset** → ArduPilot `SITLBridge` on **UDP 9002** (binary servo in / JSON physics out); motor
+  decode uses the ArduCopter QUAD-X order.
+- **`PX4_SIM=1`** → PX4 `PX4SimBridge` on **TCP 4560** (HIL_ACTUATOR_CONTROLS in / HIL_SENSOR out);
+  motor decode uses the PX4 none_iris CA_ROTOR geometry. The kinematic model below the decode is
+  identical. See `control/README.md` for the PX4 launch sequence and migration status.
+
+For fast PX4 control-loop iteration use the headless `control/drone_sim.py` (`PX4_SIM=1`) instead
+of the full Isaac render.
 
 ---
 

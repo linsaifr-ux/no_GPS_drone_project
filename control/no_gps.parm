@@ -23,7 +23,7 @@ SIM_MAG_RND     0       # disable simulated compass noise
 SCHED_LOOP_RATE 50
 
 EK3_SRC1_POSXY  6       # horizontal position from ExternalNav (VISION_POSITION_ESTIMATE)
-EK3_SRC1_VELXY  0       # no horizontal velocity source
+EK3_SRC1_VELXY  6       # horizontal velocity from ExternalNav (VISION_SPEED_ESTIMATE) — pos-hold damping
 EK3_SRC1_POSZ   6       # altitude from ExternalNav (VPE z = kinematic AGL from drone_sim.py)
 EK3_SRC1_YAW    6       # yaw from ExternalNav (VPE yaw) — avoids compass field mismatch in SITL
 VISO_TYPE       1       # enable MAVLink ExternalNav processing
@@ -51,7 +51,7 @@ MOT_THST_HOVER  0.5
 ATC_ANG_RLL_P   1.5     # roll angle P (default 4.5)
 ATC_ANG_PIT_P   1.5     # pitch angle P (default 4.5)
 ATC_RAT_RLL_P   0.10    # roll rate P — raised from 0.04; needed to generate motor differential for tilt
-ATC_RAT_RLL_I   0.0     # roll rate I — zeroed: even 0.02 accumulates over 45 s climb → motor imbalance
+ATC_RAT_RLL_I   0.0     # roll rate I — zeroed: windup causes divergence with this kinematic model
 ATC_RAT_RLL_D   0.0     # roll rate D (removed — causes oscillation with kinematic IMU)
 ATC_RAT_PIT_P   0.10    # pitch rate P
 ATC_RAT_PIT_I   0.0     # pitch rate I — zeroed: same reason as roll
@@ -67,13 +67,13 @@ PSC_ACCZ_I      0.3     # acceleration Z I (default 1.0)
 PSC_ACCZ_D      0.0     # acceleration Z D (default 0.0)
 WPNAV_SPEED_UP  100     # max climb rate cm/s (default 250) — gentler climb
 WPNAV_SPEED_DN  60      # max descent rate cm/s (default 150)
-WPNAV_SPEED     100     # max horizontal speed cm/s (default 500) — prevent runaway tilt
+WPNAV_SPEED     100     # max horizontal speed cm/s — kept low to prevent motor imbalance during 3D position control
 
 # Horizontal position controller — reduce from defaults to prevent flyaway
 PSC_POSXY_P     0.3     # horizontal position P (default 1.0)
-PSC_VELXY_P     0.5     # horizontal velocity P (default 2.0)
-PSC_VELXY_I     0.0     # horizontal velocity I — zeroed to prevent windup over 90s climb
-PSC_VELXY_D     0.0     # horizontal velocity D (removed — unstable at 50 Hz)
+PSC_VELXY_P     0.6     # horizontal velocity P (default 2.0)
+PSC_VELXY_I     0.0     # horizontal velocity I — zeroed (integrator drove slow oscillation)
+PSC_VELXY_D     0.75    # horizontal velocity D — strong damping; clean now via EK3_SRC1_VELXY=6 vision_speed
 
 # Prevent auto-disarm while debugging takeoff (10 s default causes disarm before liftoff)
 DISARM_DELAY    0

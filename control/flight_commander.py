@@ -40,9 +40,10 @@ import rclpy
 import rclpy.node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geographic_msgs.msg import GeoPointStamped
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from mavros_msgs.msg import Mavlink, PositionTarget, State
-from mavros_msgs.srv import CommandBool, CommandLong, CommandTOL, SetMode
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
+from mavros_msgs.msg import Mavlink, PositionTarget, State, Waypoint
+from mavros_msgs.srv import (CommandBool, CommandLong, CommandTOL, SetMode,
+                             WaypointPush, WaypointClear)
 
 _SENSOR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -65,7 +66,7 @@ except (FileNotFoundError, KeyError):
 
 # ── Mission parameters ─────────────────────────────────────────────────────────
 TAKEOFF_ALT          = 90.0   # metres AGL
-WAYPOINT_RADIUS      =  5.0   # metres — how close counts as reached
+WAYPOINT_RADIUS      = 60.0   # metres — how close counts as reached
 WAYPOINT_TIMEOUT     = 900.0  # seconds per waypoint (699 m at 1 m/s ≈ 12 min)
 MIN_LOCALISATION_AGL = 50.0   # metres AGL — below this, VPE is locked to home position;
                                # above this, AnyLoc estimates are used
@@ -112,6 +113,7 @@ class FlightCommander(rclpy.node.Node):
         self._ekf_flags           = 0     # from EKF_STATUS_REPORT (msg 193)
         self._gps_origin_received = False # set when GPS_GLOBAL_ORIGIN (msg 49) arrives
         self._last_motor_pwm      = None  # from SERVO_OUTPUT_RAW (msg 36)
+        self._vpe_yaw             = math.pi / 2.0  # Phase-1 VPE yaw (ENU rad); mutable for calibration
 
         # Subscribers
         self.create_subscription(State, "/mavros/state",
@@ -126,11 +128,19 @@ class FlightCommander(rclpy.node.Node):
         self.create_subscription(Mavlink, "/uas1/mavlink_source",
                                  self._cb_mavlink, _SENSOR_QOS)
 
-        # Publishers
+        # setpoint_raw/local with FRAME_LOCAL_NED and IGNORE_PZ.
+        # MAVROS always converts ENU→NED even with FRAME_LOCAL_NED; send ENU
+        # (x=East, y=North) so MAVROS produces the correct NED target.
+        # IGNORE_PZ lets ArduPilot hold altitude from NAV_TAKEOFF (z convention ambiguous).
         self._pos_pub    = self.create_publisher(
             PositionTarget, "/mavros/setpoint_raw/local", 1)
         self._vpe_pub    = self.create_publisher(
             PoseWithCovarianceStamped, "/mavros/vision_pose/pose_cov", 1)
+        # Horizontal velocity aiding (VISION_SPEED_ESTIMATE).  Without a velocity source
+        # (EK3_SRC1_VELXY was 0) the EKF derives velocity only by integrating the bridge's
+        # laggy double-differenced IMU accel → delayed damping → position-hold runaway.
+        self._vspeed_pub = self.create_publisher(
+            TwistStamped, "/mavros/vision_speed/speed_twist", 1)
         self._origin_pub = self.create_publisher(
             GeoPointStamped, "/mavros/global_position/set_gp_origin", 1)
 
@@ -139,6 +149,8 @@ class FlightCommander(rclpy.node.Node):
         self._cmd_cli  = self.create_client(CommandLong, "/mavros/cmd/command")
         self._mode_cli = self.create_client(SetMode,     "/mavros/set_mode")
         self._tof_cli  = self.create_client(CommandTOL,  "/mavros/cmd/takeoff")
+        self._wp_push  = self.create_client(WaypointPush,  "/mavros/mission/push")
+        self._wp_clear = self.create_client(WaypointClear, "/mavros/mission/clear")
 
         self.get_logger().info("Flight commander ready")
 
@@ -165,6 +177,7 @@ class FlightCommander(rclpy.node.Node):
             n_sent       = 0
             n_anyloc     = 0
             phase_logged = False
+            last_ds      = None   # (east, north, t) for velocity differencing
 
             _write_stub_estimate()
 
@@ -236,7 +249,13 @@ class FlightCommander(rclpy.node.Node):
                         north_v = self._drone_state.pose.position.y
                     else:
                         east_v, north_v = 0.0, 0.0
-                    yaw_v  = 0.0
+                    # VPE yaw sets the EKF heading (no compass → external-nav is the yaw
+                    # source).  The sim drone faces North (kinematic kyaw=0).  ENU yaw=π/2
+                    # → MAVROS converts to EKF NED yaw=0 (North), matching the sim, so the
+                    # position controller maps NED errors to the correct lean angles.
+                    # (Requires the ch2<->ch3 motor-order fix in cesium_scene.py; without it
+                    # the decoded roll/pitch are reflected and the drone flies away.)
+                    yaw_v  = self._vpe_yaw
                     cov_xy = 0.1
 
                 # ── Publish VPE ───────────────────────────────────────────────────
@@ -261,6 +280,27 @@ class FlightCommander(rclpy.node.Node):
                 n_sent += 1
                 if n_sent == 1:
                     print("[Commander] VPE thread started — Phase 1 (home position)")
+
+                # ── Horizontal velocity aiding (VISION_SPEED_ESTIMATE, ENU) ──────────
+                # True velocity from differencing drone_state truth; MAVROS converts
+                # ENU→NED.  Gives the EKF a direct, low-lag velocity measurement
+                # (EK3_SRC1_VELXY=6) so the position controller has clean damping.
+                if self._drone_state is not None:
+                    ds = self._drone_state.pose.position
+                    now_t = time.time()
+                    if last_ds is not None:
+                        dt_v = now_t - last_ds[2]
+                        if dt_v > 1e-3:
+                            vx = (ds.x - last_ds[0]) / dt_v   # ENU East  vel
+                            vy = (ds.y - last_ds[1]) / dt_v   # ENU North vel
+                            tw = TwistStamped()
+                            tw.header.stamp = self.get_clock().now().to_msg()
+                            tw.header.frame_id = "map"
+                            tw.twist.linear.x = vx
+                            tw.twist.linear.y = vy
+                            tw.twist.linear.z = 0.0
+                            self._vspeed_pub.publish(tw)
+                    last_ds = (ds.x, ds.y, now_t)
 
                 elapsed = time.time() - t0
                 time.sleep(max(0.0, 0.05 - elapsed))  # 20 Hz — 5 Hz caused EKF dead-reckoning gaps
@@ -505,48 +545,83 @@ class FlightCommander(rclpy.node.Node):
 
         Distance check uses /drone/state ENU truth (x=East, y=North, z=MSL).
         """
-        # Use setpoint_raw/local with MAV_FRAME_LOCAL_NED (frame=1) so MAVROS
-        # passes x,y,z directly to ArduPilot without any ENU↔NED conversion.
-        # type_mask: ignore velocity, accel, yaw, yaw_rate (position-only).
-        msg = PositionTarget()
-        msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED   # = 1
-        msg.type_mask = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
-                         PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
-                         PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
-                         PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
-        msg.position.x = float(north)   # NED x = North
-        msg.position.y = float(east)    # NED y = East
-        msg.position.z = float(down)    # NED z = Down  (negative = above origin)
+        # Speed-capped velocity "carrot" toward the target while holding altitude.
+        # A raw 700 m position target makes ArduPilot command an unbounded, overshooting
+        # velocity (WPNAV_SPEED is not enforced for setpoint_raw position), which drove a
+        # growing oscillation/flyaway.  Instead command horizontal VELOCITY toward the
+        # target, magnitude = min(SPEED_CAP, dist*APPROACH_GAIN), with position-Z holding
+        # altitude.  Within WAYPOINT_RADIUS, fall back to a position-hold setpoint.
+        # MAVROS setpoint_raw applies ftf::transform_frame_enu_ned, so send ENU and it
+        # becomes the correct NED command.
+        # Position "carrot": always command a position target only CARROT_DIST metres
+        # ahead toward the goal, advancing it as the drone moves.  A near target keeps the
+        # position controller in its gentle regime so it self-limits speed; a far raw
+        # target made it command an unbounded, overshooting velocity (the velocity loop is
+        # underdamped and won't track a velocity setpoint either).  Within CARROT_DIST,
+        # command the real goal.  MAVROS applies ENU→NED, so send ENU.
+        CARROT_DIST = 25.0      # metres ahead of the drone
+        target_agl  = -down     # AGL metres
 
-        target_agl = -down   # AGL metres
+        _POS_MASK = (PositionTarget.IGNORE_VX  | PositionTarget.IGNORE_VY |
+                     PositionTarget.IGNORE_VZ  | PositionTarget.IGNORE_AFX |
+                     PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                     PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
 
         deadline   = time.time() + timeout
         last_print = time.time()
 
         try:
             while time.time() < deadline:
+                if self._drone_state is not None:
+                    ds = self._drone_state.pose.position
+                    cur_e, cur_n = ds.x, ds.y
+                    dz = (ds.z - HOME_ALT_MSL) - target_agl
+                elif self._local_pos is not None:
+                    p  = self._local_pos.pose.position
+                    cur_e, cur_n = p.x, p.y
+                    dz = p.z - target_agl
+                else:
+                    rclpy.spin_once(self, timeout_sec=0.1)
+                    continue
+
+                dx = cur_e - east              # ENU east  error (drone − target)
+                dy = cur_n - north             # ENU north error
+                hdist = math.hypot(dx, dy)
+                dist  = math.sqrt(dx**2 + dy**2 + dz**2)
+
+                # Velocity "carrot" toward the goal (ENU), capped.  Empirically the velocity
+                # loop tracks DIRECTION correctly (converges toward the WP) whereas raw
+                # position setpoints are interpreted mirrored.  This is the best-performing
+                # form so far: it converges from ~700 m to ~380 m, then the weak North/pitch
+                # axis + underdamped velocity loop cause overshoot before the 60 m radius.
+                # KNOWN-UNSOLVED: North/pitch authority is weak (ArduPilot pitch-for-North
+                # decodes mostly as roll in the sim); see horizontal-flyaway-diagnosis memory.
+                SPEED_CAP = 5.0
+                msg = PositionTarget()
+                msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+                msg.type_mask = (PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY |
+                                 PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
+                                 PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                                 PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+                if hdist > 1e-3:
+                    spd = min(SPEED_CAP, hdist * 0.4)
+                    msg.velocity.x = float(-dx / hdist * spd)
+                    msg.velocity.y = float(-dy / hdist * spd)
+                msg.position.z = float(target_agl)
                 msg.header.stamp = self.get_clock().now().to_msg()
                 self._pos_pub.publish(msg)
                 rclpy.spin_once(self, timeout_sec=0.1)
 
-                if self._drone_state is not None:
-                    ds = self._drone_state.pose.position
-                    dx = ds.x - east               # ENU east  error
-                    dy = ds.y - north              # ENU north error
-                    dz = (ds.z - HOME_ALT_MSL) - target_agl
-                elif self._local_pos is not None:
-                    p  = self._local_pos.pose.position
-                    dx, dy, dz = p.x - east, p.y - north, p.z - target_agl
-                else:
-                    continue
-
-                dist = math.sqrt(dx**2 + dy**2 + dz**2)
                 now  = time.time()
                 if now - last_print > 5.0:
                     agl = (self._drone_state.pose.position.z - HOME_ALT_MSL
                            if self._drone_state else float("nan"))
+                    ekf = ""
+                    if self._local_pos is not None:
+                        p = self._local_pos.pose.position
+                        ekf = f"  EKF=({p.x:+.0f},{p.y:+.0f})"
                     print(f"[Commander] WP  err N={dy:+.1f} E={dx:+.1f}"
-                          f"  AGL={agl:.1f} m  dist={dist:.1f} m")
+                          f"  AGL={agl:.1f} m  dist={dist:.1f} m{ekf}")
                     last_print = now
 
                 if dist <= WAYPOINT_RADIUS:
@@ -554,6 +629,149 @@ class FlightCommander(rclpy.node.Node):
         except Exception:
             pass
         return False
+
+    def fly_auto_waypoint(self, north: float, east: float, agl: float,
+                          timeout: float = 600.0) -> bool:
+        """
+        Fly to a waypoint using an AUTO-mode mission instead of GUIDED setpoints.
+
+        Uploads a lat/lon mission and lets ArduPilot's own WPNAV controller fly it.
+        This bypasses the MAVROS setpoint_raw frame conversion and GUIDED setpoint
+        streaming entirely — a different navigation path than go_to_ned.
+        """
+        tgt_lat = HOME_LAT + north / M_PER_DEG
+        tgt_lon = HOME_LON + east  / (M_PER_DEG * COS_LAT)
+        self.get_logger().info(
+            f"AUTO mission → {tgt_lat:.6f}°N {tgt_lon:.6f}°E {agl:.0f} m AGL")
+
+        def mk(seq_current, cmd, lat, lon, alt, frame=3):
+            wp = Waypoint()
+            wp.frame = frame                     # 3 = GLOBAL_RELATIVE_ALT
+            wp.command = cmd
+            wp.is_current = seq_current
+            wp.autocontinue = True
+            wp.param1 = wp.param2 = wp.param3 = wp.param4 = 0.0
+            wp.x_lat = float(lat); wp.y_long = float(lon); wp.z_alt = float(alt)
+            return wp
+
+        # seq0 = home (placeholder), seq1 = waypoint, seq2 = loiter at waypoint
+        wps = [
+            mk(False, 16, HOME_LAT, HOME_LON, 0.0, frame=0),     # NAV_WAYPOINT home
+            mk(True,  16, tgt_lat,  tgt_lon,  agl),               # NAV_WAYPOINT target
+            mk(False, 17, tgt_lat,  tgt_lon,  agl),               # NAV_LOITER_UNLIM
+        ]
+
+        # clear, then push
+        for cli, name in ((self._wp_clear, "clear"), (self._wp_push, "push")):
+            if not cli.wait_for_service(timeout_sec=5.0):
+                self.get_logger().warn(f"mission {name} service unavailable")
+                return False
+        cf = self._wp_clear.call_async(WaypointClear.Request())
+        self._spin_future(cf, 5.0)
+
+        req = WaypointPush.Request(); req.start_index = 0; req.waypoints = wps
+        pf = self._wp_push.call_async(req)
+        if not self._spin_future(pf, 10.0) or not pf.result().success:
+            self.get_logger().warn("mission push failed")
+            return False
+        self.get_logger().info(f"mission pushed ({pf.result().wp_transfered} items) ✓")
+
+        if not self.set_mode("AUTO"):
+            return False
+
+        deadline = time.time() + timeout
+        last_print = time.time()
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self._drone_state is None:
+                continue
+            ds = self._drone_state.pose.position
+            dx = ds.x - east; dy = ds.y - north
+            dist = math.hypot(dx, dy)
+            now = time.time()
+            if now - last_print > 5.0:
+                cur_agl = ds.z - HOME_ALT_MSL
+                print(f"[Commander] AUTO  err N={dy:+.1f} E={dx:+.1f}  "
+                      f"AGL={cur_agl:.1f} m  dist={dist:.1f} m")
+                last_print = now
+            if dist <= WAYPOINT_RADIUS:
+                return True
+        return False
+
+    def _spin_future(self, future, timeout):
+        deadline = time.time() + timeout
+        while not future.done() and time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return future.done()
+
+
+    def velocity_probe(self):
+        """
+        Calibration: command known ENU velocity vectors and measure the actual
+        ENU motion from /drone/state truth.  Reveals the commanded-direction →
+        actual-motion transfer so the sim frame/sign bug can be pinned down
+        empirically instead of by analysis.  Gated by env var CALIBRATE=1.
+        """
+        _IGNORE = (PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY |
+                   PositionTarget.IGNORE_PZ | PositionTarget.IGNORE_AFX |
+                   PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                   PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+
+        def send_vel(vx, vy, secs):
+            msg = PositionTarget()
+            msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+            msg.type_mask = _IGNORE
+            msg.velocity.x = float(vx); msg.velocity.y = float(vy); msg.velocity.z = 0.0
+            t_end = time.time() + secs
+            while time.time() < t_end:
+                msg.header.stamp = self.get_clock().now().to_msg()
+                self._pos_pub.publish(msg)
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+        def pos():
+            p = self._drone_state.pose.position
+            return (p.x, p.y)  # East, North
+
+        def att():
+            # roll/pitch/yaw (deg) from drone_state ENU quaternion
+            q = self._drone_state.pose.orientation
+            sinr = 2*(q.w*q.x + q.y*q.z); cosr = 1-2*(q.x*q.x + q.y*q.y)
+            roll = math.degrees(math.atan2(sinr, cosr))
+            sinp = 2*(q.w*q.y - q.z*q.x)
+            pitch = math.degrees(math.asin(max(-1, min(1, sinp))))
+            siny = 2*(q.w*q.z + q.x*q.y); cosy = 1-2*(q.y*q.y + q.z*q.z)
+            yaw = math.degrees(math.atan2(siny, cosy))
+            return roll, pitch, yaw
+
+        def vel_pulse(vx, vy):
+            send_vel(0.0, 0.0, 3.0)        # settle/hover
+            p0 = pos()
+            t_end = time.time() + 4.0
+            while time.time() < t_end:
+                send_vel(vx, vy, 0.05)
+            p1 = pos()
+            send_vel(0.0, 0.0, 3.0)        # brake
+            return (p1[0] - p0[0], p1[1] - p0[1])
+
+        def ekf_yaw_enu():
+            if self._local_pos is None:
+                return float('nan')
+            q = self._local_pos.pose.orientation
+            siny = 2*(q.w*q.z + q.x*q.y); cosy = 1-2*(q.y*q.y + q.z*q.z)
+            return math.degrees(math.atan2(siny, cosy))
+
+        # Map VPE yaw command -> resulting EKF heading (no velocity cmds = no runaway).
+        # The drone physically faces North (sim kyaw=0); we want the VPE yaw that makes
+        # EKF heading = North (ENU 90°) so ArduPilot's NED axes line up.
+        print("[CAL] ===== VPE-yaw -> EKF-heading map =====")
+        for yaw_deg in (0, 45, 90, 135, 180, 225, 270, 315):
+            self._vpe_yaw = math.radians(yaw_deg)
+            send_vel(0.0, 0.0, 5.0)        # hold ~0 vel, let EKF adopt new yaw
+            ey = ekf_yaw_enu()
+            print(f"[CAL] vpe_yaw={yaw_deg:3d}° -> EKF_heading_ENU={ey:+6.1f}°  "
+                  f"({'≈North(+90) ✓' if abs(((ey-90+180)%360)-180)<20 else ''})")
+        print("[CAL] ===== yaw map done (want EKF_heading ≈ +90° = North) =====")
+        self._vpe_yaw = math.pi / 2.0
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -571,98 +789,167 @@ def main():
         print("[Commander] MAVROS2 not connected — is SITL + launch_mavros.sh running?")
         stop_ev.set(); rclpy.shutdown(); return
 
-    # Step 3: sanity-check drone is on the ground before proceeding.
-    # If AGL > 10 m, SITL was not restarted cleanly — abort and ask user to --wipe.
+    # Step 3: detect whether this is a fresh ground start or an in-air restart.
+    # In-air restart: SITL + cesium are still running; only the commander was
+    # restarted (e.g. after WP nav drifted the drone far from home at 90 m AGL).
+    # In that case skip arming/takeoff and go straight to waypoints.
     for _ in range(20):
         rclpy.spin_once(cmd, timeout_sec=0.1)
         if cmd._drone_state is not None:
             break
+
+    in_air_restart = False
     if cmd._drone_state is not None:
         start_agl = cmd._drone_state.pose.position.z - HOME_ALT_MSL
         if start_agl > 10.0:
-            print(f"[Commander] ABORT: drone is at {start_agl:.0f} m AGL at startup. "
-                  "Restart SITL with --wipe before running.")
+            print(f"[Commander] In-air restart detected: drone at {start_agl:.0f} m AGL "
+                  f"(E={cmd._drone_state.pose.position.x:+.0f} "
+                  f"N={cmd._drone_state.pose.position.y:+.0f}) — "
+                  "skipping takeoff sequence, proceeding to waypoints")
+            in_air_restart = True
+            # Ensure GUIDED mode — RTL or other modes may have triggered while
+            # the commander was restarting and setpoints were briefly absent.
+            if cmd._state.mode != "GUIDED":
+                print(f"[Commander] Mode is {cmd._state.mode}, switching to GUIDED …")
+                cmd.set_mode("GUIDED")
+                cmd._spin_until(lambda: cmd._state.mode == "GUIDED", timeout=10.0)
+
+    if not in_air_restart:
+        # Step 4: wait for SITL EKF to initialize, then confirm EKF global origin.
+        # Without confirmed origin, position setpoints use the wrong coordinate frame
+        # and the drone flies to the wrong location (observed: 664 m displacement).
+        # EKF typically needs 5-10 s to initialize after SITL starts; set_ekf_origin
+        # retries every 2 s for up to 60 s and aborts if not confirmed.
+        print("[Commander] Waiting 8 s for SITL EKF to initialize …")
+        t_wait = time.time() + 8.0
+        while time.time() < t_wait:
+            rclpy.spin_once(cmd, timeout_sec=0.1)
+
+        if not cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=60.0):
+            print("[Commander] ABORT: EKF origin not confirmed. Restart SITL with --wipe.")
             stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 4: wait for SITL EKF to initialize, then confirm EKF global origin.
-    # Without confirmed origin, position setpoints use the wrong coordinate frame
-    # and the drone flies to the wrong location (observed: 664 m displacement).
-    # EKF typically needs 5-10 s to initialize after SITL starts; set_ekf_origin
-    # retries every 2 s for up to 60 s and aborts if not confirmed.
-    print("[Commander] Waiting 8 s for SITL EKF to initialize …")
-    t_wait = time.time() + 8.0
-    while time.time() < t_wait:
-        rclpy.spin_once(cmd, timeout_sec=0.1)
+        # Step 5: arm in STABILIZE first — only needs EKF attitude, not position.
+        # This bypasses the GPS/VisOdom position requirement that blocks GUIDED arming.
+        cmd.set_mode("STABILIZE")
+        time.sleep(0.5)
+        print("[Commander] Arming in STABILIZE (no EKF position required) …")
+        if not cmd.arm():
+            print("[Commander] Arm failed in STABILIZE — check IMU/bridge")
+            stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    if not cmd.set_ekf_origin(HOME_LAT, HOME_LON, HOME_ALT_MSL, timeout=60.0):
-        print("[Commander] ABORT: EKF origin not confirmed. Restart SITL with --wipe.")
-        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
+        # Step 6: switch to GUIDED now that motors are armed
+        cmd.set_mode("GUIDED")
+        time.sleep(0.5)
 
-    # Step 5: arm in STABILIZE first — only needs EKF attitude, not position.
-    # This bypasses the GPS/VisOdom position requirement that blocks GUIDED arming.
-    cmd.set_mode("STABILIZE")
-    time.sleep(0.5)
-    print("[Commander] Arming in STABILIZE (no EKF position required) …")
-    if not cmd.arm():
-        print("[Commander] Arm failed in STABILIZE — check IMU/bridge")
-        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
+        # Step 6: wait for EKF POS_ABS — VPE must be accepted before takeoff command
+        if not cmd.wait_ekf_pos(timeout=60.0):
+            print("[Commander] EKF POS_ABS not reached — check VPE flow")
+            stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 6: switch to GUIDED now that motors are armed
-    cmd.set_mode("GUIDED")
-    time.sleep(0.5)
+        # Step 7: Takeoff
+        if not cmd.takeoff(TAKEOFF_ALT):
+            print("[Commander] Takeoff failed")
+            stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Step 6: wait for EKF POS_ABS — VPE must be accepted before takeoff command
-    if not cmd.wait_ekf_pos(timeout=60.0):
-        print("[Commander] EKF POS_ABS not reached — check VPE flow")
-        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
+        # Latch the hold NED target immediately when takeoff() returns (drone is at
+        # TAKEOFF_ALT AGL).  Use drone_state for current horizontal position (should
+        # be near 0,0 since we took off from home); fall back to exact home if the
+        # topic is momentarily unavailable.  Altitude is latched from TAKEOFF_ALT —
+        # more reliable than recomputing from MSL each iteration.
+        # drone_state is ENU (x=East, y=North). Hold at current horizontal position.
+        if cmd._drone_state is not None:
+            _hold_north = cmd._drone_state.pose.position.y   # ENU y = North = NED x
+            _hold_east  = cmd._drone_state.pose.position.x   # ENU x = East  = NED y
+        else:
+            _hold_north, _hold_east = 0.0, 0.0
 
-    # Step 7: Takeoff
-    if not cmd.takeoff(TAKEOFF_ALT):
-        print("[Commander] Takeoff failed")
-        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
+        _IGNORE = (PositionTarget.IGNORE_VX  | PositionTarget.IGNORE_VY |
+                   PositionTarget.IGNORE_VZ  | PositionTarget.IGNORE_AFX |
+                   PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                   PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+        _hold = PositionTarget()
+        _hold.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        _hold.type_mask        = _IGNORE
+        _hold.position.x       = float(_hold_east)   # ENU x = East  → MAVROS → NED East
+        _hold.position.y       = float(_hold_north)  # ENU y = North → MAVROS → NED North
+        _hold.position.z       = float(TAKEOFF_ALT)  # ENU z = Up → hold at takeoff altitude
 
-    # Latch the hold NED target immediately when takeoff() returns (drone is at
-    # TAKEOFF_ALT AGL).  Use drone_state for current horizontal position (should
-    # be near 0,0 since we took off from home); fall back to exact home if the
-    # topic is momentarily unavailable.  Altitude is latched from TAKEOFF_ALT —
-    # more reliable than recomputing from MSL each iteration.
-    # drone_state is ENU (x=East, y=North). Hold at current horizontal position.
-    if cmd._drone_state is not None:
-        _hold_north = cmd._drone_state.pose.position.y   # ENU y = North → NED x
-        _hold_east  = cmd._drone_state.pose.position.x   # ENU x = East  → NED y
-    else:
-        _hold_north, _hold_east = 0.0, 0.0
+        # Hold for 10 s — publish on every iteration so there is never a gap.
+        print(f"[Commander] Holding 10 s at {TAKEOFF_ALT:.0f} m …")
+        t_hold = time.time() + 10.0
+        while time.time() < t_hold:
+            _hold.header.stamp = cmd.get_clock().now().to_msg()
+            cmd._pos_pub.publish(_hold)
+            rclpy.spin_once(cmd, timeout_sec=0.05)
 
-    _IGNORE = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
-               PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
-               PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
-               PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
-    _hold = PositionTarget()
-    _hold.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-    _hold.type_mask        = _IGNORE
-    _hold.position.x       = float(_hold_north)   # NED North
-    _hold.position.y       = float(_hold_east)    # NED East
-    _hold.position.z       = -TAKEOFF_ALT         # NED Down (negative = above home)
-
-    # Hold for 10 s — publish on every iteration so there is never a gap.
-    print(f"[Commander] Holding 10 s at {TAKEOFF_ALT:.0f} m …")
-    t_hold = time.time() + 10.0
-    while time.time() < t_hold:
+        # One final publish before handing off to go_to_ned.
         _hold.header.stamp = cmd.get_clock().now().to_msg()
         cmd._pos_pub.publish(_hold)
-        rclpy.spin_once(cmd, timeout_sec=0.05)
 
-    # One final publish before handing off to go_to_ned.
-    _hold.header.stamp = cmd.get_clock().now().to_msg()
-    cmd._pos_pub.publish(_hold)
+    # Calibration mode: probe the frame instead of flying the waypoint.
+    if os.environ.get("CALIBRATE"):
+        try:
+            cmd.velocity_probe()
+        except Exception as exc:
+            print(f"[CAL] probe aborted: {exc}")
+        print("[CAL] holding — Ctrl-C to exit")
+        try:
+            while True:
+                rclpy.spin_once(cmd, timeout_sec=0.1)
+        except KeyboardInterrupt:
+            pass
+        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
+
+    # Hold-in-place stability test: command the CURRENT position and log drift.
+    # If it stays → position loop is stable (waypoint frame is the issue).
+    # If it drifts away → the position loop itself is unstable.
+    if os.environ.get("HOLDTEST"):
+        for _ in range(10):
+            rclpy.spin_once(cmd, timeout_sec=0.1)
+        e0 = cmd._drone_state.pose.position.x if cmd._drone_state else 0.0
+        n0 = cmd._drone_state.pose.position.y if cmd._drone_state else 0.0
+        print(f"[HOLD] holding at E={e0:+.1f} N={n0:+.1f} AGL≈90 for 40 s")
+        hmsg = PositionTarget()
+        hmsg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        hmsg.type_mask = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
+                          PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
+                          PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                          PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
+        hmsg.position.x = float(e0); hmsg.position.y = float(n0); hmsg.position.z = float(TAKEOFF_ALT)
+        t_end = time.time() + 40.0; t_log = 0.0
+        while time.time() < t_end:
+            hmsg.header.stamp = cmd.get_clock().now().to_msg()
+            cmd._pos_pub.publish(hmsg)
+            rclpy.spin_once(cmd, timeout_sec=0.05)
+            if time.time() - t_log > 4.0 and cmd._drone_state is not None:
+                t_log = time.time()
+                e = cmd._drone_state.pose.position.x; n = cmd._drone_state.pose.position.y
+                print(f"[HOLD] drift E={e-e0:+6.1f} N={n-n0:+6.1f}  dist={math.hypot(e-e0,n-n0):6.1f} m")
+        print("[HOLD] done")
+        stop_ev.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
     # Step 8: Waypoints
+    use_auto = bool(os.environ.get("AUTO_WP"))
     try:
         for i, (n, e, d) in enumerate(WAYPOINTS):
             print(f"[Commander] WP {i+1}/{len(WAYPOINTS)}  "
-                  f"N={n:+.0f} E={e:+.0f} ALT={-d:.0f} m AGL")
-            reached = cmd.go_to_ned(n, e, d, timeout=WAYPOINT_TIMEOUT)
-            print(f"[Commander] WP {i+1} {'✓' if reached else 'timeout'}")
+                  f"N={n:+.0f} E={e:+.0f} ALT={-d:.0f} m AGL  "
+                  f"[{'AUTO mission' if use_auto else 'GUIDED setpoint'}]")
+            if use_auto:
+                reached = cmd.fly_auto_waypoint(n, e, -d, timeout=WAYPOINT_TIMEOUT)
+            else:
+                reached = cmd.go_to_ned(n, e, d, timeout=WAYPOINT_TIMEOUT)
+            if reached and cmd._drone_state is not None:
+                ds = cmd._drone_state.pose.position
+                agl = ds.z - HOME_ALT_MSL
+                dx = ds.x - e; dy = ds.y - n
+                dist = math.sqrt(dx**2 + dy**2)
+                print(f"[Commander] WP {i+1} ARRIVED ✓  "
+                      f"pos E={ds.x:+.1f} N={ds.y:+.1f} AGL={agl:.1f} m  "
+                      f"horiz_err={dist:.1f} m")
+            else:
+                print(f"[Commander] WP {i+1} {'✓' if reached else 'TIMEOUT — did not arrive'}")
             time.sleep(1.0)
 
         # Step 9: hold at target indefinitely (Ctrl-C to RTL)

@@ -3,7 +3,13 @@
 Autonomous drone system that localises itself and detects objects without GPS, validated in Isaac Sim before deployment to real hardware.
 
 **Location:** Chiayi, Taiwan — 23.4509°N, 120.2861°E  
-**Stack:** Isaac Sim 6.0.0 · AnyLoc · YOLOv8 · ArduPilot · ROS2 Jazzy · MAVROS2
+**Stack:** Isaac Sim 6.0.0 · AnyLoc · YOLOv8 · ArduPilot / **PX4 (migrating)** · ROS2 Jazzy · MAVROS2
+
+> **Autopilot migration (2026-06):** moving from ArduPilot to **PX4** because ArduPilot's
+> horizontal position controller (`AC_PosControl`) inverts its output with verified-correct
+> EKF inputs (WP nav flies the mirror direction). The physics/Cesium stack is unchanged; only
+> the SITL bridge, params, and commander differ — toggle with `PX4_SIM=1`. PX4 bridge↔SITL is
+> validated (Phase 1); MAVROS↔PX4 + the position-hold gate are in progress. See `control/README.md`.
 
 ---
 

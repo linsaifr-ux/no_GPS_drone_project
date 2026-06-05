@@ -47,7 +47,14 @@ import rclpy.node
 from geometry_msgs.msg import PoseStamped
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from control.sitl_bridge import SITLBridge
+
+# PX4_SIM=1 → PX4 SITL (MAVLink HIL on TCP 4560); else ArduPilot (JSON UDP 9002).
+# Lightweight headless physics rig (no Isaac Sim) for control-loop validation.
+_PX4_SIM = bool(os.environ.get("PX4_SIM"))
+if _PX4_SIM:
+    from control.px4_sim_bridge import PX4SimBridge
+else:
+    from control.sitl_bridge import SITLBridge
 
 # ── Home position ──────────────────────────────────────────────────────────────
 _HOME_CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -95,16 +102,18 @@ def main():
 
     state_pub = node.create_publisher(PoseStamped, "/drone/state", 1)
 
-    # SITL bridge — listens on UDP 9002, sends physics state to ArduPilot
+    # SITL bridge — ArduPilot (UDP 9002) or PX4 (TCP 4560 MAVLink HIL)
     try:
-        bridge = SITLBridge(listen_port=9002, centre_elev=HOME_ALT_MSL)
+        if _PX4_SIM:
+            bridge = PX4SimBridge(listen_port=4560, centre_elev=HOME_ALT_MSL)
+        else:
+            bridge = SITLBridge(listen_port=9002, centre_elev=HOME_ALT_MSL)
+            bridge.debug_hz = 0.2   # print physics state 5× per second
     except OSError as e:
         if e.errno == 98:   # EADDRINUSE
-            print("[drone_sim] ERROR: UDP 9002 already in use — is another bridge running?")
+            print("[drone_sim] ERROR: bridge port already in use — another bridge running?")
             node.destroy_node(); rclpy.shutdown(); return
         raise
-
-    bridge.debug_hz = 0.2   # print physics state 5× per second for diagnostics
 
     # ── Kinematic state ────────────────────────────────────────────────────────
     _kx      = 0.0            # ENU east of home (m)
@@ -133,19 +142,28 @@ def main():
             servos = bridge.step(_kx, _ky, _kz, yaw_deg,
                                  _kroll, _kpitch, t_now)
 
-            # ── Integrate 6-DOF kinematic model from ArduPilot PWM ────────────
-            if servos is not None and _kdt > 0:
-                pwm = servos["pwm"]
-                _p4 = [max(0.0, (v - 1000) / 1000.0) for v in pwm[:4]]
+            # ── Integrate 6-DOF kinematic model from motor outputs ────────────
+            if _PX4_SIM:
+                _p4 = [float(v) for v in servos[:4]] if servos else [0.0, 0.0, 0.0, 0.0]
+            else:
+                if servos is not None:
+                    _p4 = [max(0.0, (v - 1000) / 1000.0) for v in servos["pwm"][:4]]
+                else:
+                    _p4 = None
+            if _p4 is not None and _kdt > 0:
                 _mean_p  = sum(_p4) / 4.0
                 _kthrust = _mean_p * 2.0 * _K_GRAVITY   # 0 – 2 g
 
-                # Motor differential → target roll/pitch
-                # ArduCopter X-frame FRAME_TYPE=1: ch1=M1(FR), ch2=M2(RL), ch3=M3(RR), ch4=M4(FL)
-                # roll right (+): left  motors (M2-RL + M4-FL) > right motors (M1-FR + M3-RR)
-                # pitch up  (+): front  motors (M1-FR + M4-FL) > rear  motors (M2-RL + M3-RR)
-                _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
-                _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
+                if _PX4_SIM:
+                    # PX4 quad-X (none_iris CA_ROTOR): control[0]=FR(+,+) [1]=RL(-,-)
+                    # [2]=FL(+,-) [3]=RR(-,+).  roll(+=right)=(m1+m2)-(m0+m3);
+                    # pitch(+=nose up)=(m0+m2)-(m1+m3).
+                    _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
+                    _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+                else:
+                    # ArduCopter X-frame: ch1=FR, ch2=RL, ch3=RR, ch4=FL
+                    _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
+                    _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
 
                 # First-order attitude dynamics
                 _ka = _kdt / (_K_TILT_TAU + _kdt)

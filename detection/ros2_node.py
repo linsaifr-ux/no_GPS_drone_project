@@ -58,11 +58,12 @@ class YOLONode(rclpy.node.Node):
 
         self._drone_lat = 0.0
         self._drone_lon = 0.0
+        self._frame_times: list[float] = []
 
         # Latest results shared with postview (main thread)
         self.lock           = threading.Lock()
         self.latest_frame   = None   # PIL annotated image
-        self.latest_result  = None   # dict: n, elapsed_ms, lat, lon, detections
+        self.latest_result  = None   # dict: n, elapsed_ms, fps, lat, lon, detections
 
         self.create_subscription(Image,       "/drone/camera/image_raw", self._cb_image, 1)
         self.create_subscription(PoseStamped, "/drone/pose",             self._cb_pose,  10)
@@ -89,6 +90,13 @@ class YOLONode(rclpy.node.Node):
         detections = self._det.detect(pil_img)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
+        self._frame_times.append(t0)
+        if len(self._frame_times) > 30:
+            self._frame_times.pop(0)
+        fps = ((len(self._frame_times) - 1) /
+               (self._frame_times[-1] - self._frame_times[0])
+               if len(self._frame_times) >= 2 else 0.0)
+
         # Publish ROS2 detections
         arr = Detection2DArray()
         arr.header = msg.header
@@ -112,9 +120,9 @@ class YOLONode(rclpy.node.Node):
             for d in detections:
                 print(f"[YOLO] {d['label']:12s}  conf={d['conf']:.2f}  "
                       f"box=({d['x1']:.0f},{d['y1']:.0f},"
-                      f"{d['x2']:.0f},{d['y2']:.0f})")
+                      f"{d['x2']:.0f},{d['y2']:.0f})  {fps:.1f} fps")
         else:
-            print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms  "
+            print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms  {fps:.1f} fps  "
                   f"lat={self._drone_lat:.5f} lon={self._drone_lon:.5f}")
 
         # Annotated frame for postview
@@ -123,7 +131,7 @@ class YOLONode(rclpy.node.Node):
         with self.lock:
             self.latest_frame  = annotated
             self.latest_result = dict(
-                n=n, elapsed_ms=elapsed_ms,
+                n=n, elapsed_ms=elapsed_ms, fps=fps,
                 lat=self._drone_lat, lon=self._drone_lon,
                 detections=detections,
             )
@@ -152,7 +160,7 @@ def run_postview(node: YOLONode):
             color = '#50ff50' if r['n'] > 0 else 'white'
             ax.set_title(
                 f"YOLO  {r['n']} vehicle{'s' if r['n'] != 1 else ''}  —  "
-                f"{r['elapsed_ms']:.0f} ms  |  "
+                f"{r['elapsed_ms']:.0f} ms  {r['fps']:.1f} fps  |  "
                 f"{r['lat']:.5f} N  {r['lon']:.5f} E",
                 color=color, fontsize=11, pad=4)
             im.set_data(_pil_to_array(frame))
