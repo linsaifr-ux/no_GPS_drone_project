@@ -12,5 +12,4 @@ ros2 run mavros mavros_node \
     --ros-args \
     -p fcu_url:="udp://:14540@127.0.0.1:14580" \
     -p tgt_system:=1 \
-    -p tgt_component:=1 \
-    -p fcu_protocol:="v2.0"
+    -p tgt_component:=1

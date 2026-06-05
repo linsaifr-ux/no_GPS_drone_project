@@ -1,72 +1,124 @@
-# Isaac Sim — Simulator README
+# simulator/ — Isaac Sim Physics Engine + Visualiser
 
-`cesium_scene.py` is the **physics engine and visualiser** for the no-GPS drone project. It runs a 100 Hz background physics thread (same 6-DOF kinematic model as `drone_sim.py`) + the ArduPilot SITL bridge, and publishes `/drone/state` for the flight commander and AnyLoc nodes. The render loop (~13 Hz) reads the current physics state and updates the drone mesh.
+`cesium_scene.py` is the **physics engine and visualiser** for the no-GPS drone project. It runs a 100 Hz background physics thread with a 6-DOF kinematic model and the autopilot SITL bridge, and publishes `/drone/state` for the flight commander and AnyLoc nodes. The render loop (~13 Hz) reads the physics state and updates the drone mesh in Cesium.
 
-**`drone_sim.py` is not used when Isaac Sim is running.** Both bind UDP 9002 — run only one at a time.
+**`drone_sim.py` is not used when Isaac Sim is running.** Both publish `/drone/state` and own a bridge port — run only one at a time.
 
-**Start `cesium_scene.py` before the autopilot SITL.** It must open the bridge port before SITL starts, or SITL exits immediately.
-
-Launch: `cd simulator && ./run_chiayi.sh`
-
-### Autopilot toggle: ArduPilot (default) vs PX4 (`PX4_SIM=1`)
-`cesium_scene.py` honours the `PX4_SIM` env var (same as `control/drone_sim.py`):
-- **unset** → ArduPilot `SITLBridge` on **UDP 9002** (binary servo in / JSON physics out); motor
-  decode uses the ArduCopter QUAD-X order.
-- **`PX4_SIM=1`** → PX4 `PX4SimBridge` on **TCP 4560** (HIL_ACTUATOR_CONTROLS in / HIL_SENSOR out);
-  motor decode uses the PX4 none_iris CA_ROTOR geometry. The kinematic model below the decode is
-  identical. See `control/README.md` for the PX4 launch sequence and migration status.
-
-For fast PX4 control-loop iteration use the headless `control/drone_sim.py` (`PX4_SIM=1`) instead
-of the full Isaac render.
+**Start `cesium_scene.py` before the autopilot SITL.** The bridge must be listening before SITL/PX4 connects, or it exits immediately.
 
 ---
 
-## Architecture inside cesium_scene.py
+## Launch
+
+```bash
+# ArduPilot (default)
+cd simulator && ./run_chiayi.sh
+
+# PX4
+cd simulator && ./run_chiayi.sh --px4
+```
+
+Or via the top-level launcher:
+```bash
+bash run.sh --tmux          # ArduPilot
+bash run.sh --tmux --px4    # PX4
+```
+
+---
+
+## Autopilot Toggle: ArduPilot vs PX4
+
+`cesium_scene.py` honours the `PX4_SIM` environment variable:
+
+| Value | Bridge | Port | Protocol |
+|-------|--------|------|----------|
+| unset / 0 | `SITLBridge` | UDP 9002 | Binary servo in / JSON FDM out |
+| `PX4_SIM=1` | `PX4SimBridge` | TCP 4560 | `HIL_ACTUATOR_CONTROLS` in / `HIL_SENSOR` out |
+
+`run_chiayi.sh --px4` sets `PX4_SIM=1` automatically. The kinematic model below the motor-decode layer is identical for both autopilots.
+
+For fast control-loop iteration without the Isaac Sim render overhead, use the headless `control/drone_sim.py` (also honours `PX4_SIM`).
+
+---
+
+## Architecture Inside cesium_scene.py
 
 ```
-Background thread (100 Hz)          Render loop (~13 Hz)
-─────────────────────────────        ─────────────────────────────
-bridge.step() ←→ ArduPilot SITL     read _k* state under lock
-kinematic 6-DOF integration          update drone_pos_op / drone_orient_op
-publish /drone/state                 HUD, frame capture, ROS2 spin
+Background thread (100 Hz)                   Render loop (~13 Hz)
+─────────────────────────────                ─────────────────────────────
+bridge.step() ↔ ArduPilot/PX4 SITL          read _k* state under _kin_lock
+kinematic 6-DOF integration                  update drone mesh position/orientation
+publish /drone/state (ENU)                   HUD overlay, frame capture, ROS2 spin
 ```
 
-## What the physics thread does each step (100 Hz)
+### Physics thread (100 Hz steps)
 
-1. Send current kinematic state to ArduPilot SITL via `SITLBridge` (UDP 9002)
-2. Receive latest motor PWM from ArduPilot
-3. Integrate 6-DOF kinematic model: PWM → thrust → roll/pitch → NED velocity → ENU position
-4. Apply ground constraint (no sliding on ground)
-5. Update shared state variables (protected by `threading.Lock`)
-6. Publish `/drone/state` (ENU PoseStamped, frame `local_enu`)
+1. Call `bridge.step()` — send kinematic state to autopilot, receive motor commands
+2. Decode motor outputs to roll/pitch torque targets:
+   - **ArduPilot** (QUAD-X): ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
+   - **PX4** (none_iris CA_ROTOR): control[0]=FR, [1]=RL, [2]=FL, [3]=RR
+3. Integrate attitude: first-order response toward roll/pitch target (τ = 0.15 s)
+4. Compute body-frame accelerations → NED velocity → ENU position
+5. Apply ground constraint (no movement below terrain elevation; zero horizontal velocity on landing)
+6. Update shared state (protected by `threading.Lock`)
+7. Publish `/drone/state` (ENU `PoseStamped`, frame `local_enu`)
 
-## Kinematic physics constants
+### Why 100 Hz matters
+
+Isaac Sim renders at ~13 fps. If the physics + bridge ran in the render loop, the autopilot would see 13 Hz physics replies. At 13 Hz, the altitude PID I-term accumulates too aggressively and the drone oscillates. At 100 Hz the control loop is stable and the drone tracks setpoints correctly.
+
+---
+
+## Kinematic Physics Model
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Mass | 1.0 kg | Sets hover at PWM 1500 matching `MOT_THST_HOVER=0.5` |
-| Max tilt | 0.35 rad (~20°) | From PWM differential |
-| Attitude τ | 0.15 s | First-order response |
-| Drag | 0.35 s⁻¹ | Aerodynamic drag |
-| Physics rate | 100 Hz | Background thread — ArduPilot sees 100 Hz physics |
-| Motor layout | ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW) | ArduCopter X-frame FRAME_TYPE=1 |
+| Gravity | 9.81 m/s² | |
+| Max tilt | 0.35 rad (~20°) | From motor differential |
+| Attitude τ | 0.15 s | First-order roll/pitch response |
+| Aerodynamic drag | 0.35 s⁻¹ | Applied to all velocity components |
+| Max velocity | 30 m/s | Clamp on NED components |
+| Physics rate | 100 Hz | Background thread |
+| Hover PWM | 1500 → p_norm=0.5 | Matches `MOT_THST_HOVER=0.5` |
+
+Thrust model: `thrust = mean(p_norm_4) * 2.0 * g` — at hover, mean p_norm = 0.5 → thrust = g → zero vertical acceleration.
 
 ---
 
-# Isaac Sim Environment Setup
+## ROS2 Topics Published
 
-A Python environment for running NVIDIA Isaac Sim 6.0.0 simulations.
+| Topic | Type | Rate | Content |
+|-------|------|------|---------|
+| `/drone/state` | `geometry_msgs/PoseStamped` | 100 Hz | ENU position (z = MSL altitude), heading quaternion |
+| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Nadir RGB 640×480 |
+| `/drone/pose` | `geometry_msgs/PoseStamped` | ~13 Hz | Same as `/drone/state` at render rate |
+| `/drone/agl` | `std_msgs/Float64` | ~13 Hz | Altitude above ground level (m) |
 
-## Requirements
+Subscribed: `/drone/reset` (`std_msgs/Bool`) — resets drone to origin.
+
+---
+
+## Cesium Scene
+
+- **Terrain**: Cesium World Terrain (asset 1) — 2 km radius around 23.4509°N, 120.2861°E
+- **Buildings**: Cesium OSM Buildings (asset 96188)
+- **Imagery**: Esri World Imagery (WMTS) with NLSC fallback
+- **Home elevation**: loaded from `cesium_terrain_cache/` at startup; written to `control/home_elevation.json`
+
+The terrain cache (`cesium_terrain_cache/`) and tile cache (`cesium_tile_cache/`) are pre-downloaded — no network required at runtime.
+
+---
+
+## Isaac Sim Setup
+
+### Requirements
 
 - NVIDIA GPU (RTX 2080 Ti or better, 8 GB+ VRAM)
 - NVIDIA driver 520+ (tested with 580.142)
-- [Miniconda](https://docs.conda.io/en/latest/miniconda.html)
+- Miniconda
 - Ubuntu 22.04 / 24.04
 
-## Setup
-
-### 1. Create the conda environment
+### 1. Create conda environment
 
 ```bash
 conda create -n isaac_sim_test python=3.12 -y
@@ -95,7 +147,7 @@ OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python -m pip install \
     --extra-index-url https://pypi.nvidia.com
 ```
 
-> **Note:** Total download is ~20 GB. The extscache packages alone are ~6 GB.
+> Total download ~20 GB. First run compiles CUDA kernels (~4 min); subsequent starts ~15 s.
 
 ### 3. Accept the EULA
 
@@ -104,33 +156,22 @@ echo "yes" > $(conda run -n isaac_sim_test python -c \
     "import isaacsim; import os; print(os.path.join(os.path.dirname(isaacsim.__file__), 'kit', 'EULA_ACCEPTED'))")
 ```
 
-### 4. Create missing extension stubs
-
-Isaac Sim 6.0.0.0 pip packages reference test-only and GUI-only extensions as hard dependencies. Run the included script to create lightweight stubs:
+### 4. Create missing extension stubs (one-time)
 
 ```bash
 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python create_stubs.py
-```
 
-Fix the version constraint on one stub (`carb.graphics_optional` requires `^2`):
-
-```bash
 sed -i 's/version = "1.0.0"/version = "2.0.0"/' \
     $(conda run -n isaac_sim_test python -c \
-    "import isaacsim, os; print(os.path.join(os.path.dirname(isaacsim.__file__), 'extsUser', 'carb.graphics_optional', 'config', 'extension.toml'))")
-```
+    "import isaacsim, os; print(os.path.join(os.path.dirname(isaacsim.__file__), \
+     'extsUser', 'carb.graphics_optional', 'config', 'extension.toml'))")
 
-Also create stubs for extensions required by the full GUI experience (`isaacsim.exp.full`) that are not installed:
-
-```bash
-ISAACSIM=$(conda run -n isaac_sim_test python -c "import isaacsim, os; print(os.path.dirname(isaacsim.__file__))")
+ISAACSIM=$(conda run -n isaac_sim_test python -c \
+    "import isaacsim, os; print(os.path.dirname(isaacsim.__file__))")
 for ext in \
-    isaacsim.examples.interactive \
-    isaacsim.exp.base \
-    isaacsim.robot_setup.assembler \
-    isaacsim.robot_setup.collision_detector \
-    isaacsim.robot_setup.gain_tuner \
-    isaacsim.robot_setup.grasp_editor \
+    isaacsim.examples.interactive isaacsim.exp.base \
+    isaacsim.robot_setup.assembler isaacsim.robot_setup.collision_detector \
+    isaacsim.robot_setup.gain_tuner isaacsim.robot_setup.grasp_editor \
     isaacsim.robot_setup.xrdf_editor; do
   mkdir -p "$ISAACSIM/extsUser/$ext/config"
   printf '[package]\nversion = "1.0.0"\ntitle = "%s stub"\n\n[dependencies]\n' "$ext" \
@@ -138,58 +179,37 @@ for ext in \
 done
 ```
 
-## Usage
-
-### Launch the full simulator (standard)
+### Performance tips
 
 ```bash
-cd simulator && ./run_chiayi.sh
+# Set CPU governor to performance for better throughput
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 ```
 
-This sources ROS2 Jazzy and runs `cesium_scene.py` in the `isaac_sim_test` conda environment.
+---
 
-### Run the headless test
-
-```bash
-./run_test.sh
-# or
-OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python test_isaac.py
-```
-
-### Launch the full GUI simulator standalone
-
-```bash
-DISPLAY=:0 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test isaacsim
-```
-
-Replace `:0` with your active X display (check with `echo $DISPLAY`).
-
-## Project structure
-
-```
-simulator/
-├── README.md           # This file
-├── cesium_scene.py     # Physics + visualiser: Cesium terrain, 100 Hz kinematic thread, SITL bridge
-├── run_chiayi.sh       # Launch script (sources ROS2 Jazzy, runs in conda env)
-├── test_isaac.py       # Headless test: creates a World and steps 5 times
-├── city_scene.py       # GUI city scene (standalone demo — not used in flight pipeline)
-├── geo_utils.py        # Geo helpers shared between scene scripts
-└── create_stubs.py     # One-time script to stub missing test extensions
-```
-
-## Performance notes
-
-- **First run:** ~4 minutes — Warp compiles CUDA kernels and caches them at `~/.cache/warp/`
-- **Subsequent runs:** ~15 seconds startup
-- **CPU powersave warning:** Set your CPU governor to `performance` for better throughput:
-  ```bash
-  echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-  ```
-
-## Known non-fatal warnings
+## Known Non-Fatal Warnings
 
 | Warning | Cause | Impact |
 |---------|-------|--------|
-| `isaacsim.robot.manipulators.examples` failed to load | Stub `isaacsim.examples.base` has no Python code | None — example UI only |
+| `isaacsim.robot.manipulators.examples` failed to load | Stub has no Python code | None — example UI only |
 | `omni.platforminfo` CPU core errors | Kernel 6.x topology reporting | None — cosmetic |
-| `Unexpected reference count` on UsdStage close | Normal during shutdown | None |
+| `Unexpected reference count` on shutdown | Normal UsdStage teardown | None |
+| BARO/MAG STALE at PX4 startup | Clock-settle transient (first few seconds) | Clears automatically |
+
+---
+
+## Files
+
+```
+simulator/
+├── cesium_scene.py     # Physics + visualiser: 100 Hz kinematic thread + bridge
+├── run_chiayi.sh       # Launch: sources ROS2, runs cesium_scene.py in conda [--px4]
+├── drone_frames/       # Latest rendered frame (latest.jpg + latest_meta.json)
+├── cesium_terrain_cache/  # Pre-downloaded terrain tiles
+├── cesium_tile_cache/     # Pre-downloaded 3D building tiles
+├── geo_utils.py        # Shared geo helpers (lat/lon ↔ metres, WMTS tile math)
+├── test_isaac.py       # Headless test: create World, step 5 times
+├── create_stubs.py     # One-time stub creation for missing Isaac extensions
+└── city_scene.py       # Standalone GUI demo (not used in flight pipeline)
+```

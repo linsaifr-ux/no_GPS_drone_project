@@ -1,64 +1,165 @@
 #!/bin/bash
 # run.sh — Autonomous drone mission launcher.
 #
-# Manual 3-terminal workflow:
+# ArduPilot mode (default):
+#   bash run.sh --tmux           — launch all services in tmux (existing EEPROM)
+#   bash run.sh --tmux --wipe    — wipe EEPROM and reload params (first run)
 #
-#   STEP 1 — SITL (ArduPilot + MAVProxy)
-#   ──────────────────────────────────────
-#   First-ever run (wipes EEPROM, loads no_gps.parm):
-#     bash control/launch_sitl.sh --wipe
-#     → Wait for "Received 1346 parameters", then type: reboot
+# PX4 mode:
+#   bash run.sh --tmux --px4            — full PX4 pipeline (saved parameters.bson)
+#   bash run.sh --tmux --px4 --params   — full PX4 pipeline + apply params (first run)
+#   bash run.sh --tmux --px4 --wipe     — wipe parameters.bson before starting
 #
-#   All subsequent runs (EEPROM already has params):
-#     bash control/launch_sitl.sh
+# Manual 3-terminal (ArduPilot):
+#   bash control/launch_sitl.sh --wipe   # first run → type 'reboot' in MAVProxy
+#   bash control/launch_sitl.sh          # subsequent runs
+#   bash control/launch_mavros.sh
+#   bash control/launch_commander.sh
 #
-#   STEP 2 — MAVROS2 bridge
-#   ────────────────────────
-#     bash control/launch_mavros.sh
-#
-#   STEP 3 — Flight commander (after MAVROS2 prints "CON: Got HEARTBEAT")
-#   ──────────────────────────────────────────────────────────────────────
-#     bash control/launch_commander.sh
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# Automated tmux mode (all 3 windows + auto-reboot on first run):
-#
-#   bash run.sh --tmux          — reuse existing EEPROM
-#   bash run.sh --tmux --wipe   — wipe EEPROM and reload params (first run)
-# ──────────────────────────────────────────────────────────────────────────────
+# Manual 4-terminal (PX4):
+#   bash simulator/run_chiayi.sh --px4   # Isaac Sim + bridge (TCP 4560) — first
+#   bash control/launch_px4_sitl.sh
+#   bash control/apply_px4_params.sh     # first run only
+#   bash control/launch_mavros_px4.sh
+#   bash control/launch_commander_px4.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 print_usage() {
     echo ""
     echo "Usage:"
-    echo "  bash run.sh                  — print this help"
-    echo "  bash run.sh --tmux           — launch all 3 in tmux (existing EEPROM)"
-    echo "  bash run.sh --tmux --wipe    — launch all 3 in tmux (wipe EEPROM first)"
+    echo "  bash run.sh                          — print this help"
+    echo "  bash run.sh --tmux                   — ArduPilot pipeline in tmux"
+    echo "  bash run.sh --tmux --wipe            — ArduPilot pipeline, wipe EEPROM"
+    echo "  bash run.sh --tmux --px4             — PX4 pipeline in tmux"
+    echo "  bash run.sh --tmux --px4 --params    — PX4 pipeline + apply params (first run)"
+    echo "  bash run.sh --tmux --px4 --wipe      — PX4 pipeline, wipe parameters.bson"
     echo ""
 }
 
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    print_usage
-    exit 0
-fi
+# ── Parse flags ────────────────────────────────────────────────────────────────
+TMUX_MODE=0; USE_PX4=0; WIPE=""; PARAMS=""
+for arg in "$@"; do
+    case "$arg" in
+        --tmux)   TMUX_MODE=1 ;;
+        --px4)    USE_PX4=1 ;;
+        --wipe)   WIPE="--wipe" ;;
+        --params) PARAMS=1 ;;
+        --help|-h) print_usage; exit 0 ;;
+    esac
+done
 
 # ── tmux mode ──────────────────────────────────────────────────────────────────
-if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
+if [[ "$TMUX_MODE" == "1" ]]; then
     if ! command -v tmux &>/dev/null; then
         echo "[run.sh] tmux not found.  sudo apt install tmux"
         exit 1
     fi
 
-    # Accept --wipe in either argument position
-    WIPE=""
-    [[ "$1" == "--wipe" || "$2" == "--wipe" ]] && WIPE="--wipe"
+    # ════════════════════════════════════════════════════════════════════════════
+    # PX4 pipeline
+    # ════════════════════════════════════════════════════════════════════════════
+    if [[ "$USE_PX4" == "1" ]]; then
+        SESSION="drone_px4"
+        MAVROS_LOG="/tmp/drone_mavros_px4_$$.log"
 
+        echo "[run.sh] Cleaning up old PX4 processes..."
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+        pkill -9 -f 'px4$|mavros_node|px4_commander' 2>/dev/null || true
+        sleep 2
+
+        # ── Window 0: Isaac Sim + PX4 bridge (TCP 4560) ─────────────────────
+        echo "[run.sh] Starting Isaac Sim (PX4_SIM=1) — may take ~2 min to load..."
+        tmux new-session -d -s "$SESSION" -x 220 -y 50
+        tmux rename-window -t "$SESSION:0" "Isaac"
+        tmux send-keys -t "$SESSION:0" \
+            "bash '$SCRIPT_DIR/simulator/run_chiayi.sh' --px4; exec bash" Enter
+
+        # Wait for TCP 4560 (bridge up = Isaac initialised its physics thread)
+        echo -n "[run.sh] Waiting for Isaac Sim bridge (TCP 4560)"
+        WAITED=0
+        while ! ss -tlnp 2>/dev/null | grep -q ":4560 "; do
+            sleep 3; WAITED=$((WAITED+3)); echo -n "."
+            if [[ $WAITED -ge 300 ]]; then
+                echo ""
+                echo "[run.sh] ERROR: TCP 4560 not ready after 300 s — check Isaac window."
+                tmux attach-session -t "$SESSION"; exit 1
+            fi
+        done
+        echo " done."
+
+        # ── Window 1: PX4 SITL ──────────────────────────────────────────────
+        echo "[run.sh] Starting PX4 SITL..."
+        tmux new-window -t "$SESSION"
+        tmux rename-window -t "$SESSION:1" "PX4"
+        tmux send-keys -t "$SESSION:1" \
+            "bash '$SCRIPT_DIR/control/launch_px4_sitl.sh' $WIPE; exec bash" Enter
+
+        # Wait for UDP 14580 (PX4 MAVLink ready)
+        echo -n "[run.sh] Waiting for PX4 SITL (UDP 14580)"
+        WAITED=0
+        while ! ss -ulnp 2>/dev/null | grep -q ":14580 "; do
+            sleep 1; WAITED=$((WAITED+1)); echo -n "."
+            if [[ $WAITED -ge 30 ]]; then
+                echo ""
+                echo "[run.sh] ERROR: UDP 14580 not ready — check PX4 window."
+                tmux attach-session -t "$SESSION"; exit 1
+            fi
+        done
+        echo " done."
+
+        # ── Apply params (first run / --params flag) ─────────────────────────
+        if [[ -n "$PARAMS" ]]; then
+            echo "[run.sh] Applying PX4 params (will reboot PX4)..."
+            bash "$SCRIPT_DIR/control/apply_px4_params.sh"
+        fi
+
+        # ── Window 2: MAVROS ─────────────────────────────────────────────────
+        echo "[run.sh] Starting MAVROS..."
+        tmux new-window -t "$SESSION"
+        tmux rename-window -t "$SESSION:2" "MAVROS"
+        tmux send-keys -t "$SESSION:2" \
+            "bash '$SCRIPT_DIR/control/launch_mavros_px4.sh' 2>&1 | tee '$MAVROS_LOG'; exec bash" \
+            Enter
+
+        # Wait for MAVROS heartbeat
+        echo -n "[run.sh] Waiting for MAVROS heartbeat"
+        WAITED=0
+        while ! grep -q "Got HEARTBEAT, connected" "$MAVROS_LOG" 2>/dev/null; do
+            sleep 2; WAITED=$((WAITED+2)); echo -n "."
+            if [[ $WAITED -ge 60 ]]; then
+                echo ""
+                echo "[run.sh] ERROR: MAVROS heartbeat not received — check MAVROS window."
+                tmux attach-session -t "$SESSION"; exit 1
+            fi
+        done
+        echo " done."
+        sleep 2
+
+        # ── Window 3: Commander ──────────────────────────────────────────────
+        echo "[run.sh] Starting PX4 commander..."
+        tmux new-window -t "$SESSION"
+        tmux rename-window -t "$SESSION:3" "Commander"
+        tmux send-keys -t "$SESSION:3" \
+            "bash '$SCRIPT_DIR/control/launch_commander_px4.sh'; exec bash" Enter
+
+        tmux select-window -t "$SESSION:0"
+        echo "[run.sh] PX4 pipeline running. Attaching tmux (Ctrl-B 0/1/2/3 = Isaac/PX4/MAVROS/Commander)"
+        if [ -t 1 ]; then
+            tmux attach-session -t "$SESSION"
+        else
+            echo "[run.sh] Not a TTY — connect manually:  tmux attach -t $SESSION"
+        fi
+        exit 0
+    fi
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # ArduPilot pipeline (original)
+    # ════════════════════════════════════════════════════════════════════════════
     SESSION="drone_mission"
     SITL_LOG="/tmp/drone_sitl_$$.log"
     MAVROS_LOG="/tmp/drone_mavros_$$.log"
 
-    # ── kill any stale session ───────────────────────────────────────────────
     echo "[run.sh] Cleaning up old processes..."
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     pkill -9 -f 'arducopter|mavproxy|mavros_node|flight_commander' 2>/dev/null || true
@@ -72,7 +173,6 @@ if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
         "bash '$SCRIPT_DIR/control/launch_sitl.sh' $WIPE 2>&1 | tee '$SITL_LOG'; exec bash" \
         Enter
 
-    # Poll until MAVProxy has saved all parameters (up to 120 s)
     echo -n "[run.sh] Waiting for SITL params to load"
     WAITED=0
     while ! grep -q "Saved 1346 parameters" "$SITL_LOG" 2>/dev/null; do
@@ -85,12 +185,9 @@ if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
     done
     echo " done."
 
-    # On --wipe runs: auto-send 'reboot' so params persist to eeprom
     if [[ -n "$WIPE" ]]; then
         echo "[run.sh] Sending 'reboot' to MAVProxy to persist params..."
         tmux send-keys -t "$SESSION:0" "reboot" Enter
-
-        # Poll until SITL comes back online (second 'ArduPilot Ready' = post-reboot boot)
         echo -n "[run.sh] Waiting for SITL reboot"
         WAITED=0
         while true; do
@@ -105,7 +202,7 @@ if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
         done
         echo " done."
     fi
-    sleep 2  # brief extra settle time
+    sleep 2
 
     # ── Window 1: MAVROS2 ────────────────────────────────────────────────────
     echo "[run.sh] Starting MAVROS2..."
@@ -115,7 +212,6 @@ if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
         "bash '$SCRIPT_DIR/control/launch_mavros.sh' 2>&1 | tee '$MAVROS_LOG'; exec bash" \
         Enter
 
-    # Poll until MAVROS2 gets a heartbeat (up to 60 s)
     echo -n "[run.sh] Waiting for MAVROS2 heartbeat"
     WAITED=0
     while ! grep -q "Got HEARTBEAT, connected" "$MAVROS_LOG" 2>/dev/null; do
@@ -127,20 +223,17 @@ if [[ "$1" == "--tmux" || "$2" == "--tmux" ]]; then
         fi
     done
     echo " done."
-    sleep 2  # brief extra settle time
+    sleep 2
 
     # ── Window 2: Flight Commander ───────────────────────────────────────────
     echo "[run.sh] Starting flight commander..."
     tmux new-window -t "$SESSION"
     tmux rename-window -t "$SESSION:2" "Commander"
     tmux send-keys -t "$SESSION:2" \
-        "bash '$SCRIPT_DIR/control/launch_commander.sh'; exec bash" \
-        Enter
+        "bash '$SCRIPT_DIR/control/launch_commander.sh'; exec bash" Enter
 
-    # Switch to SITL window so user sees the MAVProxy console first
     tmux select-window -t "$SESSION:0"
     echo "[run.sh] All services running. Attaching tmux (Ctrl-B 0/1/2 = SITL/MAVROS/Commander)"
-    # Attach only when running in a real terminal
     if [ -t 1 ]; then
         tmux attach-session -t "$SESSION"
     else
@@ -152,20 +245,25 @@ fi
 
 # ── print instructions mode (default) ─────────────────────────────────────────
 echo ""
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
 echo "  Drone Mission — Launch Sequence"
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
 echo ""
-echo "  Open 3 terminals and run in order:"
+echo "  ArduPilot (tmux):  bash run.sh --tmux [--wipe]"
+echo "  PX4 (tmux):        bash run.sh --tmux --px4 [--params] [--wipe]"
 echo ""
-echo "  [Terminal 1]  bash control/launch_sitl.sh --wipe    # first run"
-echo "                → Wait for 'Saved 1346 parameters', then type: reboot"
-echo "                bash control/launch_sitl.sh            # subsequent runs"
+echo "  Manual — ArduPilot:"
+echo "    [T1]  bash control/launch_sitl.sh --wipe    # first run"
+echo "          bash control/launch_sitl.sh            # subsequent runs"
+echo "    [T2]  bash control/launch_mavros.sh"
+echo "    [T3]  bash control/launch_commander.sh"
 echo ""
-echo "  [Terminal 2]  bash control/launch_mavros.sh"
-echo "                → Wait for: CON: Got HEARTBEAT, connected."
+echo "  Manual — PX4:"
+echo "    [T1]  bash simulator/run_chiayi.sh --px4"
+echo "    [T2]  bash control/launch_px4_sitl.sh"
+echo "          bash control/apply_px4_params.sh       # first run only"
+echo "    [T3]  bash control/launch_mavros_px4.sh"
+echo "    [T4]  bash control/launch_commander_px4.sh"
 echo ""
-echo "  [Terminal 3]  bash control/launch_commander.sh"
-echo ""
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
 print_usage

@@ -1,71 +1,153 @@
 # control/ — Flight control, SITL bridges, and autopilot integration
 
-This module connects the simulator physics to an autopilot (SITL) and runs the
-autonomous mission. **It supports two autopilots**, selected by the `PX4_SIM` env var:
+This module connects the simulator physics to an autopilot (SITL) and runs the autonomous mission.
+Two autopilots are supported via the `PX4_SIM` environment variable:
 
 | Autopilot | Bridge | Transport | Commander | Status |
 |-----------|--------|-----------|-----------|--------|
-| **ArduPilot** (default) | `sitl_bridge.py` | JSON FDM, UDP 9002 | `flight_commander.py` | takeoff+90 m alt OK; **horizontal WP nav has an unsolved `AC_PosControl` inversion** (see memory `horizontal-flyaway-diagnosis`) |
-| **PX4** (`PX4_SIM=1`) | `px4_sim_bridge.py` | MAVLink HIL, TCP 4560 | `px4_commander.py` | **migration in progress** — Phase 1 done (bridge↔PX4 validated), Phase 2/3 wiring underway |
+| **PX4** (`PX4_SIM=1`) | `px4_sim_bridge.py` | MAVLink HIL, TCP 4560 | `px4_commander.py` | **Full mission ready** — phases 1–5 complete; position-hold gate passed (<0.3 m drift); waypoint nav 90 m AGL / 699 m leg implemented |
+| **ArduPilot** (default) | `sitl_bridge.py` | JSON FDM, UDP 9002 | `flight_commander.py` | Takeoff + 90 m alt OK; **horizontal WP nav has an unresolved `AC_PosControl` direction inversion** |
 
-The PX4 migration was started because the ArduPilot position-control inversion
-defied an exhaustive investigation (EKF/velocity/yaw all verified correct, yet
-position setpoints + AUTO fly the mirror direction; only direct velocity commands track).
+The PX4 migration was started because ArduPilot's position controller inversion defied exhaustive investigation (EKF/velocity/yaw all verified correct; only direct velocity commands tracked correctly — position setpoints and AUTO mode flew the mirror direction).
+
+---
 
 ## Files
 
 ### Bridges (simulator ↔ autopilot)
-- **`sitl_bridge.py`** — ArduPilot SIM_JSON bridge. UDP 9002 server; binary servo PWM in,
-  JSON physics (IMU/attitude/velocity, NED) out. Owns the clock-reset-on-reconnect fix
-  (re-zeros the FDM clock per SITL session so SITL is restartable; see memory).
-- **`px4_sim_bridge.py`** — PX4 Simulator-MAVLink (HIL) bridge. **TCP 4560 server** (PX4 is
-  the client). In: `HIL_ACTUATOR_CONTROLS` (16 normalised motor outputs). Out: `HIL_SENSOR`
-  (accel/gyro body-FRD, synthetic mag rotated by attitude, baro). Reuses the IMU/specific-force
-  math from `sitl_bridge`. Notes:
-  - **time_usec**: PX4 `px4_clock_settime`s its CLOCK_MONOTONIC to it (even nolockstep) →
-    send `time.monotonic()*1e6`, not 0-based (a backward jump makes baro/mag STALE).
-  - Motor decode (PX4 none_iris CA_ROTOR geometry) is done in the sim: `control[0]=FR(+,+)
-    [1]=RL(-,-) [2]=FL(+,-) [3]=RR(-,+)`; roll=`(m1+m2)-(m0+m3)`, pitch=`(m0+m2)-(m1+m3)`.
 
-### Physics rigs (publish `/drone/state`, no Isaac Sim)
-- **`drone_sim.py`** — headless kinematic 6-DOF rig + bridge. `PX4_SIM=1` → PX4 bridge (4560),
-  else ArduPilot (9002). The fast control-loop iteration tool (no Isaac render overhead).
-  The full visual sim is `simulator/cesium_scene.py` (also honours `PX4_SIM`).
+**`px4_sim_bridge.py`** — PX4 Simulator-MAVLink (HIL) bridge. TCP 4560 server (PX4 is the client).
+- In: `HIL_ACTUATOR_CONTROLS` — 16 normalised motor outputs [0, 1]
+- Out: `HIL_SENSOR` — accel/gyro body-FRD, synthetic mag rotated by attitude, baro
+- `time_usec` must be `time.monotonic() * 1e6` — PX4 sets its CLOCK_MONOTONIC to it; a backward jump causes BARO/MAG STALE errors
+- Motor decode for PX4 none_iris quad-X (CA_ROTOR geometry): `control[0]=FR(+,+)`, `[1]=RL(-,-)`, `[2]=FL(+,-)`, `[3]=RR(-,+)`. Roll = `(m1+m2)-(m0+m3)`, pitch = `(m0+m2)-(m1+m3)`. Decode is in `cesium_scene.py` and `drone_sim.py` under `_PX4_SIM`.
+
+**`sitl_bridge.py`** — ArduPilot SIM_JSON bridge. UDP 9002 server.
+- In: binary `servo_packet_16` (40 bytes, magic=18458)
+- Out: JSON physics state terminated by `\n` — `velocity` included, `position` intentionally absent
+
+### Physics rigs (headless — no Isaac Sim)
+
+**`drone_sim.py`** — kinematic 6-DOF rig + SITL bridge. Honours `PX4_SIM`:
+- `PX4_SIM=0` → ArduPilot bridge (UDP 9002)
+- `PX4_SIM=1` → PX4 bridge (TCP 4560)
+
+Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop iteration without the full Isaac Sim render overhead. Not used when `cesium_scene.py` is running.
 
 ### Commanders (the mission)
-- **`flight_commander.py`** — ArduPilot/MAVROS: VPE injection (`/mavros/vision_pose`),
-  vision_speed, STABILIZE→GUIDED arm, NAV_TAKEOFF, waypoint nav (velocity-carrot `go_to_ned`).
-  Diagnostic harnesses: `CALIBRATE=1` (yaw/velocity probes), `HOLDTEST=1` (position-hold).
-- **`px4_commander.py`** — PX4/MAVROS: vision injection (`/mavros/vision_pose` + `/mavros/vision_speed`),
-  OFFBOARD-mode arm + takeoff-and-hold (the position-hold **gate** test).
+
+**`px4_commander.py`** — PX4/MAVROS2 full mission commander.
+- Vision injection: 20 Hz `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov` + velocity to `/mavros/vision_speed/speed_twist`
+- Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc estimate
+- Mission: pre-stream setpoints → OFFBOARD → arm → climb to 90 m → hold 5 s → carrot nav to WP (531 m N, −454 m E) → hold → Ctrl-C → RTL
+- `HOLDTEST=1`: 3 m hold gate (Phase 3 regression test)
+- `TAKEOFF_ALT=<m>`: override cruise altitude (default 90 m)
+- In-air restart: detects AGL > 5 m at startup and skips takeoff
+
+**`flight_commander.py`** — ArduPilot/MAVROS2 commander (reference; WP nav unresolved).
+- STABILIZE → arm → GUIDED → EKF origin → NAV_TAKEOFF → velocity-carrot WP → RTL
+- `HOLDTEST=1`, `CALIBRATE=1` diagnostic modes
 
 ### Parameters
-- **`no_gps.parm`** — ArduPilot SITL params (EK3_SRC*=ExternalNav, GPS off, tuned PSC/ATC gains).
-- **`px4_no_gps.params`** — PX4 params (`EKF2_GPS_CTRL=0`, `EKF2_EV_CTRL=15`, `EKF2_HGT_REF=3`,
-  no-RC/failsafe disables). Apply with `apply_px4_params.sh` then reboot PX4.
+
+**`px4_no_gps.params`** — PX4 no-GPS external-vision params:
+- `EKF2_GPS_CTRL=0`, `SYS_HAS_GPS=0`, `COM_ARM_WO_GPS=1`
+- `EKF2_EV_CTRL=15` (fuse EV pos+height+vel+yaw), `EKF2_HGT_REF=3` (vision altitude)
+- `EKF2_BARO_CTRL=0`, `COM_RC_IN_MODE=4`, failsafes disabled
+- Apply once with `apply_px4_params.sh` — persists in `parameters.bson`
+
+**`no_gps.parm`** — ArduPilot no-GPS params:
+- `EK3_SRC1_POSXY=6`, `EK3_SRC1_POSZ=6` (ExternalNav), `GPS_TYPE=0`
+- `FS_CRASH_CHECK=0`, `ARMING_CHECK=0`, `DISARM_DELAY=0`
 
 ### Launch scripts
-- ArduPilot: `launch_sitl.sh` (+`--wipe`), `launch_mavros.sh`, `launch_commander.sh`.
-- PX4: `apply_px4_params.sh`, `launch_mavros_px4.sh`, `px4_bridge_test.py` (standalone HIL link test).
 
-## PX4 launch (hard-won — see memory `px4-migration-plan`)
-1. Build once: `cd ~/PX4-Autopilot && PATH=~/.local/bin:$PATH make px4_sitl_nolockstep`
-   (nolockstep = PX4 free-runs, right for a render-paced sim). Python deps + `ninja` via
-   `pip install --user --break-system-packages …`.
-2. Bridge first (must own TCP 4560): `PX4_SIM=1 python3 control/drone_sim.py`.
-3. PX4: from `build/px4_sitl_nolockstep/rootfs`, run `PX4_SYS_AUTOSTART=10016 ../bin/px4 -d`
-   with **no other args** (extra args break px4's data_path auto-detect). Use `setsid` so the
-   daemon survives the launching shell.
-4. MAVROS: `bash control/launch_mavros_px4.sh` (fcu_url udp 14540).
-5. Params: `bash control/apply_px4_params.sh`, then reboot PX4.
-6. Commander: `python3 control/px4_commander.py` (vision + OFFBOARD hold gate).
+| Script | Purpose |
+|--------|---------|
+| `launch_px4_sitl.sh` | Start PX4 SITL (checks TCP 4560, waits for UDP 14580) |
+| `apply_px4_params.sh` | Set + save PX4 params, auto-reboot PX4 |
+| `launch_mavros_px4.sh` | MAVROS2 → PX4 (`fcu_url udp://:14540@127.0.0.1:14580`) |
+| `launch_commander_px4.sh` | Run `px4_commander.py` (sources ROS2) |
+| `launch_sitl.sh` | ArduPilot SITL via MAVProxy (`--wipe` flag) |
+| `launch_mavros.sh` | MAVROS2 → ArduPilot (UDP 14550) |
+| `launch_commander.sh` | Run `flight_commander.py` |
 
-## Phased migration status (2026-06-05)
-- ✅ **Phase 1** — PX4 SITL ↔ `px4_sim_bridge` validated: PX4 connects on 4560, 27k+ HIL_SENSOR
-  frames, **EKF2 → level attitude** (roll/pitch/yaw 0.0), sensors fresh. The bridge/IMU math is correct.
-- 🚧 **Phase 2/3** — `drone_sim PX4_SIM=1` runs and PX4 connects; `px4_commander`, MAVROS launch,
-  and params are built. **Open blockers:** (a) MAVROS↔PX4 link — PX4 SITL's onboard MAVLink
-  (14540/14580) isn't streaming bidirectionally to MAVROS (VER timeouts, `connected:false`);
-  (b) PX4 daemon stability/IPC under `-d`+`setsid` (px4 client occasionally can't reach the daemon).
-  Next: get the onboard MAVLink link up, then run the **position-hold gate** (make-or-break vs the
-  ArduPilot inversion), then waypoint, then AnyLoc/detection.
+### Test / diagnostics
+
+**`px4_bridge_test.py`** — standalone HIL link test (no ROS2, no MAVROS). Connects to TCP 4560, streams HIL_SENSOR for 30 s, prints frame count and EKF attitude. Use to verify the bridge/PX4 link before involving MAVROS.
+
+---
+
+## PX4 Launch Sequence
+
+> **Critical:** the bridge must own TCP 4560 **before** PX4 starts.
+
+```bash
+# 1. Bridge first (TCP 4560 server)
+PX4_SIM=1 python3 control/drone_sim.py          # headless
+# or:  bash simulator/run_chiayi.sh --px4       # Isaac Sim
+
+# 2. PX4 SITL
+bash control/launch_px4_sitl.sh [--wipe]        # --wipe deletes parameters.bson
+
+# 3. Apply params (first run only — persists)
+bash control/apply_px4_params.sh
+
+# 4. MAVROS2
+bash control/launch_mavros_px4.sh
+
+# 5. Commander
+source /opt/ros/jazzy/setup.bash
+python3 control/px4_commander.py
+# or: HOLDTEST=1 python3 control/px4_commander.py
+```
+
+Or use the top-level launcher:
+```bash
+bash run.sh --tmux --px4              # full Isaac Sim pipeline
+bash run.sh --tmux --px4 --params     # + apply params (first run)
+```
+
+### Hard-won PX4 notes
+
+- **No `-d` flag**: using `px4 -d` changes the working directory, breaking the `px4-param` IPC socket path. Use `setsid nohup` without `-d`; run from the rootfs dir.
+- **`fcu_protocol:="v2.0"`** must NOT be passed to MAVROS: PX4 denies `MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES` (520), causing MAVROS VER plugin to double-satisfy a future → `Promise already satisfied` crash.
+- **ENU convention**: `setpoint_raw/local` MAVROS2 always converts ENU→NED regardless of `FRAME_LOCAL_NED` flag. Send `x=East, y=North, z=Up(AGL)`.
+- **Stale bridge**: if a previous `drone_sim.py` is running on TCP 4560, PX4 silently connects to it. Always kill stale instances before starting the pipeline.
+
+---
+
+## PX4 Phase Status
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 1 | Done | Bridge↔PX4 validated: 27k+ HIL_SENSOR frames, EKF2 level attitude |
+| 2 | Done | Vision + MAVROS↔PX4 link; EKF tracks truth |
+| 3 | Done | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift |
+| 4 | Done | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg, RTL |
+| 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
+| 6 | TODO | End-to-end Isaac Sim waypoint flight test |
+
+---
+
+## ArduPilot Takeoff Sequence (reference)
+
+1. Start VPE thread (Phase 1: kinematic stub at 20 Hz)
+2. Set EKF global origin — block up to 60 s
+3. Arm in STABILIZE (bypasses GPS pre-arm checks)
+4. Switch to GUIDED
+5. Wait for `EKF_POS_HORIZ_ABS` flag (VPE accepted)
+6. `MAV_CMD_NAV_TAKEOFF` — monitor `/drone/state` AGL
+7. Hold 5 s, then velocity-carrot waypoint navigation
+
+---
+
+## Coordinate Conventions
+
+| Frame | Convention | Used by |
+|-------|-----------|---------|
+| `/drone/state` | ENU, MSL altitude (z = metres MSL) | cesium_scene.py, drone_sim.py |
+| VPE to MAVROS | ENU `"map"` frame (MAVROS converts to NED) | commanders |
+| `setpoint_raw/local` | ENU (MAVROS converts to NED) | commanders |
+| PX4 EKF2 internal | NED | autopilot |
+| ArduPilot EKF3 internal | NED | autopilot |

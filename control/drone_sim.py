@@ -127,7 +127,8 @@ def main():
     _kyaw_rad = 0.0           # heading (rad, NED CW); no PWM-driven yaw torque
     _kprev_t = None
 
-    print("[drone_sim] Kinematic drone on ground — waiting for ArduPilot servo packets …")
+    bridge_name = "PX4 HIL (TCP 4560)" if _PX4_SIM else "ArduPilot (UDP 9002)"
+    print(f"[drone_sim] Kinematic drone on ground — waiting for {bridge_name} …")
     print(f"[drone_sim] Home: AGL=0  MSL={HOME_ALT_MSL:.1f} m")
 
     try:
