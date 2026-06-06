@@ -88,6 +88,7 @@ class YOLONode(rclpy.node.Node):
         self._drone_agl = msg.data
 
     def _cb_image(self, msg):
+        _t_recv = time.perf_counter()
         if self._drone_agl < MIN_AGL:
             return
 
@@ -102,6 +103,7 @@ class YOLONode(rclpy.node.Node):
             self.get_logger().warn(f"Image decode: {e}")
             return
 
+        _t_decode_ms = (time.perf_counter() - _t_recv) * 1000.0
         t0 = time.perf_counter()
         detections = self._det.detect(pil_img)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -138,7 +140,8 @@ class YOLONode(rclpy.node.Node):
                       f"box=({d['x1']:.0f},{d['y1']:.0f},"
                       f"{d['x2']:.0f},{d['y2']:.0f})  {fps:.1f} fps")
         else:
-            print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms  {fps:.1f} fps  "
+            print(f"[YOLO] no vehicles  decode {_t_decode_ms:.0f} ms  "
+                  f"infer {elapsed_ms:.0f} ms  {fps:.1f} fps  "
                   f"lat={self._drone_lat:.5f} lon={self._drone_lon:.5f}")
 
         # Annotated frame for postview — scale boxes to half-res display

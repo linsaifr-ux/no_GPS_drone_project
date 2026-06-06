@@ -18,6 +18,11 @@
 #   bash run.sh --tmux --px4 --headless --wipe   — headless + wipe params
 #   (--anyloc and --detection require Isaac Sim for camera frames; ignored in headless)
 #
+# PX4 Isaac Sim no-window mode (full camera/AnyLoc/YOLO, no display — faster rep.step):
+#   bash run.sh --tmux --px4 --no-window                      — Isaac Sim headless
+#   bash run.sh --tmux --px4 --no-window --anyloc             — + AnyLoc
+#   bash run.sh --tmux --px4 --no-window --anyloc --detection — + YOLO detection
+#
 # Manual 3-terminal (ArduPilot):
 #   bash control/launch_sitl.sh --wipe   # first run → type 'reboot' in MAVProxy
 #   bash control/launch_sitl.sh          # subsequent runs
@@ -46,21 +51,28 @@ print_usage() {
     echo "  bash run.sh --tmux --px4 --anyloc --detection          — + YOLO detection"
     echo "  bash run.sh --tmux --px4 --headless                    — PX4 headless (no Isaac Sim)"
     echo "  bash run.sh --tmux --px4 --headless --params           — PX4 headless + apply params"
+    echo "  bash run.sh --tmux --px4 --no-window                           — Isaac Sim headless (no display, full camera)"
+    echo "  bash run.sh --tmux --px4 --no-window --anyloc                  — + AnyLoc"
+    echo "  bash run.sh --tmux --px4 --no-window --anyloc --detection      — + YOLO detection"
+    echo "  bash run.sh --tmux --px4 --no-window --rasterize               — headless + rasterization renderer (~20fps)"
+    echo "  bash run.sh --tmux --px4 --rasterize                           — rasterization renderer (windowed)"
     echo ""
 }
 
 # ── Parse flags ────────────────────────────────────────────────────────────────
-TMUX_MODE=0; USE_PX4=0; WIPE=""; PARAMS=""; HEADLESS=0; ANYLOC=0; DETECTION=0
+TMUX_MODE=0; USE_PX4=0; WIPE=""; PARAMS=""; HEADLESS=0; NO_WINDOW=0; RASTERIZE=0; ANYLOC=0; DETECTION=0
 for arg in "$@"; do
     case "$arg" in
-        --tmux)      TMUX_MODE=1 ;;
-        --px4)       USE_PX4=1 ;;
-        --wipe)      WIPE="--wipe" ;;
-        --params)    PARAMS=1 ;;
-        --headless)  HEADLESS=1 ;;
-        --anyloc)    ANYLOC=1 ;;
-        --detection) DETECTION=1 ;;
-        --help|-h)   print_usage; exit 0 ;;
+        --tmux)       TMUX_MODE=1 ;;
+        --px4)        USE_PX4=1 ;;
+        --wipe)       WIPE="--wipe" ;;
+        --params)     PARAMS=1 ;;
+        --headless)   HEADLESS=1 ;;
+        --no-window)  NO_WINDOW=1 ;;
+        --rasterize)  RASTERIZE=1 ;;
+        --anyloc)     ANYLOC=1 ;;
+        --detection)  DETECTION=1 ;;
+        --help|-h)    print_usage; exit 0 ;;
     esac
 done
 
@@ -103,11 +115,15 @@ if [[ "$TMUX_MODE" == "1" ]]; then
             done
             echo " done."
         else
-            echo "[run.sh] Starting Isaac Sim (PX4_SIM=1) — may take ~2 min to load..."
+            NOWIN_ARG="";    [[ "$NO_WINDOW"  == "1" ]] && NOWIN_ARG="--no-window"
+            RASTER_ARG="";   [[ "$RASTERIZE"  == "1" ]] && RASTER_ARG="--rasterize"
+            WIN_LABEL="Isaac"; [[ "$NO_WINDOW" == "1" ]] && WIN_LABEL="Isaac(nw)"
+            [[ "$RASTERIZE" == "1" ]] && WIN_LABEL="${WIN_LABEL}(r)"
+            echo "[run.sh] Starting Isaac Sim (PX4_SIM=1${NO_WINDOW:+, no window}${RASTERIZE:+, rasterize}) — may take ~2 min to load..."
             tmux new-session -d -s "$SESSION" -x 220 -y 50
-            tmux rename-window -t "$SESSION:0" "Isaac"
+            tmux rename-window -t "$SESSION:0" "$WIN_LABEL"
             tmux send-keys -t "$SESSION:0" \
-                "bash '$SCRIPT_DIR/simulator/run_chiayi.sh' --px4; exec bash" Enter
+                "bash '$SCRIPT_DIR/simulator/run_chiayi.sh' --px4 $NOWIN_ARG $RASTER_ARG; exec bash" Enter
 
             echo -n "[run.sh] Waiting for Isaac Sim bridge (TCP 4560)"
             WAITED=0
@@ -312,7 +328,8 @@ echo "  ArduPilot (tmux):         bash run.sh --tmux [--wipe]"
 echo "  PX4 (tmux):               bash run.sh --tmux --px4 [--params] [--wipe]"
 echo "  PX4 + AnyLoc:             bash run.sh --tmux --px4 --anyloc"
 echo "  PX4 + AnyLoc + Detection: bash run.sh --tmux --px4 --anyloc --detection"
-echo "  PX4 headless (tmux):      bash run.sh --tmux --px4 --headless [--params]"
+echo "  PX4 headless (tmux):      bash run.sh --tmux --px4 --headless [--params]
+  PX4 no-window (tmux):    bash run.sh --tmux --px4 --no-window [--anyloc] [--detection]"
 echo ""
 echo "  Manual — ArduPilot:"
 echo "    [T1]  bash control/launch_sitl.sh --wipe    # first run"

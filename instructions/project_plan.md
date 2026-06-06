@@ -14,8 +14,8 @@ no_GPS_drone_project/
 ├── simulator/
 │   ├── cesium_scene.py         # Physics engine + visualiser
 │   │                           #   100 Hz background thread: 6-DOF kinematic model + SITLBridge (UDP 9002)
-│   │                           #   render loop (~13 Hz): reads state, updates mesh, captures camera
-│   │                           #   publishes /drone/state (100 Hz) + /drone/camera/image_raw + /drone/pose + /drone/agl
+│   │                           #   render loop (~5 Hz): reads state, updates mesh, captures camera
+│   │                           #   publishes /drone/state (100 Hz) + /drone/camera/image_raw (1024×768) + /drone/pose + /drone/agl
 │   └── run_chiayi.sh           # Launch: sources ROS2 Jazzy, runs in conda env
 ├── anyloc/
 │   ├── build_database.py             # Build VLAD database (run once)

@@ -154,7 +154,7 @@ DISPLAY=:2 conda run -n isaac_sim_test --no-capture-output python3 -u anyloc/ros
 
 | Direction | Topic | Type | Notes |
 |---|---|---|---|
-| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 2048×1536 (AP-IMX900-Mini-USB3-I5) |
+| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 1024×768 (AP-IMX900-Mini-USB3-I5 at half native; optics: 88°×65.1° FOV, EFL 3.1 mm) |
 | Subscribe | `/drone/pose` | `geometry_msgs/PoseStamped` | WGS84 (lat, lon, alt_msl) |
 | Subscribe | `/drone/agl` | `std_msgs/Float64` | AGL in metres |
 | Publish | `/anyloc/pose_estimate` | `geometry_msgs/PoseWithCovarianceStamped` | AnyLoc estimate (monitoring) |

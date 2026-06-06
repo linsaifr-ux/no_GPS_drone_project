@@ -1,5 +1,92 @@
 # Project History
 
+## 2026-06-07 — Isaac Sim FPS diagnosis; --no-window and --rasterize modes; background publish thread
+
+### Investigation: Isaac Sim render loop FPS bottleneck
+
+**Symptom:** Isaac Sim camera loop running at ~2 fps initially, target 20 fps for reliable VO.
+
+**Diagnosis — three-stage profiling:**
+
+1. Added `[PERF]` timing around `simulation_app.update()` and `rep.orchestrator.step()` + `get_data()` separately.
+2. Varied resolution (2048×1536 → 1024×768 → 512×384), rt_subframes (1→0), viewport size (1920×1080 → 1280×720), RTX denoiser (on→off via carb settings), renderer mode (RaytracingLighting → FullRasterization), headless mode (`--no-window`), and `pause_timeline=True`.
+3. Split `rep.step` and `get_data` timing: `rep.step=186ms`, `get_data=1ms` — GPU→CPU transfer is instant; entire bottleneck is inside `rep.orchestrator.step()`.
+
+**Result:** `rep.orchestrator.step()` has a **~190 ms fixed floor** invariant to all of the above. It is not GPU rendering (FullRasterization made zero difference), not timeline stepping (`pause_timeline=True` had zero effect), not the denoiser, and not the resolution. The floor is internal to the replicator annotator pipeline.
+
+**Attempted bypass:** replacing `rep.orchestrator.step()` with multiple `simulation_app.update()` calls → annotator returns empty frames regardless of count. `rep.orchestrator.preview()` → also empty. The annotator requires `rep.orchestrator.step()` and cannot be populated by `simulation_app.update()` alone.
+
+**Conclusion:** 5 fps is the hard ceiling with the current replicator setup. The right fix is making navigation robust at 5 fps (larger LK window, VPE at 20 Hz via VO dead-reckoning, vision velocity publishing) — not chasing camera FPS. These are deferred to a later session.
+
+**Optimisations kept (cumulative improvement ~416 ms → ~210 ms):**
+- Camera render resolution: 2048×1536 → 1024×768
+- `rt_subframes`: 1 → 0
+- Viewport: 1920×1080 → 1280×720
+- RTX denoiser disabled via carb settings (`/rtx/post/dlss/execMode=0`, `/rtx/denoise/enabled=False`)
+
+Files: `simulator/cesium_scene.py`.
+
+---
+
+### New: --no-window flag (Isaac Sim headless — no display, full camera)
+
+`--no-window` runs Isaac Sim with `"headless": True` in `SimulationApp`. The display window is suppressed; camera, physics, Replicator annotator, and ROS2 topics all run normally. GPU is freed from viewport rendering — `sim.update` drops from 44 ms to 20 ms, but `rep.step` is unchanged at 190 ms.
+
+Parsed before `SimulationApp` initialises (Kit must not have opened a window yet):
+```python
+_NO_WINDOW = "--no-window" in sys.argv
+if _NO_WINDOW:
+    sys.argv.remove("--no-window")
+from isaacsim import SimulationApp
+simulation_app = SimulationApp({"headless": _NO_WINDOW, ...})
+```
+
+`run_chiayi.sh` already forwards unknown flags via `FWDARGS`, so no change needed there. `run.sh` gains `NO_WINDOW` flag, `--no-window` case, `NOWIN_ARG` variable injected into the `run_chiayi.sh` call.
+
+```bash
+bash run.sh --tmux --px4 --no-window
+bash run.sh --tmux --px4 --no-window --anyloc --detection
+```
+
+`--anyloc` and `--detection` work normally with `--no-window` (both require Isaac Sim camera, not the display window). They are only blocked by `--headless` (which runs `drone_sim.py` — no camera at all).
+
+Files: `simulator/cesium_scene.py`, `run.sh`.
+
+---
+
+### New: --rasterize flag (FullRasterization renderer)
+
+`--rasterize` passes `"renderer": "FullRasterization"` to `SimulationApp`. Tested but made zero difference to `rep.step` timing (confirmed the 190 ms is not GPU rendering). Kept as an option for future investigation.
+
+```bash
+bash run.sh --tmux --px4 --no-window --rasterize
+```
+
+Files: `simulator/cesium_scene.py`, `run.sh`.
+
+---
+
+### New: background publish thread for ROS2 camera publishing
+
+`tobytes()`, PIL JPEG encode, and ROS2 message serialisation are moved to a background daemon thread. A depth-1 queue (`_pub_q`) decouples the render loop from publishing: `put_nowait()` drops a frame silently if the worker is still busy, so the render loop never blocks on publishing. `DRONE_SAVE_FRAMES = False` (was always-on disk write) skips `drone_frames/latest.jpg` by default.
+
+Shutdown: `_pub_q.put(None); _pub_thread.join(timeout=2.0)` before `_trace_f.close()`.
+
+Files: `simulator/cesium_scene.py`.
+
+---
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `simulator/cesium_scene.py` | `--no-window` + `--rasterize` flags; RTX denoiser off; background publish thread; `DRONE_SAVE_FRAMES=False`; render res 1024×768; `rt_subframes=0`; viewport 1280×720; `[PERF]` split timing |
+| `run.sh` | `--no-window`, `--rasterize` flags; help text; `NOWIN_ARG`/`RASTER_ARG` wired to `run_chiayi.sh` |
+| `anyloc/vo_refiner.py` | Default `cam_w=1024, cam_h=768` (matches published camera resolution) |
+| `detection/ros2_node.py` | Add `_t_decode_ms` instrumentation; print `decode N ms  infer N ms` |
+
+---
+
 ## 2026-06-06 — PX4-7 prep: AnyLoc + detection integration fixes
 
 ### Bug: duplicate VPE when AnyLoc node runs alongside commander

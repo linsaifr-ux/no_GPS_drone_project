@@ -20,8 +20,10 @@ cd simulator && ./run_chiayi.sh --px4
 
 Or via the top-level launcher:
 ```bash
-bash run.sh --tmux          # ArduPilot
-bash run.sh --tmux --px4    # PX4
+bash run.sh --tmux                          # ArduPilot
+bash run.sh --tmux --px4                    # PX4 (windowed)
+bash run.sh --tmux --px4 --no-window        # PX4 headless (no display window, full camera)
+bash run.sh --tmux --px4 --no-window --rasterize  # + FullRasterization renderer (experimental)
 ```
 
 ---
@@ -44,13 +46,22 @@ For fast control-loop iteration without the Isaac Sim render overhead, use the h
 ## Architecture Inside cesium_scene.py
 
 ```
-Background thread (100 Hz)                   Render loop (~13 Hz)
+Background thread (100 Hz)                   Render loop (~5 Hz)
 ─────────────────────────────                ──────────────────────────────────────
 bridge.step() ↔ ArduPilot/PX4 SITL          read _k* state under _kin_lock
 kinematic 6-DOF integration                  update drone mesh position/orientation
 publish /drone/state (ENU)                   2-axis gimbal: cam = conj(drone)×yaw_only
-                                             HUD, frame capture, ROS2 spin
+                                             HUD, rep.orchestrator.step() (~190 ms floor)
+                                             _pub_q.put_nowait() → background publish thread
+                                             ↓
+                              Background publish thread (daemon)
+                              ─────────────────────────────────
+                              tobytes() + ROS2 serialise
+                              publish /drone/camera/image_raw
+                              publish /drone/pose, /drone/agl
 ```
+
+> **Render loop FPS floor:** `rep.orchestrator.step()` has a fixed ~190 ms cost that is invariant to resolution, renderer (RTX/rasterization), headless mode, denoiser settings, and extra `simulation_app.update()` calls. It is internal to the replicator annotator pipeline. The render loop runs at ~5 fps as a result.
 
 ### Physics thread (100 Hz steps)
 
@@ -78,7 +89,7 @@ publish /drone/state (ENU)                   2-axis gimbal: cam = conj(drone)×y
 
 ### Why 100 Hz matters
 
-Isaac Sim renders at ~13 fps. If the physics + bridge ran in the render loop, the autopilot would see 13 Hz physics replies. At 13 Hz, the altitude PID I-term accumulates too aggressively and the drone oscillates. At 100 Hz the control loop is stable and the drone tracks setpoints correctly.
+The replicator render loop runs at ~5 fps. If the physics + bridge ran in the render loop, the autopilot would see 5 Hz physics replies. At 5 Hz, the altitude PID I-term accumulates too aggressively and the drone oscillates. At 100 Hz the control loop is stable and the drone tracks setpoints correctly.
 
 ---
 
@@ -105,9 +116,9 @@ Thrust model: `thrust = mean(p_norm_4) * 2.0 * g` — at hover, mean p_norm = 0.
 | Topic | Type | Rate | Content |
 |-------|------|------|---------|
 | `/drone/state` | `geometry_msgs/PoseStamped` | 100 Hz | ENU position (z = MSL altitude), heading quaternion |
-| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Gimbal-stabilised nadir RGB 2048×1536 (AP-IMX900-Mini-USB3-I5) |
-| `/drone/pose` | `geometry_msgs/PoseStamped` | ~13 Hz | Same as `/drone/state` at render rate |
-| `/drone/agl` | `std_msgs/Float64` | ~13 Hz | Altitude above ground level (m) |
+| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~5 Hz | Gimbal-stabilised nadir RGB 1024×768 (optics = AP-IMX900-Mini-USB3-I5: 88°×65.1°, EFL 3.1 mm) |
+| `/drone/pose` | `geometry_msgs/PoseStamped` | ~5 Hz | Same as `/drone/state` at render rate |
+| `/drone/agl` | `std_msgs/Float64` | ~5 Hz | Altitude above ground level (m) |
 
 Subscribed: `/drone/reset` (`std_msgs/Bool`) — resets drone to origin.
 

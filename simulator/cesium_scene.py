@@ -15,7 +15,7 @@ Run:
 """
 
 import csv
-import io as _io, json, math, os, struct, sys, threading, time, urllib.parse, urllib.request
+import io as _io, json, math, os, queue as _queue, struct, sys, threading, time, urllib.parse, urllib.request
 
 # Project root on path so control/ package is importable from simulator/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -69,8 +69,9 @@ R_EARTH    = 6_371_000.0
 COS_LAT    = math.cos(math.radians(CENTER_LAT))
 HERE             = os.path.dirname(os.path.abspath(__file__))
 DRONE_FRAME_DIR  = os.path.join(HERE, "drone_frames")
-DRONE_CAM_W, DRONE_CAM_H = 2048, 1536   # AP-IMX900-Mini-USB3-I5 native resolution
-DRONE_SAVE_EVERY = 1    # capture a frame every N sim steps
+DRONE_CAM_W, DRONE_CAM_H = 1024, 768    # render res (optics stay 88°×65.1°; native=2048×1536)
+DRONE_SAVE_EVERY  = 1      # capture every render frame (rep.step dominates; no benefit skipping)
+DRONE_SAVE_FRAMES = False  # write drone_frames/latest.jpg to disk (debug; off by default)
 DRONE_SPEED_M    = 5.0  # keyboard move step (m)
 
 # WGS-84
@@ -111,13 +112,30 @@ def ecef_to_geodetic_vec(xyz: np.ndarray):
     return np.degrees(lat), lon, alt
 
 # ── Isaac Sim ──────────────────────────────────────────────────────────────────
+# Parse --no-window before SimulationApp (must happen before Kit initialises)
+_NO_WINDOW = "--no-window" in sys.argv
+if _NO_WINDOW:
+    sys.argv.remove("--no-window")
+
+_RASTERIZE = "--rasterize" in sys.argv
+if _RASTERIZE:
+    sys.argv.remove("--rasterize")
+
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({
-    "headless":     False,
-    "width":        1920,
-    "height":       1080,
+    "headless":     _NO_WINDOW,
+    "renderer":     "FullRasterization" if _RASTERIZE else "RaytracingLighting",
+    "width":        1280,
+    "height":       720,
     "window_title": "Isaac Sim — Cesium ion  23.45°N 120.29°E",
 })
+
+# Disable RTX denoiser — it is the ~190 ms fixed floor in rep.orchestrator.step().
+# With FullRasterization this is a no-op; with RaytracingLighting it saves ~50-80 ms.
+import carb as _carb
+_rs = _carb.settings.get_settings()
+_rs.set("/rtx/post/dlss/execMode", "0")   # 0 = DLSS off
+_rs.set("/rtx/denoise/enabled", False)
 
 import omni.usd
 from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
@@ -815,6 +833,67 @@ if _ROS2_OK:
         print(f"[ROS2] Node init failed: {_e} — falling back to file output")
         _ros2_node = None
 
+# ── Background publish thread ─────────────────────────────────────────────────
+# Encode + ROS2 serialise + publish happen here so the render loop is never
+# blocked by CPU-heavy tobytes() or PIL JPEG encode.
+# Queue depth = 1: put_nowait() in the render loop silently drops a frame when
+# the worker is still busy — always processes the freshest available frame.
+_pub_q: _queue.Queue = _queue.Queue(maxsize=1)
+
+def _publish_worker():
+    _first = True
+    while True:
+        item = _pub_q.get()
+        if item is None:
+            break
+        rgb_arr, lat, lon, alt, agl, yaw_CCW, step = item
+        try:
+            if DRONE_SAVE_FRAMES:
+                Image.fromarray(rgb_arr, "RGB").save(
+                    os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=85)
+                with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as _mf:
+                    json.dump({
+                        "step": step, "lat": lat, "lon": lon,
+                        "alt_m": alt, "agl_m": agl,
+                        "centre_elev": centre_elev,
+                        "yaw_deg": math.degrees(yaw_CCW),
+                        "frame_w": DRONE_CAM_W, "frame_h": DRONE_CAM_H,
+                    }, _mf)
+            if _ros2_node is not None:
+                _now = _ros2_node.get_clock().now().to_msg()
+                img_msg = RosImage()
+                img_msg.header.stamp    = _now
+                img_msg.header.frame_id = "drone_camera"
+                img_msg.height   = DRONE_CAM_H
+                img_msg.width    = DRONE_CAM_W
+                img_msg.encoding = "rgb8"
+                img_msg.step     = DRONE_CAM_W * 3
+                img_msg.data     = rgb_arr.flatten().tobytes()
+                _img_pub.publish(img_msg)
+                _hy = yaw_CCW / 2.0
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp    = _now
+                pose_msg.header.frame_id = "wgs84"
+                pose_msg.pose.position.x = lat
+                pose_msg.pose.position.y = lon
+                pose_msg.pose.position.z = alt
+                pose_msg.pose.orientation.z = math.sin(_hy)
+                pose_msg.pose.orientation.w = math.cos(_hy)
+                _pose_pub.publish(pose_msg)
+                agl_msg = Float64()
+                agl_msg.data = float(agl)
+                _agl_pub.publish(agl_msg)
+                if _first:
+                    print("[ROS2] First frame published to /drone/camera/image_raw")
+                    _first = False
+        except Exception as _pub_e:
+            print(f"[PUB] Worker error: {_pub_e}")
+        finally:
+            _pub_q.task_done()
+
+_pub_thread = threading.Thread(target=_publish_worker, name="cam-pub", daemon=True)
+_pub_thread.start()
+
 # ── LOAD CESIUM OSM BUILDINGS ─────────────────────────────────────────────────
 print("[CESIUM] Loading Cesium OSM Buildings …")
 building_tiles, bld_token = fetch_building_tiles()
@@ -1193,8 +1272,12 @@ print("[SCENE] Running — close the window to exit")
 simulation_app.update()
 
 _step = 0
+_t_update_ms = 0.0
+_t_rep_ms    = 0.0
 while simulation_app.is_running():
+    _t0 = time.perf_counter()
     simulation_app.update()   # advances physics + rendering
+    _t_update_ms = (time.perf_counter() - _t0) * 1000.0
     _step += 1
 
     # ── Read physics state from background thread ──────────────────────────────
@@ -1234,10 +1317,18 @@ while simulation_app.is_running():
         _lbl_alt.text    = f"  ALT  {_alt:.1f} m MSL    AGL  {_agl:.1f} m"
         _lbl_cam.text    = f"  CAM  Overview"
 
-    # ── Frame capture + publish ───────────────────────────────────────────────
+    # ── Frame capture ──────────────────────────────────────────────────────────────
     if _step % DRONE_SAVE_EVERY == 0:
-        rep.orchestrator.step(rt_subframes=1, delta_time=0.0)
+        _t0 = time.perf_counter()
+        rep.orchestrator.step(rt_subframes=0, delta_time=0.0)
+        _t_step_ms = (time.perf_counter() - _t0) * 1000.0
         raw = _rgb.get_data()
+        _t_rep_ms = (time.perf_counter() - _t0) * 1000.0
+        _t_get_ms = _t_rep_ms - _t_step_ms
+        if _step % (DRONE_SAVE_EVERY * 20) == 0:
+            print(f"[PERF] sim.update {_t_update_ms:.0f} ms | "
+                  f"rep.step {_t_step_ms:.0f} ms | get_data {_t_get_ms:.0f} ms | "
+                  f"loop {(_t_update_ms + _t_rep_ms):.0f} ms total")
         if raw is None:
             print(f"[DRONE] step {_step}: get_data() returned None — frame skipped")
         else:
@@ -1246,55 +1337,16 @@ while simulation_app.is_running():
                 print(f"[DRONE] step {_step}: empty frame — skipped")
             else:
                 rgb_arr = arr[:, :, :3].astype(np.uint8)
-
-                Image.fromarray(rgb_arr, "RGB").save(
-                    os.path.join(DRONE_FRAME_DIR, "latest.jpg"), "JPEG", quality=90)
-                with open(os.path.join(DRONE_FRAME_DIR, "latest_meta.json"), "w") as f:
-                    json.dump({
-                        "step":        _step,
-                        "lat":         _lat,
-                        "lon":         _lon,
-                        "alt_m":       _alt,
-                        "agl_m":       _agl,
-                        "centre_elev": centre_elev,
-                        "yaw_deg":     _yaw_deg,
-                        "frame_w":     DRONE_CAM_W,
-                        "frame_h":     DRONE_CAM_H,
-                    }, f)
                 if _step == DRONE_SAVE_EVERY:
-                    print(f"[DRONE] Frame capture working — saving to {DRONE_FRAME_DIR}/")
+                    print(f"[DRONE] Frame capture working — publishing via background thread")
+                # Encode + publish in background; drop frame if worker is still busy
+                try:
+                    _pub_q.put_nowait((rgb_arr, _lat, _lon, _alt, _agl, _yaw_CCW, _step))
+                except _queue.Full:
+                    pass
 
-                if _ros2_node is not None:
-                    _now = _ros2_node.get_clock().now().to_msg()
-
-                    img_msg = RosImage()
-                    img_msg.header.stamp    = _now
-                    img_msg.header.frame_id = "drone_camera"
-                    img_msg.height   = DRONE_CAM_H
-                    img_msg.width    = DRONE_CAM_W
-                    img_msg.encoding = "rgb8"
-                    img_msg.step     = DRONE_CAM_W * 3
-                    img_msg.data     = rgb_arr.flatten().tobytes()
-                    _img_pub.publish(img_msg)
-
-                    pose_msg = PoseStamped()
-                    pose_msg.header.stamp    = _now
-                    pose_msg.header.frame_id = "wgs84"
-                    pose_msg.pose.position.x = _lat
-                    pose_msg.pose.position.y = _lon
-                    pose_msg.pose.position.z = _alt
-                    _hy = _yaw_CCW / 2.0
-                    pose_msg.pose.orientation.z = math.sin(_hy)
-                    pose_msg.pose.orientation.w = math.cos(_hy)
-                    _pose_pub.publish(pose_msg)
-
-                    agl_msg = Float64()
-                    agl_msg.data = float(_agl)
-                    _agl_pub.publish(agl_msg)
-
-                    if _step == DRONE_SAVE_EVERY:
-                        print("[ROS2] First frame published to /drone/camera/image_raw")
-
+_pub_q.put(None)   # signal publish worker to exit cleanly
+_pub_thread.join(timeout=2.0)
 _trace_f.close()
 print(f"[DRONE] Flight trace saved → {_trace_path}")
 simulation_app.close()

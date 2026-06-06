@@ -22,7 +22,7 @@ Autonomous drone that localises itself and detects objects without GPS, validate
 │  PX4:       PX4SimBridge TCP 4560  (HIL_ACTUATOR_CONTROLS in /       │
 │                                     HIL_SENSOR out)                  │
 │  Publishes: /drone/state (ENU PoseStamped, 100 Hz)                  │
-│             /drone/camera/image_raw (2-axis gimbal nadir, 2048×1536) │
+│             /drone/camera/image_raw (2-axis gimbal nadir, 1024×768)  │
 │             /drone/pose  /drone/agl                                  │
 └───────┬──────────────────────────────────────────────────────────────┘
         │ /drone/state
@@ -155,6 +155,10 @@ bash run.sh --tmux --px4 --anyloc
 
 # With AnyLoc + YOLO vehicle detection:
 bash run.sh --tmux --px4 --anyloc --detection
+
+# Headless Isaac Sim (no display window — full camera/AnyLoc/YOLO still run):
+bash run.sh --tmux --px4 --no-window
+bash run.sh --tmux --px4 --no-window --anyloc --detection
 ```
 
 tmux windows: **0 Isaac** · **1 PX4** · **2 MAVROS** · **3 Commander** · **4 AnyLoc** · **5 Detection**  
