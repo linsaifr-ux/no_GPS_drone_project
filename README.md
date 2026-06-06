@@ -107,7 +107,7 @@ no_GPS_drone_project/
 | PX4-4 | Waypoint nav ported to px4_commander.py (90 m, 699 m leg) | Done |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (90 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
-| 7 | AnyLoc + detection integration in PX4 pipeline | TODO |
+| 7 | AnyLoc + detection integration in PX4 pipeline | In progress |
 | 8 | Deploy to real hardware | TODO |
 
 ---
@@ -146,12 +146,20 @@ PATH=~/.local/bin:$PATH make px4_sitl_nolockstep
 # First run — apply params and wipe saved state:
 bash run.sh --tmux --px4 --params --wipe
 
-# Subsequent runs:
+# Subsequent runs (control loop only):
 bash run.sh --tmux --px4
+
+# With AnyLoc GPS-denied localisation (Phase 2 VPE from visual matching):
+bash run.sh --tmux --px4 --anyloc
+
+# With AnyLoc + YOLO vehicle detection:
+bash run.sh --tmux --px4 --anyloc --detection
 ```
 
-tmux windows: **0 Isaac** · **1 PX4** · **2 MAVROS** · **3 Commander**  
-Switch with `Ctrl-B 0/1/2/3`. The commander prints `[PX4Cmd]` progress to window 3.
+tmux windows: **0 Isaac** · **1 PX4** · **2 MAVROS** · **3 Commander** · **4 AnyLoc** · **5 Detection**  
+Switch with `Ctrl-B 0–5`. The commander prints `[PX4Cmd]` progress to window 3.
+
+> **AnyLoc startup:** loading the 6.8 GB VLAD database takes ~20 min. The commander starts immediately and uses kinematic truth VPE until AnyLoc produces its first estimate above 50 m AGL. Check window 4 for `[AnyLoc] Model ready` before the drone reaches cruise altitude.
 
 ### Run — headless (no Isaac Sim, for control-loop testing)
 
@@ -235,6 +243,8 @@ Both commanders publish `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose
 
 Altitude always comes from `/drone/state` (kinematic AGL); cov_z = 0.25 m².  
 Frame: `"map"` (ENU) — MAVROS converts to NED for PX4/ArduPilot.
+
+**Heading:** ENU yaw = π/2 (North) in **both** phases. `/drone/pose` encodes orientation as `qz = sin(−_kyaw_rad / 2)`, so a North-facing drone (`_kyaw_rad = 0`) produces `yaw_deg = 0` (East) in `latest_estimate.json` — a 90° error. Since the drone never yaws, the commander hardcodes π/2 for consistent, correct heading across both phases.
 
 ### MAVROS2 setpoint convention
 

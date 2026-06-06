@@ -26,6 +26,7 @@ import rclpy
 import rclpy.node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float64
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 import matplotlib
@@ -42,6 +43,8 @@ MODEL_PT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "yolov8l_visdrone.pt")
 
+MIN_AGL = 50.0   # m — skip inference below this altitude
+
 
 def _pil_to_array(pil_img, size=(640, 480)):
     img = pil_img.resize(size, PILImage.LANCZOS).convert('RGB')
@@ -56,8 +59,10 @@ class YOLONode(rclpy.node.Node):
 
         self._det = YOLODetector(MODEL_PT, conf=0.30)
 
-        self._drone_lat = 0.0
-        self._drone_lon = 0.0
+        self._drone_lat  = 0.0
+        self._drone_lon  = 0.0
+        self._drone_agl  = 0.0
+        self._agl_logged = False
         self._frame_times: list[float] = []
 
         # Latest results shared with postview (main thread)
@@ -67,6 +72,7 @@ class YOLONode(rclpy.node.Node):
 
         self.create_subscription(Image,       "/drone/camera/image_raw", self._cb_image, 1)
         self.create_subscription(PoseStamped, "/drone/pose",             self._cb_pose,  10)
+        self.create_subscription(Float64,     "/drone/agl",              self._cb_agl,   10)
 
         self.pub = self.create_publisher(Detection2DArray, "/yolo/detections", 1)
 
@@ -78,7 +84,17 @@ class YOLONode(rclpy.node.Node):
         self._drone_lat = msg.pose.position.x
         self._drone_lon = msg.pose.position.y
 
+    def _cb_agl(self, msg):
+        self._drone_agl = msg.data
+
     def _cb_image(self, msg):
+        if self._drone_agl < MIN_AGL:
+            return
+
+        if not self._agl_logged:
+            print(f"[YOLO] AGL {self._drone_agl:.0f} m ≥ {MIN_AGL:.0f} m — starting detection")
+            self._agl_logged = True
+
         try:
             pil_img = PILImage.frombytes(
                 "RGB", (msg.width, msg.height), bytes(msg.data))

@@ -126,8 +126,10 @@ class PX4Commander(rclpy.node.Node):
           Phase 2 (AGL ≥ MIN_LOCALISATION_AGL):
             position = AnyLoc estimate from latest_estimate.json, cov_xy = err_m²
 
-        Heading-only quaternion: ENU yaw = π/2 (= facing North) so PX4 EKF2
-        receives the correct North heading without roll/pitch contamination.
+        Heading quaternion: ENU yaw = π/2 (North) in both phases.
+        /drone/pose encodes -_kyaw_rad (not π/2-_kyaw_rad), so the kinematic
+        yaw_deg=0 maps to East, not North. Since the drone never yaws, π/2 is
+        always correct and keeps Phase 1→2 VPE yaw continuous.
         MAVROS converts ENU yaw=π/2 → NED yaw=0 (North).
         """
         def loop():
@@ -169,7 +171,12 @@ class PX4Commander(rclpy.node.Node):
                             if (est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL
                                     and err_m < 100.0):
                                 lat  = est["est_lat"]; lon = est["est_lon"]
-                                yaw  = math.radians(est.get("yaw_deg", 0.0))
+                                # Always π/2 (ENU North): the kinematic drone never
+                                # yaws and /drone/pose encodes -_kyaw_rad (not π/2-_kyaw_rad),
+                                # giving yaw_deg=0 (East) when the drone actually faces
+                                # North. Hardcoding π/2 matches Phase 1 and avoids a
+                                # 90° VPE yaw jump at the Phase 1→2 transition.
+                                yaw  = math.pi / 2.0
                                 n_v  = (lat - HOME_LAT) * M_PER_DEG
                                 e_v  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
                                 cov  = max(1.0, err_m ** 2)

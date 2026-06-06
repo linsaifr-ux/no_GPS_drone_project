@@ -151,12 +151,11 @@ DISPLAY=:2 conda run -n isaac_sim_test --no-capture-output python3 -u anyloc/ros
 | Direction | Topic | Type | Notes |
 |---|---|---|---|
 | Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 640×480 |
-| Subscribe | `/drone/pose` | `geometry_msgs/PoseStamped` | ENU position |
+| Subscribe | `/drone/pose` | `geometry_msgs/PoseStamped` | WGS84 (lat, lon, alt_msl) |
 | Subscribe | `/drone/agl` | `std_msgs/Float64` | AGL in metres |
-| Publish | `/anyloc/pose_estimate` | `geometry_msgs/PoseWithCovarianceStamped` | AnyLoc estimate |
-| Publish | `/mavros/vision_pose/pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | VPE to EKF |
+| Publish | `/anyloc/pose_estimate` | `geometry_msgs/PoseWithCovarianceStamped` | AnyLoc estimate (monitoring) |
 
-VPE is published only when AGL ≥ 50 m. Below that threshold the flight commander's Phase 1 kinematic VPE is active. The `latest_estimate.json` file is written to disk so the commander can read it independently.
+**VPE to MAVROS is not published by this node.** `px4_commander.py` reads `latest_estimate.json` and publishes `/mavros/vision_pose/pose_cov` with correct per-axis covariance. Publishing from both processes caused duplicate EKF2 inputs.
 
 ### latest_estimate.json format
 
@@ -164,12 +163,14 @@ VPE is published only when AGL ≥ 50 m. Below that threshold the flight command
 {
   "est_lat": 23.4512,
   "est_lon": 120.2847,
-  "yaw_deg": 90.0,
+  "yaw_deg": 0.0,
   "agl_m": 82.3,
   "error_m": 55.1,
   "timestamp": 1748991234.5
 }
 ```
+
+> **Note on `yaw_deg`:** This field is the drone's kinematic yaw extracted from `/drone/pose`, but `/drone/pose` encodes orientation as `qz = sin(−_kyaw_rad / 2)` — not the correct ENU conversion (`π/2 − _kyaw_rad`). For a North-facing drone (`_kyaw_rad = 0`), `yaw_deg` is always `0.0` (East), which is a 90° error. `px4_commander.py` ignores this field and hardcodes ENU yaw = π/2 (North) for VPE in both Phase 1 and Phase 2, since the drone never yaws in simulation.
 
 ---
 

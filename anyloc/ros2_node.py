@@ -10,9 +10,11 @@ Subscribes:
 
 Publishes:
   /anyloc/pose_estimate    (geometry_msgs/PoseWithCovarianceStamped)
-  /mavros/vision_pose/pose (geometry_msgs/PoseStamped, NED from home → MAVROS2)
 
-Also writes anyloc/latest_estimate.json (for legacy run_flight.py / run_vision.py).
+Writes:
+  anyloc/latest_estimate.json — read by px4_commander.py Phase 2 VPE thread.
+  VPE publishing to MAVROS is intentionally handled by the commander (not here)
+  to avoid duplicate EKF2 inputs when both processes run together.
 
 Run:
   source /opt/ros/jazzy/setup.bash
@@ -57,6 +59,7 @@ M_PER_DEG    = 111_320.0
 
 ANYLOC_INTERVAL = 10
 SEARCH_RADIUS_M = 200.0
+MIN_AGL         = 50.0   # m — below this AGL skip inference (matches px4_commander Phase 2)
 
 HERE          = os.path.dirname(os.path.abspath(__file__))
 DB_PATH       = os.path.join(HERE, "database")
@@ -100,12 +103,6 @@ def _geo_dist_m(lat1, lon1, lat2, lon2):
                       (lon1 - lon2) * M_PER_DEG * COS_LAT)
 
 
-def _ned_from_geopose(lat, lon, alt_msl):
-    return ((lat - HOME_LAT) * M_PER_DEG,
-            (lon - HOME_LON) * M_PER_DEG * COS_LAT,
-            -(alt_msl - HOME_ALT_MSL))
-
-
 def _yaw_from_quat(qz, qw):
     return 2.0 * math.atan2(qz, qw)
 
@@ -120,18 +117,20 @@ class AnyLocNode(rclpy.node.Node):
         self._vo  = VORefiner()
 
         # Localization state
-        self._frame_count = 0
-        self._anchor_lat  = None
-        self._anchor_lon  = None
-        self._accum_dlat  = 0.0
-        self._accum_dlon  = 0.0
+        self._frame_count  = 0
+        self._anchor_lat   = None
+        self._anchor_lon   = None
+        self._accum_dlat   = 0.0
+        self._accum_dlon   = 0.0
+        self._last_score   = 0.0   # score from most recent AnyLoc anchor (reused for VO frames)
 
         # Drone state (updated by pose/agl callbacks)
         self._drone_lat = HOME_LAT
         self._drone_lon = HOME_LON
         self._drone_alt = HOME_ALT_MSL
         self._drone_yaw = 0.0      # radians
-        self._drone_agl = 50.0
+        self._drone_agl = 0.0
+        self._agl_logged = False   # one-time "AGL reached" print
 
         # Latest results shared with postview thread
         self.lock         = threading.Lock()
@@ -147,8 +146,10 @@ class AnyLocNode(rclpy.node.Node):
         # Publishers
         self.pub_est = self.create_publisher(
             PoseWithCovarianceStamped, "/anyloc/pose_estimate", 1)
-        self.pub_vpe = self.create_publisher(
-            PoseStamped, "/mavros/vision_pose/pose", 1)
+        # Note: VPE to MAVROS is handled by px4_commander.py reading latest_estimate.json.
+        # Publishing directly to /mavros/vision_pose/pose here caused duplicate VPE when
+        # running alongside the commander, confusing EKF2. The file-based interface is the
+        # correct integration point.
 
         self.get_logger().info("AnyLoc node ready — waiting for /drone/camera/image_raw")
 
@@ -165,6 +166,14 @@ class AnyLocNode(rclpy.node.Node):
         self._drone_agl = msg.data if msg.data > 0.5 else self._drone_agl
 
     def _cb_image(self, msg):
+        agl_m = self._drone_agl
+        if agl_m < MIN_AGL:
+            return
+
+        if not self._agl_logged:
+            print(f"[AnyLoc] AGL {agl_m:.0f} m ≥ {MIN_AGL:.0f} m — starting inference")
+            self._agl_logged = True
+
         try:
             pil_img = PILImage.frombytes(
                 "RGB", (msg.width, msg.height), bytes(msg.data))
@@ -202,16 +211,15 @@ class AnyLocNode(rclpy.node.Node):
             if result is None:
                 return
             est_lat, est_lon, est_alt, match_img, score, db_idx = result
-            self._anchor_lat = est_lat
-            self._anchor_lon = est_lon
-            self._accum_dlat = 0.0
-            self._accum_dlon = 0.0
+            self._anchor_lat  = est_lat
+            self._anchor_lon  = est_lon
+            self._accum_dlat  = 0.0
+            self._accum_dlon  = 0.0
+            self._last_score  = score
             self._vo.reset()
-            self._write_estimate(est_lat, est_lon, drone_alt, agl_m, yaw_deg,
-                                 score, drone_lat, drone_lon)
         else:
             match_img = None
-            score     = 0.0
+            score     = self._last_score
             db_idx    = 0
             est_lat   = (self._anchor_lat + self._accum_dlat
                          if self._anchor_lat is not None else None)
@@ -222,6 +230,12 @@ class AnyLocNode(rclpy.node.Node):
 
         if est_lat is None:
             return
+
+        # Write JSON every frame with VO-smoothed position so the commander's
+        # VPE thread gets a continuous update stream instead of a stale anchor
+        # that jumps every ANYLOC_INTERVAL frames (~2 s), causing EKF2 lurches.
+        self._write_estimate(est_lat, est_lon, drone_alt, agl_m, yaw_deg,
+                             score, drone_lat, drone_lon)
 
         self._publish(est_lat, est_lon, drone_alt)
 
@@ -261,16 +275,6 @@ class AnyLocNode(rclpy.node.Node):
         cov[21] = cov[28] = cov[35] = 0.3**2
         est.pose.covariance = cov
         self.pub_est.publish(est)
-
-        north, east, down = _ned_from_geopose(lat, lon, alt_msl)
-        vpe = PoseStamped()
-        vpe.header.stamp = now; vpe.header.frame_id = "map"  # ENU: x=East, y=North, z=Up
-        vpe.pose.position.x = east    # ENU East  (was: north — swapped)
-        vpe.pose.position.y = north   # ENU North (was: east  — swapped)
-        vpe.pose.position.z = -down   # ENU Up    (was: down  — wrong sign)
-        vpe.pose.orientation.z = math.sin(hy)
-        vpe.pose.orientation.w = math.cos(hy)
-        self.pub_vpe.publish(vpe)
 
     def _write_estimate(self, est_lat, est_lon, alt_msl, agl_m,
                         yaw_deg, score, drone_lat, drone_lon):

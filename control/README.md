@@ -42,7 +42,8 @@ Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop i
 
 **`px4_commander.py`** — PX4/MAVROS2 full mission commander.
 - Vision injection: 20 Hz `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov` + velocity to `/mavros/vision_speed/speed_twist`
-- Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc estimate
+- Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
+- VPE heading: ENU yaw = π/2 (North) in **both** phases. `/drone/pose` encodes `−_kyaw_rad` not `π/2−_kyaw_rad`, so `yaw_deg=0` in the JSON maps to East, not North. Since the drone never yaws, π/2 is always correct and avoids a 90° EKF2 heading jump at the Phase 1→2 transition.
 - Mission: pre-stream setpoints → OFFBOARD → arm → climb to 90 m → hold 5 s → carrot nav to WP (531 m N, −454 m E) → hold → Ctrl-C → RTL
 - `HOLDTEST=1`: 3 m hold gate (Phase 3 regression test)
 - `TAKEOFF_ALT=<m>`: override cruise altitude (default 90 m)

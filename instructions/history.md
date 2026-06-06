@@ -1,5 +1,69 @@
 # Project History
 
+## 2026-06-06 — PX4-7 prep: AnyLoc + detection integration fixes
+
+### Bug: duplicate VPE when AnyLoc node runs alongside commander
+
+**Symptom:** `anyloc/ros2_node.py` published `PoseStamped` (no covariance) to `/mavros/vision_pose/pose` while `px4_commander.py` publishes `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov`. Running both simultaneously sent two conflicting VPE streams into PX4 EKF2.
+
+**Fix:** Removed the `pub_vpe` publisher and `_ned_from_geopose()` helper from `anyloc/ros2_node.py`. The AnyLoc node now writes only to `anyloc/latest_estimate.json`; the commander is the sole MAVROS VPE publisher.
+
+Files: `anyloc/ros2_node.py`, `anyloc/README.md`.
+
+---
+
+### New: AGL gate on AnyLoc and YOLO nodes (MIN_AGL = 50 m)
+
+Both `anyloc/ros2_node.py` and `detection/ros2_node.py` subscribe to `/drone/agl` (std_msgs/Float64) and skip `_cb_image` processing until AGL ≥ 50 m. A one-time log line confirms when inference starts. Initial `_drone_agl = 0.0` (not 50.0) so the gate is always closed at startup until the first AGL reading arrives.
+
+Files: `anyloc/ros2_node.py`, `detection/ros2_node.py`.
+
+---
+
+### Bug: non-straight flight with AnyLoc active (stale JSON updates)
+
+**Symptom:** With AnyLoc running, the drone deviated from the straight-line path to the waypoint. Position corrections appeared as ~2-second bursts orthogonal to the intended course.
+
+**Root cause:** `_write_estimate()` (which writes `latest_estimate.json`) was only called on AnyLoc anchor frames (every 10 camera frames, ~2 s). Between anchors, VO accumulated `_accum_dlat/_accum_dlon` internally but never wrote them to the file. The commander's VPE thread (reading JSON at 20 Hz) received a stale anchor position for ~2 s, then a sudden jump when the next AnyLoc frame fired. This EKF2 position jump triggered a position-controller correction burst in the wrong direction.
+
+**Fix:** Moved `_write_estimate()` outside the `if run_anyloc:` block so it runs on every camera frame. VO-frame writes use `est_lat = anchor_lat + accum_dlat` / `est_lon = anchor_lon + accum_dlon`. The commander's VPE thread now receives a smooth ~6 Hz update stream instead of 2-second jumps. Added `self._last_score = 0.0` to carry the most recent AnyLoc score for reuse on VO frames.
+
+Files: `anyloc/ros2_node.py`.
+
+---
+
+### Bug: 90° VPE yaw discontinuity at Phase 1→2 transition
+
+**Symptom:** Phase 1 VPE sent `yaw = π/2` (ENU North). Phase 2 read `yaw_deg` from `latest_estimate.json`, which was always 0° (ENU East) — causing a 90° yaw jump in EKF2 at the 50 m AGL threshold.
+
+**Root cause:** `cesium_scene.py` encodes `/drone/pose` orientation as `qz = sin(-_kyaw_rad / 2)`. For `_kyaw_rad = 0` (North in NED), this gives `qz = 0, qw = 1` → ENU yaw = 0 (East), not π/2 (North). The `anyloc` node extracted this as `yaw_deg = 0.0` and wrote it to `latest_estimate.json`. The commander used it as the VPE heading, telling EKF2 the drone faces East when it actually faces North.
+
+**Fix:** `px4_commander.py` Phase 2 now hardcodes `yaw = math.pi / 2.0` instead of reading `yaw_deg` from JSON. Since the kinematic drone never yaws (`_kyaw_rad` stays 0 throughout all flights), π/2 (North) is always correct and keeps the VPE heading consistent between phases.
+
+Files: `control/px4_commander.py`.
+
+---
+
+### New: run.sh --anyloc / --detection flags
+
+`run.sh` gains `--anyloc` and `--detection` flags. When Isaac Sim mode is active, `--anyloc` opens tmux window 4 running `anyloc/run_ros2_localizer.sh`; `--detection` (requires `--anyloc`) opens window 5 running `detection/run_ros2_detector.sh`. In headless mode, `--anyloc` is ignored with a warning (no camera frames). Full pipeline: `bash run.sh --tmux --px4 --anyloc --detection`.
+
+Files: `run.sh`.
+
+---
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `anyloc/ros2_node.py` | Remove duplicate VPE publisher; AGL gate (MIN_AGL=50m); write JSON every frame (VO-smoothed) |
+| `detection/ros2_node.py` | Add `/drone/agl` subscriber; AGL gate (MIN_AGL=50m) |
+| `control/px4_commander.py` | Phase 2 VPE yaw hardcoded π/2 (was reading yaw_deg=0 from JSON) |
+| `run.sh` | Add `--anyloc` and `--detection` flags; windows 4 and 5 |
+| `anyloc/README.md` | Remove `/mavros/vision_pose/pose` row; add file-based VPE note |
+
+---
+
 ## 2026-06-05 — PX4 physics sign fix; second-order model in Isaac Sim; flight trace tools; end-to-end confirmed
 
 ### Bug: northward runaway on takeoff (physics sign inversion)

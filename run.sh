@@ -6,14 +6,17 @@
 #   bash run.sh --tmux --wipe    — wipe EEPROM and reload params (first run)
 #
 # PX4 mode (with Isaac Sim):
-#   bash run.sh --tmux --px4            — full PX4 pipeline (saved parameters.bson)
-#   bash run.sh --tmux --px4 --params   — full PX4 pipeline + apply params (first run)
-#   bash run.sh --tmux --px4 --wipe     — wipe parameters.bson before starting
+#   bash run.sh --tmux --px4                        — full PX4 pipeline
+#   bash run.sh --tmux --px4 --params               — + apply params (first run)
+#   bash run.sh --tmux --px4 --wipe                 — wipe parameters.bson before starting
+#   bash run.sh --tmux --px4 --anyloc               — + AnyLoc localizer (window 4)
+#   bash run.sh --tmux --px4 --anyloc --detection   — + YOLO detection (window 5)
 #
 # PX4 headless mode (no Isaac Sim — kinematic physics only):
 #   bash run.sh --tmux --px4 --headless          — headless bridge (drone_sim.py)
 #   bash run.sh --tmux --px4 --headless --params — headless + apply params (first run)
 #   bash run.sh --tmux --px4 --headless --wipe   — headless + wipe params
+#   (--anyloc and --detection require Isaac Sim for camera frames; ignored in headless)
 #
 # Manual 3-terminal (ArduPilot):
 #   bash control/launch_sitl.sh --wipe   # first run → type 'reboot' in MAVProxy
@@ -33,27 +36,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 print_usage() {
     echo ""
     echo "Usage:"
-    echo "  bash run.sh                                    — print this help"
-    echo "  bash run.sh --tmux                           — ArduPilot pipeline in tmux"
-    echo "  bash run.sh --tmux --wipe                    — ArduPilot pipeline, wipe EEPROM"
-    echo "  bash run.sh --tmux --px4                     — PX4 + Isaac Sim pipeline"
-    echo "  bash run.sh --tmux --px4 --params            — PX4 pipeline + apply params (first run)"
-    echo "  bash run.sh --tmux --px4 --wipe              — PX4 pipeline, wipe parameters.bson"
-    echo "  bash run.sh --tmux --px4 --headless          — PX4 headless (no Isaac Sim)"
-    echo "  bash run.sh --tmux --px4 --headless --params — PX4 headless + apply params"
+    echo "  bash run.sh                                              — print this help"
+    echo "  bash run.sh --tmux                                     — ArduPilot pipeline in tmux"
+    echo "  bash run.sh --tmux --wipe                              — ArduPilot pipeline, wipe EEPROM"
+    echo "  bash run.sh --tmux --px4                               — PX4 + Isaac Sim pipeline"
+    echo "  bash run.sh --tmux --px4 --params                      — PX4 pipeline + apply params (first run)"
+    echo "  bash run.sh --tmux --px4 --wipe                        — PX4 pipeline, wipe parameters.bson"
+    echo "  bash run.sh --tmux --px4 --anyloc                      — PX4 + Isaac Sim + AnyLoc localizer"
+    echo "  bash run.sh --tmux --px4 --anyloc --detection          — + YOLO detection"
+    echo "  bash run.sh --tmux --px4 --headless                    — PX4 headless (no Isaac Sim)"
+    echo "  bash run.sh --tmux --px4 --headless --params           — PX4 headless + apply params"
     echo ""
 }
 
 # ── Parse flags ────────────────────────────────────────────────────────────────
-TMUX_MODE=0; USE_PX4=0; WIPE=""; PARAMS=""; HEADLESS=0
+TMUX_MODE=0; USE_PX4=0; WIPE=""; PARAMS=""; HEADLESS=0; ANYLOC=0; DETECTION=0
 for arg in "$@"; do
     case "$arg" in
-        --tmux)     TMUX_MODE=1 ;;
-        --px4)      USE_PX4=1 ;;
-        --wipe)     WIPE="--wipe" ;;
-        --params)   PARAMS=1 ;;
-        --headless) HEADLESS=1 ;;
-        --help|-h)  print_usage; exit 0 ;;
+        --tmux)      TMUX_MODE=1 ;;
+        --px4)       USE_PX4=1 ;;
+        --wipe)      WIPE="--wipe" ;;
+        --params)    PARAMS=1 ;;
+        --headless)  HEADLESS=1 ;;
+        --anyloc)    ANYLOC=1 ;;
+        --detection) DETECTION=1 ;;
+        --help|-h)   print_usage; exit 0 ;;
     esac
 done
 
@@ -171,9 +178,32 @@ if [[ "$TMUX_MODE" == "1" ]]; then
         tmux send-keys -t "$SESSION:3" \
             "bash '$SCRIPT_DIR/control/launch_commander_px4.sh' 2>&1 | tee '$CMD_LOG'; exec bash" Enter
 
+        # ── Window 4: AnyLoc localizer (Isaac Sim only — needs camera) ───────
+        WIN_LABELS="0/1/2/3 = Isaac/PX4/MAVROS/Commander"
+        if [[ "$ANYLOC" == "1" && "$HEADLESS" == "0" ]]; then
+            echo "[run.sh] Starting AnyLoc localizer (startup ~20 min — loading VLAD database)..."
+            tmux new-window -t "$SESSION"
+            tmux rename-window -t "$SESSION:4" "AnyLoc"
+            tmux send-keys -t "$SESSION:4" \
+                "bash '$SCRIPT_DIR/anyloc/run_ros2_localizer.sh'; exec bash" Enter
+            WIN_LABELS="$WIN_LABELS · 4=AnyLoc"
+
+            # ── Window 5: YOLO detection ─────────────────────────────────────
+            if [[ "$DETECTION" == "1" ]]; then
+                echo "[run.sh] Starting YOLO detection..."
+                tmux new-window -t "$SESSION"
+                tmux rename-window -t "$SESSION:5" "Detection"
+                tmux send-keys -t "$SESSION:5" \
+                    "bash '$SCRIPT_DIR/detection/run_ros2_detector.sh'; exec bash" Enter
+                WIN_LABELS="$WIN_LABELS · 5=Detection"
+            fi
+        elif [[ "$ANYLOC" == "1" && "$HEADLESS" == "1" ]]; then
+            echo "[run.sh] WARNING: --anyloc ignored in headless mode (no camera frames)"
+        fi
+
         tmux select-window -t "$SESSION:0"
         echo "[run.sh] Commander log: $CMD_LOG"
-        echo "[run.sh] PX4 pipeline running. Attaching tmux (Ctrl-B 0/1/2/3 = Isaac/PX4/MAVROS/Commander)"
+        echo "[run.sh] PX4 pipeline running. Attaching tmux (Ctrl-B $WIN_LABELS)"
         if [ -t 1 ]; then
             tmux attach-session -t "$SESSION"
         else
@@ -280,6 +310,8 @@ echo "════════════════════════�
 echo ""
 echo "  ArduPilot (tmux):         bash run.sh --tmux [--wipe]"
 echo "  PX4 (tmux):               bash run.sh --tmux --px4 [--params] [--wipe]"
+echo "  PX4 + AnyLoc:             bash run.sh --tmux --px4 --anyloc"
+echo "  PX4 + AnyLoc + Detection: bash run.sh --tmux --px4 --anyloc --detection"
 echo "  PX4 headless (tmux):      bash run.sh --tmux --px4 --headless [--params]"
 echo ""
 echo "  Manual — ArduPilot:"

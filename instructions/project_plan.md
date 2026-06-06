@@ -150,9 +150,10 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 7. Hold 5 s at WP
 8. Ctrl-C → RTL
 
-**VPE two-phase (same as ArduPilot path):**
+**VPE two-phase:**
 - Phase 1 (AGL < 50 m): kinematic truth, cov = 0.1 m²
 - Phase 2 (AGL ≥ 50 m): AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
+- Heading: ENU yaw = π/2 (North) in both phases — `/drone/pose` encodes `−_kyaw_rad` (not `π/2−_kyaw_rad`), giving `yaw_deg=0` (East) for a North-facing drone. Hardcoding π/2 avoids a 90° VPE yaw jump at Phase 1→2.
 
 **Physics fix (2026-06):** PX4 path requires second-order angular rate model in `drone_sim.py` and `cesium_scene.py`. First-order (τ=0.15 s) causes motor oscillation at 100 Hz steps → zero net horizontal force + slow altitude sink. Sign: `_kbfwd = -thrust * sin(pitch)` (FRD positive pitch = nose-UP = southward force = stable negative feedback).
 
@@ -318,7 +319,7 @@ bash control/launch_commander.sh
 | PX4-4 | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg | Done ✓ |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done ✓ |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
-| PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | TODO |
+| PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + detection → PX4 commands | TODO |
