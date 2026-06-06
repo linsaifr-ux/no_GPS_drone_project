@@ -57,7 +57,7 @@ except (FileNotFoundError, KeyError):
     print(f"[PX4Cmd] HOME_ALT_MSL = {HOME_ALT_MSL:.1f} m  (default)")
 
 # ── Mission parameters ─────────────────────────────────────────────────────────
-TAKEOFF_ALT          = float(os.environ.get("TAKEOFF_ALT", "90.0"))
+TAKEOFF_ALT          = float(os.environ.get("TAKEOFF_ALT", "65.0"))
 HOLD_AGL             = 3.0    # m — Phase-3 gate altitude (HOLDTEST mode)
 WAYPOINT_RADIUS      = 60.0   # m — arrival threshold
 WAYPOINT_TIMEOUT     = 900.0  # s per waypoint

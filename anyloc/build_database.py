@@ -11,8 +11,8 @@ Run once before starting the localizer:
 
 Options:
     --grid-step 50    grid spacing in metres (default 50)
-    --agl-min 60      minimum AGL in metres (default 60)
-    --agl-max 120     maximum AGL in metres (default 120)
+    --agl-min 65      minimum AGL in metres (default 65)
+    --agl-max 65      maximum AGL in metres (default 65)
     --agl-step 5      AGL increment in metres (default 5)
     --rebuild         overwrite existing database
 """
@@ -259,10 +259,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--grid-step', type=float, default=50.0,
                     help='Grid spacing in metres (default 50)')
-    ap.add_argument('--agl-min',  type=float, default=60.0,
-                    help='Minimum AGL in metres (default 60)')
-    ap.add_argument('--agl-max',  type=float, default=120.0,
-                    help='Maximum AGL in metres (default 120)')
+    ap.add_argument('--agl-min',  type=float, default=65.0,
+                    help='Minimum AGL in metres (default 65)')
+    ap.add_argument('--agl-max',  type=float, default=65.0,
+                    help='Maximum AGL in metres (default 65)')
     ap.add_argument('--agl-step', type=float, default=5.0,
                     help='AGL step in metres (default 5)')
     ap.add_argument('--rebuild', action='store_true',

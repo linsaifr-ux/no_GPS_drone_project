@@ -7,7 +7,7 @@ Autonomous drone that localises itself and detects objects without GPS, validate
 
 > **Autopilot:** migrated from ArduPilot → **PX4** (2026-06). ArduPilot's horizontal position
 > controller (`AC_PosControl`) inverted its output with verified-correct EKF inputs. PX4
-> position-hold gate is validated (<0.3 m drift, 40 s); full waypoint nav (90 m AGL, 699 m leg) is
+> position-hold gate is validated (<0.3 m drift, 40 s); full waypoint nav (65 m AGL, 699 m leg) is
 > implemented. Toggle with `PX4_SIM=1`; physics, Cesium, and AnyLoc are unchanged.
 
 ---
@@ -41,7 +41,7 @@ DINOv2+VLAD localisation  YOLOv8 detection
  ── PX4 path (active) ─────────────────────────────────────────────────
  PX4 SITL (TCP 4560 HIL) → UDP 14540/14580 → MAVROS2
  /mavros/vision_pose/pose_cov → EKF2 (EV_CTRL=15)
- px4_commander.py: stream setpoints→OFFBOARD→arm→climb 90m→WP→RTL
+ px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→WP→RTL
 ```
 
 **Headless fallback:** `control/drone_sim.py` provides the same kinematic bridge without Isaac Sim — used for fast control-loop testing. Not used when Isaac Sim runs.
@@ -60,7 +60,7 @@ no_GPS_drone_project/
 │   ├── drone_sim.py              # headless physics rig (PX4_SIM=0/1)
 │   ├── px4_sim_bridge.py         # PX4 HIL bridge (TCP 4560, pymavlink)
 │   ├── sitl_bridge.py            # ArduPilot SIM_JSON bridge (UDP 9002)
-│   ├── px4_commander.py          # PX4 mission: OFFBOARD→90m→WP(699m)→RTL
+│   ├── px4_commander.py          # PX4 mission: OFFBOARD→65m→WP(699m)→RTL
 │   ├── flight_commander.py       # ArduPilot mission (reference; WP nav unsolved)
 │   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
 │   ├── no_gps.parm               # ArduPilot: EK3 ExternalNav, GPS off
@@ -72,7 +72,7 @@ no_GPS_drone_project/
 │   ├── launch_mavros.sh          # MAVROS2 → ArduPilot (UDP 14550)
 │   └── launch_commander.sh       # run flight_commander.py
 ├── anyloc/                       # visual localisation
-│   ├── build_database.py         # build 36 673-entry VLAD database (run once)
+│   ├── build_database.py         # build ~2 820-entry VLAD database (AGL 65 m only; run once)
 │   ├── localizer.py              # AnyLocLocalizer (DINOv2+VLAD+FAISS)
 │   ├── ros2_node.py              # ROS2: pub /mavros/vision_pose/pose_cov
 │   └── run_ros2_localizer.sh     # launch script
@@ -105,9 +105,9 @@ no_GPS_drone_project/
 | PX4-1 | PX4 SITL ↔ HIL bridge validated (27k+ frames, EKF2 level) | Done |
 | PX4-2 | Vision + MAVROS↔PX4 link established | Done |
 | PX4-3 | **Position-hold gate passed** (<0.3 m drift, 40 s) | Done |
-| PX4-4 | Waypoint nav ported to px4_commander.py (90 m, 699 m leg) | Done |
+| PX4-4 | Waypoint nav ported to px4_commander.py (65 m, 699 m leg) | Done |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done |
-| PX4-6 | End-to-end Isaac Sim waypoint flight (90 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
+| PX4-6 | End-to-end Isaac Sim waypoint flight (65 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
 | 7 | AnyLoc + detection integration in PX4 pipeline | In progress |
 | 8 | Deploy to real hardware | TODO |
 
@@ -164,7 +164,23 @@ bash run.sh --tmux --px4 --no-window --anyloc --detection
 tmux windows: **0 Isaac** · **1 PX4** · **2 MAVROS** · **3 Commander** · **4 AnyLoc** · **5 Detection**  
 Switch with `Ctrl-B 0–5`. The commander prints `[PX4Cmd]` progress to window 3.
 
-> **AnyLoc startup:** loading the 6.8 GB VLAD database takes ~20 min. The commander starts immediately and uses kinematic truth VPE until AnyLoc produces its first estimate above 50 m AGL. Check window 4 for `[AnyLoc] Model ready` before the drone reaches cruise altitude.
+> **AnyLoc startup:** the database is now ~2,820 entries (AGL 65 m only). Load time is much shorter than the old 36,673-entry database.
+
+### Run — distributed (Isaac Sim on PC, AnyLoc + YOLO on Jetson Orin NX)
+
+```bash
+# PC — sim + commander only (no --anyloc / --detection; those run on Jetson)
+export ROS_DOMAIN_ID=0
+bash run.sh --tmux --px4
+
+# Jetson — inference nodes (same LAN, same ROS_DOMAIN_ID)
+export ROS_DOMAIN_ID=0
+source /opt/ros/jazzy/setup.bash
+bash anyloc/run_ros2_localizer.sh        # terminal 1
+bash detection/run_ros2_detector.sh      # terminal 2
+```
+
+See `instructions/jetson_distributed_plan.md` for network setup, code changes required, and real hardware transition notes.
 
 ### Run — headless (no Isaac Sim, for control-loop testing)
 

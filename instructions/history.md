@@ -1,5 +1,52 @@
 # Project History
 
+## 2026-06-07 — Mission AGL 90 m → 65 m; AnyLoc database single-altitude; Jetson distributed plan
+
+### Change: mission cruise altitude 90 m → 65 m
+
+`TAKEOFF_ALT` default in `px4_commander.py` changed from 90.0 → 65.0 m. The waypoint
+inherits this via `TAKEOFF_ALTS` in `WAYPOINTS`. `TAKEOFF_ALT=<m>` env override still works.
+
+Files: `control/px4_commander.py`.
+
+---
+
+### Change: AnyLoc database single AGL layer (65 m only)
+
+Database was 36,673 entries spanning AGL 60–120 m in 5 m steps (13 layers × ~2,821
+positions). Since the mission now flies at a fixed 65 m AGL, all other layers are unused
+weight. Defaults changed to `--agl-min 65 --agl-max 65` → single layer → **~2,820
+entries**. Database loads ~13× faster; FAISS search is ~13× faster.
+
+Rebuild required:
+```bash
+conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+```
+
+Files: `anyloc/build_database.py`, `anyloc/README.md`.
+
+---
+
+### Plan: distributed sim — PC runs Isaac Sim, Jetson Orin NX runs AnyLoc + YOLO
+
+Written to `instructions/jetson_distributed_plan.md`. Summary:
+
+- **Network:** Jetson Orin NX RJ45 Gigabit Ethernet → same router as PC. `ROS_DOMAIN_ID=0`
+  on both. ROS2 DDS handles peer discovery automatically.
+- **Topics PC → Jetson:** `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl`
+- **Topics Jetson → PC:** `/anyloc/pose_estimate`, `/yolo/detections`
+- **Code change 1:** `anyloc/ros2_node.py` `_publish()` — pass `error_m` for dynamic
+  covariance `max(1, error_m²)` instead of hardcoded 20 m²
+- **Code change 2:** `px4_commander.py` — subscribe to `/anyloc/pose_estimate` instead
+  of polling `latest_estimate.json`; Phase 1 kinematic truth VPE unchanged (local)
+- **Code change 3 (WiFi only):** compressed image transport to cut 92 Mbps → ~10 Mbps
+- **Real hardware note:** same Jetson split applies; Phase 1 VPE injection removed
+  (EKF2 uses real IMU + baro); MAVROS connects to Pixhawk via serial
+
+Files: `instructions/jetson_distributed_plan.md` (new).
+
+---
+
 ## 2026-06-07 — Isaac Sim FPS diagnosis; --no-window and --rasterize modes; background publish thread
 
 ### Investigation: Isaac Sim render loop FPS bottleneck

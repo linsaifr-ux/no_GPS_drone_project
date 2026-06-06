@@ -54,8 +54,8 @@ conda run -n isaac_sim_test python anyloc/build_database.py
 | Flag | Default | Description |
 |---|---|---|
 | `--grid-step N` | 50 | Grid spacing in metres |
-| `--agl-min N` | 60 | Minimum AGL altitude |
-| `--agl-max N` | 120 | Maximum AGL altitude |
+| `--agl-min N` | 65 | Minimum AGL altitude |
+| `--agl-max N` | 65 | Maximum AGL altitude |
 | `--agl-step N` | 5 | AGL increment |
 | `--rebuild` | off | Overwrite existing database |
 
@@ -77,7 +77,7 @@ anyloc/database/
 └── db_meta.json         # build cache (skip re-download if present)
 ```
 
-Current database: **36 673 entries**, 50 m grid, AGL 60–120 m. **Built with old FOV (90°×73.7°) — rebuild required after camera update to 88°×65.1° (AP-IMX900-Mini-USB3-I5 spec sheet):**
+Current database: **~2 820 entries**, 50 m grid, AGL 65 m only (single altitude layer matches mission cruise altitude). Rebuild required — FOV changed (88°×65.1°) and AGL range reduced from 60–120 m to 65 m only:
 
 ```bash
 conda run -n isaac_sim_test python anyloc/build_database.py --rebuild

@@ -121,11 +121,11 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 3. Localisation (`anyloc/`)
 
-**Status:** Working — AnyLoc + VO; 36,673-entry database (60–120 m AGL, step 5 m); ~15–20 m anchor error
+**Status:** Working — AnyLoc + VO; ~2,820-entry database (65 m AGL only — single layer matching mission cruise altitude); ~15–20 m anchor error
 
 **Database build** (`anyloc/build_database.py`) — self-contained, no Isaac Sim required:
 - Downloads NLSC PHOTO2 tiles automatically if `satellite_ground.jpg` missing
-- Multi-AGL: `--agl-min 60 --agl-max 120 --agl-step 5` (13 levels × ~2821 positions)
+- Single AGL: `--agl-min 65 --agl-max 65` (1 level × ~2820 positions); was 13 levels × 36,673 entries
 - 3-pass memory-safe: crop→disk, sample 2000 for codebook, batch VLADs (peak ~4.5 GB RAM)
 - `db_meta.json` cache: Pass 1 skipped on subsequent `--rebuild` runs
 - Runtime fully offline: `database.pt` + `satellite_ground.jpg` + cached DINOv2 weights
@@ -136,7 +136,7 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 5a. Flight Control — PX4 path (`control/px4_commander.py`) **[ACTIVE]**
 
-**Status:** Full mission Done ✓ — 90 m AGL takeoff, 699 m waypoint (N=531, E=−454), horiz_err < 60 m confirmed in both headless and Isaac Sim runs.
+**Status:** Full mission Done ✓ — 65 m AGL takeoff, 699 m waypoint (N=531, E=−454), horiz_err < 60 m confirmed in both headless and Isaac Sim runs. (Was 90 m AGL; reduced 2026-06-07.)
 
 ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
 
@@ -144,7 +144,7 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 1. Pre-stream 40 position setpoints at 20 Hz (PX4 requires setpoints before OFFBOARD)
 2. Switch to OFFBOARD mode
 3. Arm
-4. Climb to 90 m AGL (continuous setpoints in `takeoff()`)
+4. Climb to 65 m AGL (continuous setpoints in `takeoff()`)
 5. Hold 5 s
 6. `go_to_ned()` — carrot navigation: publish position target 25 m ahead toward WP; within 25 m snap to exact target; wait for horiz_err < 60 m
 7. Hold 5 s at WP
@@ -316,7 +316,7 @@ bash control/launch_commander.sh
 | PX4-1 | PX4 SITL HIL bridge (TCP 4560) + EKF2 no-GPS validated | Done ✓ |
 | PX4-2 | Vision + MAVROS↔PX4 link; EKF tracks truth | Done ✓ |
 | PX4-3 | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift | Done ✓ |
-| PX4-4 | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg | Done ✓ |
+| PX4-4 | Waypoint nav in `px4_commander.py`: 65 m AGL, 699 m leg | Done ✓ |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done ✓ |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
