@@ -1,5 +1,91 @@
 # Project History
 
+## 2026-06-05 — PX4 physics sign fix; second-order model in Isaac Sim; flight trace tools; end-to-end confirmed
+
+### Bug: northward runaway on takeoff (physics sign inversion)
+
+**Symptom:** After PX4 arms and commands forward flight, the drone accelerated northward uncontrollably. Headless `drone_sim.py` run showed N position increasing exponentially despite WP being NE.
+
+**Root cause:** In PX4 body-FRD frame, positive pitch = nose UP. A nose-up pitch produces a southward horizontal thrust. The code had `_kbfwd = +_kthrust * math.sin(_kpitch)`, which mapped nose-up to northward acceleration — positive feedback instead of negative. PX4 commands nose-up to brake northward motion, but the inverted sign accelerated it further.
+
+**Fix:** Reverted to `_kbfwd = -_kthrust * math.sin(_kpitch)`. This gives the correct negative-feedback loop: nose-up → southward force → brakes northward motion.
+
+Files: `control/drone_sim.py`, `simulator/cesium_scene.py`.
+
+---
+
+### Bug: Isaac Sim drone hovers but altitude slowly sinks (first-order motor model oscillation)
+
+**Symptom:** With Isaac Sim, drone reached 90 m AGL via VPE but AGL slowly decayed to ~78 m over 60 s. Horizontal motion worked but altitude was not maintained.
+
+**Root cause:** `cesium_scene.py` had not received the second-order angular rate model that was already in `drone_sim.py`. It still used the first-order τ=0.15 s model. At 100 Hz step rate (dt=10 ms), τ=0.15 s = 15 steps. The motor commands oscillate at 5–10 Hz; the first-order low-pass averages them. Due to Jensen's inequality on `cos(pitch)`, the average of `cos(oscillating pitch)` < `cos(0)` = 1, so mean vertical thrust is less than the commanded value → altitude sink.
+
+**Fix:** Ported the second-order angular rate model from `drone_sim.py` to `cesium_scene.py`'s `_run_physics()`:
+- Added `_K_PITCH_ACCEL = 80.0` and `_K_PITCH_DAMP = 12.0` constants
+- Added `_kpitch_rate, _kroll_rate = 0.0, 0.0` state variables
+- Replaced PX4 first-order block with: `dω/dt = K_ACCEL * mean_p * diff − K_DAMP * ω`, then `θ += ω * dt`
+- Ground constraint resets rates to 0
+
+Files: `simulator/cesium_scene.py`.
+
+---
+
+### Fixes: run.sh pkill self-kill; commander stdout buffering
+
+**pkill self-kill:** `pkill -9 -f 'px4'` matched `bash run.sh --px4` and killed the run.sh process itself. Fixed pattern to `'/px4 |bin/px4$|mavros_node|px4_commander'` — specific enough to not match the launcher.
+
+**Commander stdout buffering:** `px4_commander.py` piped through `tee` used Python's block buffer (4 kB). The log showed only 6 lines for the entire flight — all remaining output was trapped in the buffer. Fixed by adding `PYTHONUNBUFFERED=1` to `control/launch_commander_px4.sh`.
+
+Files: `run.sh`, `control/launch_commander_px4.sh`.
+
+---
+
+### New: flight trace CSV + live viewer + post-flight plotter
+
+Both `drone_sim.py` and `cesium_scene.py` now write a 5 Hz CSV trace to `simulator/flight_traces/trace_<YYYYmmdd_HHMMSS>.csv`:
+
+```
+t_s, east_m, north_m, agl_m, vn_ms, ve_ms
+```
+
+**`tools/live_trace.py`** — real-time viewer using `matplotlib.animation.FuncAnimation` at 200 ms:
+- Dark theme; top view (accumulating path + home + waypoint circle) + altitude vs time panel
+- Status bar: `t / E / N / AGL / dist_to_WP`
+- Auto-expands axes as drone moves; auto-finds newest CSV (waits if none exists)
+- Usage: `python3 tools/live_trace.py [<file>]`
+
+**`tools/plot_trace.py`** — post-flight two-panel plot:
+- Top view (East vs North) + altitude vs time; can overlay multiple traces with `--all`
+- Saves `simulator/flight_traces/trace_plot.png`
+- Usage: `python3 tools/plot_trace.py [<file>] [--all]`
+
+---
+
+### End-to-end flight results
+
+**Headless (drone_sim.py + PX4 SITL):**
+- Takeoff → 90 m AGL: stable, ~45 s
+- WP nav (N=531, E=−454): horiz_err < 60 m confirmed
+- Motor oscillation: zero (second-order model); yaw stable at 0°
+
+**Isaac Sim (cesium_scene.py + PX4 SITL):**
+- Same 699 m waypoint leg, horiz_err < 60 m confirmed
+- Altitude stable at 90 m (second-order model fixed the sink)
+- Flight trace saved and verified with `tools/plot_trace.py`
+
+### Files modified
+
+| File | Change |
+|------|--------|
+| `control/drone_sim.py` | Physics sign fix (`_kbfwd = -thrust*sin(pitch)`); flight trace CSV at 5 Hz |
+| `simulator/cesium_scene.py` | Second-order angular rate model ported; physics sign fix; flight trace CSV at 5 Hz |
+| `run.sh` | Narrowed pkill pattern; added tee log for commander |
+| `control/launch_commander_px4.sh` | Added `PYTHONUNBUFFERED=1` |
+| `tools/live_trace.py` | New — real-time flight trace viewer |
+| `tools/plot_trace.py` | New — post-flight two-panel plotter |
+
+---
+
 ## 2026-06-03 — AnyLoc database rebuilt from NLSC; crash-detect disarm fixed; NED convention confirmed
 
 ### Bug: Drone disarms mid-flight at ~80 m AGL (motors cut to 1000 PWM)

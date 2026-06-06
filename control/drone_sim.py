@@ -31,6 +31,7 @@ Launch order (full, with Isaac Sim):
   6. python3 control/flight_commander.py
 """
 
+import csv
 import json
 import math
 import os
@@ -79,8 +80,10 @@ COS_LAT   = math.cos(math.radians(HOME_LAT))
 _K_GRAVITY  = 9.81    # m/s²
 _K_MAX_VEL  = 15.0    # m/s velocity clamp
 _K_MAX_TILT = 0.35    # rad (~20°) max tilt from PWM differential
-_K_TILT_TAU = 0.15    # s first-order attitude time constant
-_K_DRAG     = 0.35    # aerodynamic drag coefficient (s⁻¹)
+_K_TILT_TAU    = 0.15   # s first-order attitude time constant (ArduPilot only)
+_K_PITCH_ACCEL = 80.0  # rad/s² per unit motor diff × mean_p (PX4 only)
+_K_PITCH_DAMP  = 12.0  # angular damping s⁻¹ → time constant ≈ 83 ms (PX4 only)
+_K_DRAG        = 0.35  # aerodynamic drag coefficient (s⁻¹)
 
 
 def _euler_to_quat(roll: float, pitch: float, yaw: float):
@@ -122,10 +125,26 @@ def main():
     _kvn     = 0.0            # velocity north (m/s)
     _kve     = 0.0            # velocity east  (m/s)
     _kvd     = 0.0            # velocity NED down (m/s); negative = ascending
-    _kroll   = 0.0            # estimated roll  (rad)
-    _kpitch  = 0.0            # estimated pitch (rad)
-    _kyaw_rad = 0.0           # heading (rad, NED CW); no PWM-driven yaw torque
+    _kroll       = 0.0         # estimated roll  (rad)
+    _kpitch      = 0.0         # estimated pitch (rad)
+    _kroll_rate  = 0.0         # roll angular rate (rad/s) — PX4 second-order model
+    _kpitch_rate = 0.0         # pitch angular rate (rad/s) — PX4 second-order model
+    _kyaw_rad = 0.0            # heading (rad, NED CW); no PWM-driven yaw torque
     _kprev_t = None
+    _dbg_t   = 0.0            # last motor-debug print time
+    _dbg_start = time.time()  # mission start for elapsed time
+
+    # ── Flight trace CSV ──────────────────────────────────────────────────────
+    _TRACE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "simulator", "flight_traces")
+    os.makedirs(_TRACE_DIR, exist_ok=True)
+    _trace_path = os.path.join(_TRACE_DIR,
+                               f"trace_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    _trace_f   = open(_trace_path, "w", newline="", buffering=1)
+    _trace_csv = csv.writer(_trace_f)
+    _trace_csv.writerow(["t_s", "east_m", "north_m", "agl_m", "vn_ms", "ve_ms"])
+    _trace_last_t = 0.0   # last time a row was written (5 Hz decimation)
+    print(f"[drone_sim] Flight trace → {_trace_path}")
 
     bridge_name = "PX4 HIL (TCP 4560)" if _PX4_SIM else "ArduPilot (UDP 9002)"
     print(f"[drone_sim] Kinematic drone on ground — waiting for {bridge_name} …")
@@ -156,20 +175,36 @@ def main():
                 _kthrust = _mean_p * 2.0 * _K_GRAVITY   # 0 – 2 g
 
                 if _PX4_SIM:
-                    # PX4 quad-X (none_iris CA_ROTOR): control[0]=FR(+,+) [1]=RL(-,-)
-                    # [2]=FL(+,-) [3]=RR(-,+).  roll(+=right)=(m1+m2)-(m0+m3);
-                    # pitch(+=nose up)=(m0+m2)-(m1+m3).
-                    _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
-                    _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+                    # Second-order angular dynamics: motor torque → rate → angle.
+                    # pitch_diff>0 = front(m0,m2) > rear(m1,m3) = nose DOWN in FRD = forward.
+                    # roll_diff>0  = left(m1,m2)  > right(m0,m3) = roll RIGHT = eastward.
+                    pitch_diff = (_p4[0] + _p4[2]) - (_p4[1] + _p4[3])
+                    roll_diff  = (_p4[1] + _p4[2]) - (_p4[0] + _p4[3])
+                    _kpitch_rate += (_K_PITCH_ACCEL * _mean_p * pitch_diff
+                                     - _K_PITCH_DAMP * _kpitch_rate) * _kdt
+                    _kroll_rate  += (_K_PITCH_ACCEL * _mean_p * roll_diff
+                                     - _K_PITCH_DAMP * _kroll_rate)  * _kdt
+                    _kpitch = max(-_K_MAX_TILT, min(_K_MAX_TILT,
+                                                     _kpitch + _kpitch_rate * _kdt))
+                    _kroll  = max(-_K_MAX_TILT, min(_K_MAX_TILT,
+                                                     _kroll  + _kroll_rate  * _kdt))
+
+                    # Motor debug every 5 s
+                    if t_now - _dbg_t >= 5.0:
+                        _dbg_t = t_now
+                        _agl = _kz - HOME_ALT_MSL
+                        print(f"[SIM] t={t_now-_dbg_start:5.0f}s  "
+                              f"m=[{_p4[0]:.3f},{_p4[1]:.3f},{_p4[2]:.3f},{_p4[3]:.3f}]"
+                              f"  mean={_mean_p:.3f}  pd={pitch_diff:+.3f}  p={_kpitch:+.3f}"
+                              f"  pr={_kpitch_rate:+.2f}  vN={_kvn:+.2f}  vE={_kve:+.2f}"
+                              f"  AGL={_agl:.1f}m")
                 else:
-                    # ArduCopter X-frame: ch1=FR, ch2=RL, ch3=RR, ch4=FL
+                    # ArduCopter X-frame: first-order position filter (ch1=FR,ch2=RL,ch3=RR,ch4=FL)
                     _roll_tgt  = ((_p4[1] + _p4[3]) - (_p4[0] + _p4[2])) * _K_MAX_TILT
                     _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
-
-                # First-order attitude dynamics
-                _ka = _kdt / (_K_TILT_TAU + _kdt)
-                _kroll  += _ka * (_roll_tgt  - _kroll)
-                _kpitch += _ka * (_pitch_tgt - _kpitch)
+                    _ka = _kdt / (_K_TILT_TAU + _kdt)
+                    _kroll  += _ka * (_roll_tgt  - _kroll)
+                    _kpitch += _ka * (_pitch_tgt - _kpitch)
 
                 # Thrust vector rotated to world-NED via yaw
                 _kcy, _ksy = math.cos(_kyaw_rad), math.sin(_kyaw_rad)
@@ -196,6 +231,17 @@ def main():
                     _kvd = min(0.0, _kvd)
                     _kvn = 0.0   # ground friction — no horizontal sliding
                     _kve = 0.0
+                    _kpitch_rate = 0.0; _kroll_rate = 0.0
+
+            # ── Trace CSV at 5 Hz ─────────────────────────────────────────────
+            if t_now - _trace_last_t >= 0.2:
+                _trace_last_t = t_now
+                _trace_csv.writerow([
+                    f"{t_now - _dbg_start:.2f}",
+                    f"{_kx:.3f}", f"{_ky:.3f}",
+                    f"{_kz - HOME_ALT_MSL:.3f}",
+                    f"{_kvn:.3f}", f"{_kve:.3f}",
+                ])
 
             # ── Publish /drone/state ───────────────────────────────────────────
             qx, qy, qz, qw = _euler_to_quat(_kroll, _kpitch, _kyaw_rad)
@@ -217,6 +263,7 @@ def main():
         agl = _kz - HOME_ALT_MSL
         print(f"\n[drone_sim] Stopped. Final AGL = {agl:.1f} m")
     finally:
+        _trace_f.close()
         bridge.close()
         node.destroy_node()
         rclpy.shutdown()

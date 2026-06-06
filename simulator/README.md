@@ -57,11 +57,15 @@ publish /drone/state (ENU)                   HUD overlay, frame capture, ROS2 sp
 2. Decode motor outputs to roll/pitch torque targets:
    - **ArduPilot** (QUAD-X): ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
    - **PX4** (none_iris CA_ROTOR): control[0]=FR, [1]=RL, [2]=FL, [3]=RR
-3. Integrate attitude: first-order response toward roll/pitch target (τ = 0.15 s)
-4. Compute body-frame accelerations → NED velocity → ENU position
-5. Apply ground constraint (no movement below terrain elevation; zero horizontal velocity on landing)
+3. Integrate attitude:
+   - **ArduPilot**: first-order response toward roll/pitch target (τ = 0.15 s)
+   - **PX4**: second-order angular rate model — `dω/dt = K_ACCEL·mean_p·diff − K_DAMP·ω`, then `dθ/dt = ω`. This eliminates the 100 Hz motor oscillation the first-order model produces at fast step rates.
+4. Compute body-frame accelerations → NED velocity → ENU position.  
+   Horizontal thrust sign: `_kbfwd = -thrust * sin(pitch)` — PX4 FRD positive pitch is nose-UP (southward force), so the minus gives stable negative feedback.
+5. Apply ground constraint (no movement below terrain elevation; zero horizontal velocity and angular rates on landing)
 6. Update shared state (protected by `threading.Lock`)
 7. Publish `/drone/state` (ENU `PoseStamped`, frame `local_enu`)
+8. Write one row to flight trace CSV at 5 Hz (`simulator/flight_traces/trace_<ts>.csv`)
 
 ### Why 100 Hz matters
 
@@ -75,7 +79,9 @@ Isaac Sim renders at ~13 fps. If the physics + bridge ran in the render loop, th
 |-----------|-------|-------|
 | Gravity | 9.81 m/s² | |
 | Max tilt | 0.35 rad (~20°) | From motor differential |
-| Attitude τ | 0.15 s | First-order roll/pitch response |
+| Attitude τ (ArduPilot) | 0.15 s | First-order roll/pitch response |
+| K_PITCH_ACCEL (PX4) | 80 rad/s² | Second-order angular acceleration constant |
+| K_PITCH_DAMP (PX4) | 12 s⁻¹ | Angular rate damping (time constant ≈ 83 ms) |
 | Aerodynamic drag | 0.35 s⁻¹ | Applied to all velocity components |
 | Max velocity | 30 m/s | Clamp on NED components |
 | Physics rate | 100 Hz | Background thread |
@@ -206,6 +212,7 @@ simulator/
 ├── cesium_scene.py     # Physics + visualiser: 100 Hz kinematic thread + bridge
 ├── run_chiayi.sh       # Launch: sources ROS2, runs cesium_scene.py in conda [--px4]
 ├── drone_frames/       # Latest rendered frame (latest.jpg + latest_meta.json)
+├── flight_traces/      # CSV flight traces written at 5 Hz (t_s, east_m, north_m, agl_m, vn_ms, ve_ms)
 ├── cesium_terrain_cache/  # Pre-downloaded terrain tiles
 ├── cesium_tile_cache/     # Pre-downloaded 3D building tiles
 ├── geo_utils.py        # Shared geo helpers (lat/lon ↔ metres, WMTS tile math)

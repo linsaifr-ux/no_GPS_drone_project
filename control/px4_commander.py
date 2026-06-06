@@ -82,6 +82,7 @@ class PX4Commander(rclpy.node.Node):
         super().__init__("px4_commander")
         self._state     = State()
         self._local_pos = None   # /mavros/local_position/pose  (ENU, from EKF2)
+        self._local_vel = None   # /mavros/local_position/velocity_local (ENU)
         self._drone     = None   # /drone/state  (ENU, kinematic truth)
 
         # Subscribers
@@ -89,6 +90,8 @@ class PX4Commander(rclpy.node.Node):
         self.create_subscription(State, "/mavros/state", self._cb_state, 10)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose",
                                  self._cb_local, _SENSOR_QOS)
+        self.create_subscription(TwistStamped, "/mavros/local_position/velocity_local",
+                                 self._cb_vel, _SENSOR_QOS)
         self.create_subscription(PoseStamped, "/drone/state",
                                  self._cb_drone, _SENSOR_QOS)
 
@@ -109,6 +112,7 @@ class PX4Commander(rclpy.node.Node):
     # ── Callbacks ──────────────────────────────────────────────────────────────
     def _cb_state(self, m):  self._state     = m
     def _cb_local(self, m):  self._local_pos = m
+    def _cb_vel(self, m):    self._local_vel = m
     def _cb_drone(self, m):  self._drone     = m
 
     # ── Vision injection thread ────────────────────────────────────────────────
@@ -146,10 +150,14 @@ class PX4Commander(rclpy.node.Node):
                 if self._drone is not None:
                     drone_agl = max(0.0, self._drone.pose.position.z - HOME_ALT_MSL)
 
-                # Phase 2: read AnyLoc estimate when high enough
-                if agl >= MIN_LOCALISATION_AGL:
+                # Phase 2: read AnyLoc estimate when high enough.
+                # Use kinematic drone_agl (truth), NOT EKF agl — stale EKF state
+                # from a previous flight would otherwise trigger Phase 2 on the
+                # ground, sending altitude=0 VPE while EKF thinks we're at 60+ m,
+                # which confuses the position controller.
+                if drone_agl >= MIN_LOCALISATION_AGL:
                     if not phase_logged:
-                        print(f"[PX4Cmd] AGL {agl:.0f} m ≥ {MIN_LOCALISATION_AGL:.0f} m"
+                        print(f"[PX4Cmd] AGL {drone_agl:.0f} m ≥ {MIN_LOCALISATION_AGL:.0f} m"
                               " — VPE → AnyLoc")
                         phase_logged = True
                     try:
@@ -213,15 +221,16 @@ class PX4Commander(rclpy.node.Node):
                     ds = self._drone.pose.position
                     now_t = time.time()
                     if last_ds is not None:
-                        dt_v = now_t - last_ds[2]
+                        dt_v = now_t - last_ds[3]
                         if dt_v > 1e-3:
                             tw = TwistStamped()
                             tw.header.stamp    = msg.header.stamp
                             tw.header.frame_id = "map"
                             tw.twist.linear.x  = (ds.x - last_ds[0]) / dt_v  # ENU East
                             tw.twist.linear.y  = (ds.y - last_ds[1]) / dt_v  # ENU North
+                            tw.twist.linear.z  = (ds.z - last_ds[2]) / dt_v  # ENU Up
                             self._vspd_pub.publish(tw)
-                    last_ds = (ds.x, ds.y, now_t)
+                    last_ds = (ds.x, ds.y, ds.z, now_t)
 
                 elapsed = time.time() - t0
                 time.sleep(max(0.0, 0.05 - elapsed))   # 20 Hz
@@ -300,9 +309,27 @@ class PX4Commander(rclpy.node.Node):
 
         if not self.set_mode("OFFBOARD"):
             return False
-        if not self.arm():
-            return False
-        return True
+
+        # Keep streaming setpoints while waiting for sensor health to settle.
+        # BARO can transiently go stale right after mode change; give it 2 s.
+        settle_end = time.time() + 2.0
+        while time.time() < settle_end:
+            sp.header.stamp = self.get_clock().now().to_msg()
+            self._sp_pub.publish(sp)
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        # Retry arm up to 10 times with 1-second intervals.
+        for attempt in range(10):
+            if self.arm():
+                return True
+            print(f"[PX4Cmd] arm attempt {attempt+1}/10 failed — retrying in 1 s …")
+            retry_end = time.time() + 1.0
+            while time.time() < retry_end:
+                sp.header.stamp = self.get_clock().now().to_msg()
+                self._sp_pub.publish(sp)
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+        return False
 
     # ── Takeoff ────────────────────────────────────────────────────────────────
     def takeoff(self, alt_agl, timeout=180.0):
@@ -341,23 +368,19 @@ class PX4Commander(rclpy.node.Node):
     # ── Waypoint navigation ────────────────────────────────────────────────────
     def go_to_ned(self, north, east, agl, timeout=WAYPOINT_TIMEOUT):
         """
-        Fly to (north, east, agl) using a position carrot.
-
-        Publishes a position setpoint 25 m ahead of the drone toward the target;
-        the carrot advances as the drone moves, limiting the PX4 position controller
-        to its comfort range and avoiding max-speed overshoot on long legs.
-        Within CARROT_DIST of the target the carrot snaps to the exact target.
-
-        All coordinates are ENU (east_m, north_m, agl_m from home); MAVROS converts
-        to NED before sending to PX4.
-
-        Returns True when the drone is within WAYPOINT_RADIUS of the target.
+        Fly to (north, east, agl) via OFFBOARD velocity setpoints.
+        MAVROS converts ENU velocity → NED; PX4 velocity controller closes the loop.
+        Returns True when within WAYPOINT_RADIUS of the target.
         """
-        CARROT_DIST = 25.0
+        NAV_SPEED_H = 5.0   # m/s horizontal cruise
+        NAV_SPEED_V = 2.0   # m/s vertical limit
+        ALT_KP      = 0.4   # altitude error → desired vz
 
-        _PMASK = (PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY |
-                  PositionTarget.IGNORE_VZ | PositionTarget.IGNORE_AFX |
-                  PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+        # Velocity-only: ignore position and acceleration
+        _VMASK = (PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY |
+                  PositionTarget.IGNORE_PZ |
+                  PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY |
+                  PositionTarget.IGNORE_AFZ |
                   PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE)
 
         deadline   = time.time() + timeout
@@ -376,36 +399,41 @@ class PX4Commander(rclpy.node.Node):
                 rclpy.spin_once(self, timeout_sec=0.1)
                 continue
 
-            dx = cur_e - east    # East error  (drone − target)
-            dy = cur_n - north   # North error
+            dx = cur_e - east    # East error  (positive = drone E of target)
+            dy = cur_n - north   # North error (positive = drone N of target)
             hdist = math.hypot(dx, dy)
 
-            # Advance carrot 25 m toward target; snap to target within 25 m
-            if hdist > CARROT_DIST:
-                cx = cur_e - dx / hdist * CARROT_DIST
-                cy = cur_n - dy / hdist * CARROT_DIST
+            speed = min(NAV_SPEED_H, hdist)
+            if hdist > 0.5:
+                v_e = -dx / hdist * speed   # ENU East toward target
+                v_n = -dy / hdist * speed   # ENU North toward target
             else:
-                cx, cy = east, north
+                v_e = v_n = 0.0
+
+            v_up = max(-NAV_SPEED_V, min(NAV_SPEED_V, ALT_KP * (agl - drone_agl)))
 
             sp = PositionTarget()
             sp.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-            sp.type_mask        = _PMASK
-            sp.position.x       = float(cx)    # ENU East
-            sp.position.y       = float(cy)    # ENU North
-            sp.position.z       = float(agl)   # ENU Up (AGL)
-            sp.header.stamp     = self.get_clock().now().to_msg()
+            sp.type_mask = _VMASK
+            sp.velocity.x = float(v_e)    # ENU East  (MAVROS converts to NED)
+            sp.velocity.y = float(v_n)    # ENU North
+            sp.velocity.z = float(v_up)   # ENU Up
+            sp.header.stamp = self.get_clock().now().to_msg()
             self._sp_pub.publish(sp)
             rclpy.spin_once(self, timeout_sec=0.05)
 
             now = time.time()
             if now - last_print > 5.0:
+                ekf = ""
                 if self._local_pos:
                     lp = self._local_pos.pose.position
-                    ekf = f"  EKF=({lp.x:+.0f},{lp.y:+.0f})"
-                else:
-                    ekf = ""
+                    ekf = f"  EKF=({lp.x:+.0f},{lp.y:+.0f},{lp.z:+.0f})"
+                vel_s = ""
+                if self._local_vel:
+                    lv = self._local_vel.twist.linear
+                    vel_s = f"  vm=({lv.x:+.1f},{lv.y:+.1f})"
                 print(f"[PX4Cmd] WP  errN={dy:+.1f} errE={dx:+.1f}"
-                      f"  AGL={drone_agl:.1f} m  dist={hdist:.1f} m{ekf}")
+                      f"  AGL={drone_agl:.1f} m  dist={hdist:.1f} m{ekf}{vel_s}")
                 last_print = now
 
             if hdist <= WAYPOINT_RADIUS:
@@ -420,6 +448,15 @@ def main():
     rclpy.init()
     cmd = PX4Commander()
     stop = threading.Event()
+
+    # Overwrite stale AnyLoc estimate so Phase 2 always starts from kinematic truth.
+    try:
+        os.makedirs(os.path.dirname(ESTIMATE_JSON), exist_ok=True)
+        with open(ESTIMATE_JSON, "w") as _ef:
+            json.dump({"agl_m": -1.0, "error_m": 999.0}, _ef)
+    except OSError:
+        pass
+
     cmd.start_vision(stop)
 
     # Wait for MAVROS to connect to PX4
@@ -429,17 +466,40 @@ def main():
         stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
     print("[PX4Cmd] MAVROS connected ✓")
 
-    # Wait for drone_state and local_position to arrive
-    print("[PX4Cmd] waiting for EKF local position …")
-    if not cmd._spin_until(
-            lambda: cmd._local_pos is not None and cmd._drone is not None, 30.0):
-        print("[PX4Cmd] no /drone/state or /mavros/local_position after 30 s — check bridge")
+    # Wait for drone_state and local_position to arrive.
+    # EKF2 needs time to initialize from VPE on a fresh start (can take 60-90 s).
+    print("[PX4Cmd] waiting for EKF local position (up to 120 s) …")
+    _last_diag = [time.time()]
+    def _wait_cond():
+        now = time.time()
+        if now - _last_diag[0] > 10.0:
+            _last_diag[0] = now
+            print(f"[PX4Cmd] diag: drone={'OK' if cmd._drone is not None else 'None'}"
+                  f"  local_pos={'OK' if cmd._local_pos is not None else 'None'}"
+                  f"  t={now-start_t:.0f}s")
+        return cmd._local_pos is not None and cmd._drone is not None
+    start_t = time.time()
+    if not cmd._spin_until(_wait_cond, 120.0):
+        print(f"[PX4Cmd] no /drone/state or /mavros/local_position after 120 s"
+              f"  drone={'OK' if cmd._drone is not None else 'None'}"
+              f"  local_pos={'OK' if cmd._local_pos is not None else 'None'}")
         stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Settle: let EKF2 initialise its local frame from first VPE batch
-    time.sleep(2.0)
-    for _ in range(20):
-        rclpy.spin_once(cmd, timeout_sec=0.05)
+    # Settle: let EKF2 initialise its local frame from the first VPE batch.
+    # After a previous flight the EKF retains its last altitude (e.g. 60+ m).
+    # VPE (Phase 1, kinematic ground truth at z=0) will override this, but EKF
+    # needs time to converge. Wait until EKF z is within 5 m of ground before
+    # arming, or proceed after 15 s with a warning.
+    print("[PX4Cmd] waiting for EKF z to converge to ground …")
+    def _ekf_near_ground():
+        return (cmd._local_pos is not None and
+                abs(cmd._local_pos.pose.position.z) < 5.0)
+    if not cmd._spin_until(_ekf_near_ground, timeout=15.0):
+        ekf_z = cmd._local_pos.pose.position.z if cmd._local_pos else 999.0
+        print(f"[PX4Cmd] WARNING: EKF z={ekf_z:.1f} m after 15 s — proceeding anyway")
+    else:
+        ekf_z = cmd._local_pos.pose.position.z if cmd._local_pos else 0.0
+        print(f"[PX4Cmd] EKF z={ekf_z:.2f} m — converged ✓")
 
     # In-air restart detection: skip takeoff sequence if already airborne
     start_agl = cmd._agl()

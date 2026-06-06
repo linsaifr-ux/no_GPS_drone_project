@@ -134,9 +134,43 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 **Status:** Working — `yolov8l_visdrone.pt` (VisDrone-trained), 10 aerial classes
 
-### 5. Flight Control (`control/flight_commander.py`)
+### 5a. Flight Control — PX4 path (`control/px4_commander.py`) **[ACTIVE]**
 
-**Status:** Takeoff working ✓; waypoint direction and altitude bugs fixed; clean run with Isaac Sim physics pending
+**Status:** Full mission Done ✓ — 90 m AGL takeoff, 699 m waypoint (N=531, E=−454), horiz_err < 60 m confirmed in both headless and Isaac Sim runs.
+
+ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
+
+**Mission sequence:**
+1. Pre-stream 40 position setpoints at 20 Hz (PX4 requires setpoints before OFFBOARD)
+2. Switch to OFFBOARD mode
+3. Arm
+4. Climb to 90 m AGL (continuous setpoints in `takeoff()`)
+5. Hold 5 s
+6. `go_to_ned()` — carrot navigation: publish position target 25 m ahead toward WP; within 25 m snap to exact target; wait for horiz_err < 60 m
+7. Hold 5 s at WP
+8. Ctrl-C → RTL
+
+**VPE two-phase (same as ArduPilot path):**
+- Phase 1 (AGL < 50 m): kinematic truth, cov = 0.1 m²
+- Phase 2 (AGL ≥ 50 m): AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
+
+**Physics fix (2026-06):** PX4 path requires second-order angular rate model in `drone_sim.py` and `cesium_scene.py`. First-order (τ=0.15 s) causes motor oscillation at 100 Hz steps → zero net horizontal force + slow altitude sink. Sign: `_kbfwd = -thrust * sin(pitch)` (FRD positive pitch = nose-UP = southward force = stable negative feedback).
+
+**`px4_no_gps.params` highlights:**
+
+| Param | Value | Reason |
+|-------|-------|--------|
+| `EKF2_GPS_CTRL` | 0 | disable GPS |
+| `SYS_HAS_GPS` | 0 | no GPS hardware |
+| `COM_ARM_WO_GPS` | 1 | arm without GPS |
+| `EKF2_EV_CTRL` | 15 | fuse EV pos+height+vel+yaw |
+| `EKF2_HGT_REF` | 3 | vision altitude reference |
+| `EKF2_BARO_CTRL` | 0 | disable baro |
+| `COM_RC_IN_MODE` | 4 | no RC required |
+
+### 5b. Flight Control — ArduPilot path (`control/flight_commander.py`) **[REFERENCE]**
+
+**Status:** Takeoff working ✓; waypoint direction and altitude bugs fixed; horizontal WP nav inverts in `AC_PosControl` → **migrated to PX4**
 
 ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 
@@ -192,7 +226,36 @@ ROS2 node. No pymavlink — uses MAVROS2 raw MAVLink exclusively.
 
 ## Run order
 
-### With Isaac Sim (standard)
+### PX4 — with Isaac Sim (active path)
+
+```bash
+bash run.sh --tmux --px4 --params --wipe  # first run
+bash run.sh --tmux --px4                  # subsequent runs
+```
+
+tmux windows: 0=Isaac Sim, 1=PX4 SITL, 2=MAVROS2, 3=Commander.
+
+### PX4 — headless (no Isaac Sim)
+
+```bash
+source /opt/ros/jazzy/setup.bash
+
+# T1 — physics bridge (must own TCP 4560 before PX4 starts)
+PX4_SIM=1 python3 control/drone_sim.py
+
+# T2 — PX4 SITL
+bash control/launch_px4_sitl.sh
+bash control/apply_px4_params.sh    # first run only
+
+# T3 — MAVROS2
+bash control/launch_mavros_px4.sh
+
+# T4 — commander
+python3 control/px4_commander.py
+# or: HOLDTEST=1 python3 control/px4_commander.py  (Phase 3 regression)
+```
+
+### ArduPilot — with Isaac Sim (reference / legacy)
 
 ```bash
 # Quickest: use the top-level tmux launcher
@@ -205,49 +268,20 @@ bash run.sh --tmux --wipe   # first run or parameter change (auto-sends reboot)
 cd simulator && ./run_chiayi.sh
 
 # T2 — ArduPilot SITL
-bash control/launch_sitl.sh          # uses arducopter binary directly; MAVProxy --out udp:127.0.0.1:14550
-# or manually:
-python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
-    -v ArduCopter --model=JSON --no-rebuild \
-    -l 23.450868,120.286135,28.17,0 \
-    --add-param-file=control/no_gps.parm --wipe \
-    --out udp:127.0.0.1:14550
+bash control/launch_sitl.sh
 
 # T3 — MAVROS2
 bash control/launch_mavros.sh
 
-# T4 — AnyLoc (startup ~20 min; use python3 -u for unbuffered output; check ros2 node list)
+# T4 — AnyLoc (startup ~20 min; use python3 -u for unbuffered output)
 ./anyloc/run_ros2_localizer.sh
 
 # T5 — Flight commander
 bash control/launch_commander.sh
-# or: source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 ```
 
-> Do **not** run `drone_sim.py` alongside `cesium_scene.py` — both bind UDP 9002.
-> Start `cesium_scene.py` **before** SITL so UDP 9002 is open when ArduPilot starts.
-
-### Headless (no Isaac Sim)
-
-```bash
-# T1 — ArduPilot SITL
-python3 third_party/ardupilot/Tools/autotest/sim_vehicle.py \
-    -v ArduCopter --model=JSON --no-rebuild \
-    -l 23.450868,120.286135,28.17,0 \
-    --add-param-file=control/no_gps.parm --wipe \
-    --out udp:127.0.0.1:14550
-
-# T2 — Drone physics (start within ~10 s of SITL)
-source /opt/ros/jazzy/setup.bash && python3 control/drone_sim.py
-
-# T3 — MAVROS2
-bash control/launch_mavros.sh
-
-# T4 — Flight commander
-source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
-```
-
-> Restart all processes (SITL + physics + MAVROS2) after any failed run.
+> Do **not** run `drone_sim.py` alongside `cesium_scene.py` — both bind the bridge port.
+> Start `cesium_scene.py` (or `drone_sim.py`) **before** the autopilot SITL.
 
 ---
 
@@ -277,8 +311,15 @@ source /opt/ros/jazzy/setup.bash && python3 control/flight_commander.py
 | 6l | Integrate kinematic physics into cesium_scene.py (100 Hz thread); eliminate drone_sim.py | Done ✓ |
 | 6m | Fix crash-detect disarm at ~80 m AGL (FS_CRASH_CHECK=0, ATC I-terms=0) | Done ✓ |
 | 6n | database.pt truncation fix (_safe_save + split files); setpoint_raw/local FRAME_LOCAL_NED; launch scripts | Done ✓ |
-| 6m-wp | Waypoints clean run with Isaac Sim physics (setpoint direction resolved; end-to-end run pending) | WIP |
+| 6m-wp | ArduPilot WP nav — `AC_PosControl` position→velocity inversion unresolved; migrated to PX4 | Abandoned |
+| PX4-1 | PX4 SITL HIL bridge (TCP 4560) + EKF2 no-GPS validated | Done ✓ |
+| PX4-2 | Vision + MAVROS↔PX4 link; EKF tracks truth | Done ✓ |
+| PX4-3 | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift | Done ✓ |
+| PX4-4 | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg | Done ✓ |
+| PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done ✓ |
+| PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
+| PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
-| 7 | Full pipeline: AnyLoc + VO + IMU → ArduPilot commands | TODO |
+| 7 | Full pipeline: AnyLoc + VO + detection → PX4 commands | TODO |
 | 8 | Deploy to real drone hardware | TODO |

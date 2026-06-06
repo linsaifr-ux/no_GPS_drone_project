@@ -14,6 +14,7 @@ Run:
     DISPLAY=:2 OMNI_KIT_ACCEPT_EULA=Y conda run -n isaac_sim_test python cesium_scene.py
 """
 
+import csv
 import io as _io, json, math, os, struct, sys, threading, time, urllib.parse, urllib.request
 
 # Project root on path so control/ package is importable from simulator/
@@ -955,11 +956,13 @@ _rgb.attach([_rp])
 print(f"[DRONE] Nadir camera {DRONE_CAM_W}×{DRONE_CAM_H}  →  {DRONE_FRAME_DIR}/")
 
 # ── Kinematic physics constants ────────────────────────────────────────────────
-_K_GRAVITY  = 9.81
-_K_MAX_VEL  = 15.0
-_K_MAX_TILT = 0.35    # rad — max tilt from PWM differential
-_K_TILT_TAU = 0.15    # s   — attitude first-order time constant
-_K_DRAG     = 0.35    # s⁻¹ — aerodynamic drag coefficient
+_K_GRAVITY     = 9.81
+_K_MAX_VEL     = 15.0
+_K_MAX_TILT    = 0.35    # rad — max tilt from PWM differential
+_K_TILT_TAU    = 0.15    # s   — attitude first-order time constant (ArduPilot only)
+_K_PITCH_ACCEL = 80.0    # rad/s² per unit motor diff × mean_p (PX4 only)
+_K_PITCH_DAMP  = 12.0    # angular damping s⁻¹ (PX4 only)
+_K_DRAG        = 0.35    # s⁻¹ — aerodynamic drag coefficient
 
 # Kinematic state — ENU (x=East m, y=North m, z=MSL altitude m)
 # Protected by _kin_lock; written by physics thread, read by render loop.
@@ -968,6 +971,7 @@ _kx, _ky                    = 0.0, 0.0
 _kz                         = float(centre_elev)
 _kvn, _kve, _kvd            = 0.0, 0.0, 0.0
 _kroll, _kpitch, _kyaw_rad  = 0.0, 0.0, 0.0
+_kpitch_rate, _kroll_rate   = 0.0, 0.0             # angular rates (PX4 only)
 _kqx, _kqy, _kqz, _kqw     = 0.0, 0.0, 0.0, 1.0   # quaternion for mesh
 
 # ── SITL bridge ───────────────────────────────────────────────────────────────
@@ -978,12 +982,25 @@ else:
     _bridge.debug_hz = 0.2
 _latest_pwm = [1000] * 16   # motors off until autopilot connects and arms
 
+# ── Flight trace CSV ──────────────────────────────────────────────────────────
+_TRACE_DIR  = os.path.join(HERE, "flight_traces")
+os.makedirs(_TRACE_DIR, exist_ok=True)
+_trace_path = os.path.join(_TRACE_DIR, f"trace_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+_trace_f    = open(_trace_path, "w", newline="", buffering=1)
+_trace_csv  = csv.writer(_trace_f)
+_trace_csv.writerow(["t_s", "east_m", "north_m", "agl_m", "vn_ms", "ve_ms"])
+_trace_start_t  = time.time()
+_trace_last_t   = 0.0
+print(f"[DRONE] Flight trace → {_trace_path}")
+
 # ── 100 Hz physics thread — decoupled from Isaac Sim render rate (~13 Hz) ────
 def _run_physics():
     """Run kinematic model + SITL bridge at 100 Hz in background thread."""
     global _kx, _ky, _kz, _kvn, _kve, _kvd
     global _kroll, _kpitch, _kyaw_rad
+    global _kpitch_rate, _kroll_rate
     global _kqx, _kqy, _kqz, _kqw, _latest_pwm
+    global _trace_last_t
 
     _kprev_t_loc = None
 
@@ -996,6 +1013,7 @@ def _run_physics():
             kx = _kx;  ky = _ky;  kz = _kz
             kvn = _kvn; kve = _kve; kvd = _kvd
             kroll = _kroll; kpitch = _kpitch; kyaw = _kyaw_rad
+            kpitch_rate = _kpitch_rate; kroll_rate = _kroll_rate
             pwm = list(_latest_pwm)
 
         ret = _bridge.step(kx, ky, kz,
@@ -1013,24 +1031,28 @@ def _run_physics():
             _kthrust = _mean_p * 2.0 * _K_GRAVITY
 
             if _PX4_SIM:
-                # PX4 quad-X control allocation (none_iris CA_ROTOR geometry): control[i]
-                # → motor at (PX=fwd, PY=right):  0=FR(+,+) 1=RL(-,-) 2=FL(+,-) 3=RR(-,+).
-                # From rotor positions (torque = pos × thrust):
-                #   roll  (+=bank right→+East)   = left(RL,FL) − right(FR,RR) = (m1+m2)−(m0+m3)
-                #   pitch (+=nose up→−North accel)= front(FR,FL) − rear(RL,RR) = (m0+m2)−(m1+m3)
-                _roll_tgt  = ((_p4[1] + _p4[2]) - (_p4[0] + _p4[3])) * _K_MAX_TILT
-                _pitch_tgt = ((_p4[0] + _p4[2]) - (_p4[1] + _p4[3])) * _K_MAX_TILT
+                # Second-order angular dynamics: motor torque → rate → angle.
+                # PX4 none_iris CA_ROTOR: 0=FR(+,+) 1=RL(-,-) 2=FL(+,-) 3=RR(-,+).
+                # pitch_diff>0 = front > rear = nose DOWN in FRD = forward/northward.
+                # roll_diff>0  = left > right = roll right = eastward.
+                pitch_diff = (_p4[0] + _p4[2]) - (_p4[1] + _p4[3])
+                roll_diff  = (_p4[1] + _p4[2]) - (_p4[0] + _p4[3])
+                new_pitch_rate = kpitch_rate + (_K_PITCH_ACCEL * _mean_p * pitch_diff
+                                               - _K_PITCH_DAMP * kpitch_rate) * _kdt_loc
+                new_roll_rate  = kroll_rate  + (_K_PITCH_ACCEL * _mean_p * roll_diff
+                                               - _K_PITCH_DAMP * kroll_rate)  * _kdt_loc
+                new_pitch = max(-_K_MAX_TILT, min(_K_MAX_TILT,
+                                                   kpitch + new_pitch_rate * _kdt_loc))
+                new_roll  = max(-_K_MAX_TILT, min(_K_MAX_TILT,
+                                                   kroll  + new_roll_rate  * _kdt_loc))
             else:
-                # ArduCopter QUAD X servo order (AP_MotorsMatrix MOTOR_FRAME_TYPE_X):
-                # ch1=FR(45°), ch2=RR(135°), ch3=RL(-135°), ch4=FL(-45°).
-                # roll = left(FL,RL) − right(FR,RR) = (ch4+ch3) − (ch1+ch2)  [+roll → +East]
-                # pitch = front(FR,FL) − rear(RR,RL) = (ch1+ch4) − (ch2+ch3) [+pitch → −North]
+                # ArduCopter QUAD X: ch1=FR(45°) ch2=RR(135°) ch3=RL(-135°) ch4=FL(-45°).
                 _roll_tgt  = ((_p4[2] + _p4[3]) - (_p4[0] + _p4[1])) * _K_MAX_TILT
                 _pitch_tgt = ((_p4[0] + _p4[3]) - (_p4[1] + _p4[2])) * _K_MAX_TILT
-
-            _ka       = _kdt_loc / (_K_TILT_TAU + _kdt_loc)
-            new_roll  = kroll  + _ka * (_roll_tgt  - kroll)
-            new_pitch = kpitch + _ka * (_pitch_tgt - kpitch)
+                _ka        = _kdt_loc / (_K_TILT_TAU + _kdt_loc)
+                new_roll   = kroll  + _ka * (_roll_tgt  - kroll)
+                new_pitch  = kpitch + _ka * (_pitch_tgt - kpitch)
+                new_pitch_rate = 0.0; new_roll_rate = 0.0
 
             _kcy, _ksy = math.cos(kyaw), math.sin(kyaw)
             _kbfwd = -_kthrust * math.sin(new_pitch)
@@ -1054,6 +1076,7 @@ def _run_physics():
                 new_kz  = float(centre_elev)
                 new_kvd = min(0.0, new_kvd)
                 new_kvn = 0.0; new_kve = 0.0
+                new_pitch_rate = 0.0; new_roll_rate = 0.0
 
             _yaw_CCW_loc = -kyaw
             _cy = math.cos(_yaw_CCW_loc / 2); _sy = math.sin(_yaw_CCW_loc / 2)
@@ -1064,12 +1087,23 @@ def _run_physics():
             nqz = _cr*_cp*_sy - _sr*_sp*_cy
             nqw = _cr*_cp*_cy + _sr*_sp*_sy
 
+            # Trace at 5 Hz
+            if t_now - _trace_last_t >= 0.2:
+                _trace_last_t = t_now
+                _trace_csv.writerow([
+                    f"{t_now - _trace_start_t:.2f}",
+                    f"{new_kx:.3f}", f"{new_ky:.3f}",
+                    f"{new_kz - centre_elev:.3f}",
+                    f"{new_kvn:.3f}", f"{new_kve:.3f}",
+                ])
+
             with _kin_lock:
-                _kx, _ky, _kz       = new_kx, new_ky, new_kz
-                _kvn, _kve, _kvd    = new_kvn, new_kve, new_kvd
-                _kroll, _kpitch     = new_roll, new_pitch
-                _latest_pwm         = pwm
-                _kqx, _kqy, _kqz, _kqw = nqx, nqy, nqz, nqw
+                _kx, _ky, _kz            = new_kx, new_ky, new_kz
+                _kvn, _kve, _kvd         = new_kvn, new_kve, new_kvd
+                _kroll, _kpitch          = new_roll, new_pitch
+                _kpitch_rate, _kroll_rate = new_pitch_rate, new_roll_rate
+                _latest_pwm              = pwm
+                _kqx, _kqy, _kqz, _kqw  = nqx, nqy, nqz, nqw
 
         # Publish /drone/state at physics rate (100 Hz)
         if _state_pub is not None and _ros2_node is not None:
@@ -1238,4 +1272,6 @@ while simulation_app.is_running():
                     if _step == DRONE_SAVE_EVERY:
                         print("[ROS2] First frame published to /drone/camera/image_raw")
 
+_trace_f.close()
+print(f"[DRONE] Flight trace saved → {_trace_path}")
 simulation_app.close()

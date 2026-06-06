@@ -14,4 +14,4 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source /opt/ros/jazzy/setup.bash
 
 echo "[Commander PX4] Starting px4_commander.py..."
-python3 "$SCRIPT_DIR/px4_commander.py" "$@"
+PYTHONUNBUFFERED=1 python3 "$SCRIPT_DIR/px4_commander.py" "$@"

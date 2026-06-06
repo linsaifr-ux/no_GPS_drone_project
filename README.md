@@ -79,6 +79,9 @@ no_GPS_drone_project/
 │   ├── detector.py               # YOLODetector (auto class-map COCO/VisDrone)
 │   ├── ros2_node.py              # ROS2: sub /drone/camera → pub /yolo/detections
 │   └── run_ros2_detector.sh      # launch script
+├── tools/                        # Post-flight and live analysis tools
+│   ├── live_trace.py             # Real-time flight-trace viewer (FuncAnimation, 200 ms)
+│   └── plot_trace.py             # Post-flight two-panel plot (top view + altitude)
 ├── yolov8l_visdrone.pt           # YOLOv8l fine-tuned on VisDrone (active)
 └── third_party/ardupilot/        # ArduPilot source (SITL binary inside)
 ```
@@ -103,7 +106,7 @@ no_GPS_drone_project/
 | PX4-3 | **Position-hold gate passed** (<0.3 m drift, 40 s) | Done |
 | PX4-4 | Waypoint nav ported to px4_commander.py (90 m, 699 m leg) | Done |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done |
-| PX4-6 | End-to-end Isaac Sim waypoint flight test | TODO |
+| PX4-6 | End-to-end Isaac Sim waypoint flight (90 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
 | 7 | AnyLoc + detection integration in PX4 pipeline | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -153,6 +156,20 @@ Switch with `Ctrl-B 0/1/2/3`. The commander prints `[PX4Cmd]` progress to window
 ### Run — headless (no Isaac Sim, for control-loop testing)
 
 ```bash
+# First run (apply params):
+bash run.sh --tmux --px4 --headless --params
+
+# Subsequent runs:
+bash run.sh --tmux --px4 --headless
+```
+
+tmux windows: **0 Bridge** · **1 PX4** · **2 MAVROS** · **3 Commander**  
+Switch with `Ctrl-B 0/1/2/3`. The commander prints `[PX4Cmd]` progress to window 3.
+
+<details>
+<summary>Manual steps (without run.sh)</summary>
+
+```bash
 source /opt/ros/jazzy/setup.bash
 
 # T1 — physics bridge (must own TCP 4560 before PX4 starts)
@@ -169,6 +186,8 @@ bash control/launch_mavros_px4.sh
 source /opt/ros/jazzy/setup.bash
 python3 control/px4_commander.py
 ```
+
+</details>
 
 ### Hold-gate test only (Phase 3 regression check)
 
@@ -260,6 +279,28 @@ ros2 topic hz /drone/camera/image_raw          # ~6 Hz from Isaac Sim
 ros2 topic echo /mavros/state                  # connected, armed, mode
 ros2 topic echo /mavros/local_position/pose    # EKF2 position estimate
 ros2 topic echo /mavros/vision_pose/pose_cov   # VPE from commander
+```
+
+---
+
+## Flight Trace Tools
+
+Both `drone_sim.py` and `cesium_scene.py` write a CSV trace at 5 Hz to `simulator/flight_traces/trace_<timestamp>.csv`:
+
+```
+t_s, east_m, north_m, agl_m, vn_ms, ve_ms
+```
+
+**Live viewer** (open before or during flight):
+```bash
+python3 tools/live_trace.py              # auto-attach to latest trace
+DISPLAY=:2 python3 tools/live_trace.py  # headless display
+```
+
+**Post-flight plot** (saves `simulator/flight_traces/trace_plot.png`):
+```bash
+python3 tools/plot_trace.py             # latest trace
+python3 tools/plot_trace.py --all       # overlay all traces
 ```
 
 ---

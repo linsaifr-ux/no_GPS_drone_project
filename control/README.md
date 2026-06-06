@@ -34,6 +34,10 @@ The PX4 migration was started because ArduPilot's position controller inversion 
 
 Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop iteration without the full Isaac Sim render overhead. Not used when `cesium_scene.py` is running.
 
+**PX4 physics (second-order angular rate model):** For `PX4_SIM=1`, attitude uses a second-order model (`K_PITCH_ACCEL=80 rad/s²`, `K_PITCH_DAMP=12 s⁻¹`) rather than first-order τ. The first-order model caused motor oscillation at 100 Hz (τ=0.15 s ≈ 15 steps), resulting in zero net horizontal force and a slow altitude sink. The sign of the horizontal thrust component is `_kbfwd = -thrust * sin(pitch)` — minus because PX4 FRD positive pitch is nose-UP (southward force = negative feedback for northward flight).
+
+**Flight trace CSV:** Both `drone_sim.py` and `cesium_scene.py` write a 5 Hz trace to `simulator/flight_traces/trace_<timestamp>.csv` with columns `t_s, east_m, north_m, agl_m, vn_ms, ve_ms`. View live with `tools/live_trace.py` or post-flight with `tools/plot_trace.py`.
+
 ### Commanders (the mission)
 
 **`px4_commander.py`** — PX4/MAVROS2 full mission commander.
@@ -114,6 +118,8 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 - **`fcu_protocol:="v2.0"`** must NOT be passed to MAVROS: PX4 denies `MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES` (520), causing MAVROS VER plugin to double-satisfy a future → `Promise already satisfied` crash.
 - **ENU convention**: `setpoint_raw/local` MAVROS2 always converts ENU→NED regardless of `FRAME_LOCAL_NED` flag. Send `x=East, y=North, z=Up(AGL)`.
 - **Stale bridge**: if a previous `drone_sim.py` is running on TCP 4560, PX4 silently connects to it. Always kill stale instances before starting the pipeline.
+- **`run.sh` pkill pattern**: the pattern must be `'/px4 |bin/px4$|mavros_node|px4_commander'` — a wider pattern (e.g. `'px4'`) matches `bash run.sh --px4` and kills the launcher itself.
+- **Commander stdout buffering**: `px4_commander.py` must be launched with `PYTHONUNBUFFERED=1` (already set in `launch_commander_px4.sh`) — without it, all `print()` output is held in a 4 kB pipe buffer when stdout is piped to `tee`, making the log appear silent for the entire flight.
 
 ---
 
@@ -126,7 +132,7 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 | 3 | Done | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift |
 | 4 | Done | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg, RTL |
 | 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
-| 6 | TODO | End-to-end Isaac Sim waypoint flight test |
+| 6 | Done ✓ | End-to-end Isaac Sim waypoint flight: horiz_err < 60 m at 699 m leg |
 
 ---
 
