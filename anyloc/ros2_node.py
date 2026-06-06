@@ -191,8 +191,15 @@ class AnyLocNode(rclpy.node.Node):
         run_anyloc = (self._frame_count == 1 or
                       self._frame_count % ANYLOC_INTERVAL == 0)
 
-        # VO every frame
-        dlat, dlon, n_vo = self._vo.update(pil_img, agl_m, yaw_deg)
+        # VO every frame — gimbal preserves drone yaw so camera top = drone nose.
+        # VORefiner yaw convention: 0 = North-pointing camera (image top=North),
+        # which equals the drone's compass bearing (CW degrees from North).
+        # /drone/pose encodes orientation as −_kyaw_rad (NED CW), so
+        # self._drone_yaw = −_kyaw_rad = −(compass_bearing_rad).
+        # Therefore: compass_bearing_deg = −math.degrees(self._drone_yaw).
+        # Simulation: _drone_yaw=0 → compass=0° (North-facing) → VO yaw=0. ✓
+        _vo_yaw = -math.degrees(self._drone_yaw)
+        dlat, dlon, n_vo = self._vo.update(pil_img, agl_m, _vo_yaw)
         if self._anchor_lat is not None:
             self._accum_dlat += dlat
             self._accum_dlon += dlon

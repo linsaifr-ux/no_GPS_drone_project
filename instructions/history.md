@@ -52,15 +52,60 @@ Files: `run.sh`.
 
 ---
 
+### New: 2-axis gimbal-stabilised nadir camera
+
+**Problem:** The drone camera is a child of `/World/Drone` in USD. It inherits the drone's pitch and roll, so camera frames tilt with the drone during flight. AnyLoc and YOLO expect a level nadir image. Additionally, the image top should follow the drone nose direction so that VO pixel displacements map cleanly to the drone's heading frame.
+
+**Fix:** Added a gimbal orient op to `/World/Drone/Camera`. Each render loop frame it is set to cancel roll and pitch while preserving yaw:
+
+```
+camera_local = conj(drone_quat) × yaw_only_quat
+→ camera world orient = yaw_only  (nadir + heading-aligned)
+```
+
+Quaternion components each frame:
+```python
+_cy = cos(_yaw_CCW / 2);  _sy = sin(_yaw_CCW / 2)
+drone_cam_orient_op.Set(Gf.Quatd(
+     _qw*_cy + _qz*_sy,   # w
+    -_qx*_cy - _qy*_sy,   # x
+     _qx*_sy - _qy*_cy,   # y
+     _qw*_sy - _qz*_cy,   # z
+))
+```
+
+Result: camera looks straight down regardless of pitch/roll; image top always points toward the drone's nose. The 15 cm translate offset is unaffected (TranslateOp precedes OrientOp in the xformOp stack).
+
+Files: `simulator/cesium_scene.py`.
+
+---
+
+### Fix: VO yaw convention corrected for heading-aligned gimbal
+
+`anyloc/ros2_node.py` was passing `yaw_deg = 0` to `VORefiner.update()`. VORefiner's `yaw=0` convention means "North-pointing camera". With the 2-axis gimbal, the camera now follows the drone's heading — so the yaw fed to VO should be the drone's compass bearing (CW from North).
+
+`/drone/pose` encodes orientation as `−_kyaw_rad` (not the correct `π/2 − _kyaw_rad`), so `self._drone_yaw = −_kyaw_rad = −(compass_bearing_rad)`. Therefore:
+
+```python
+_vo_yaw = -math.degrees(self._drone_yaw)  # = compass_bearing_deg
+```
+
+In simulation (`_kyaw_rad=0`, drone faces North): `_vo_yaw = 0` ✓ (North-pointing camera convention). On real hardware with drone yaw, this correctly rotates raw pixel displacements to world ENU.
+
+Files: `anyloc/ros2_node.py`.
+
+---
+
 ### Files modified
 
 | File | Change |
 |------|--------|
-| `anyloc/ros2_node.py` | Remove duplicate VPE publisher; AGL gate (MIN_AGL=50m); write JSON every frame (VO-smoothed) |
+| `anyloc/ros2_node.py` | Remove duplicate VPE publisher; AGL gate (MIN_AGL=50m); write JSON every frame (VO-smoothed); VO yaw = compass bearing |
 | `detection/ros2_node.py` | Add `/drone/agl` subscriber; AGL gate (MIN_AGL=50m) |
 | `control/px4_commander.py` | Phase 2 VPE yaw hardcoded π/2 (was reading yaw_deg=0 from JSON) |
 | `run.sh` | Add `--anyloc` and `--detection` flags; windows 4 and 5 |
 | `anyloc/README.md` | Remove `/mavros/vision_pose/pose` row; add file-based VPE note |
+| `simulator/cesium_scene.py` | 2-axis gimbal: cancel roll+pitch, preserve yaw; camera top follows drone nose |
 
 ---
 

@@ -45,10 +45,11 @@ For fast control-loop iteration without the Isaac Sim render overhead, use the h
 
 ```
 Background thread (100 Hz)                   Render loop (~13 Hz)
-─────────────────────────────                ─────────────────────────────
+─────────────────────────────                ──────────────────────────────────────
 bridge.step() ↔ ArduPilot/PX4 SITL          read _k* state under _kin_lock
 kinematic 6-DOF integration                  update drone mesh position/orientation
-publish /drone/state (ENU)                   HUD overlay, frame capture, ROS2 spin
+publish /drone/state (ENU)                   2-axis gimbal: cam = conj(drone)×yaw_only
+                                             HUD, frame capture, ROS2 spin
 ```
 
 ### Physics thread (100 Hz steps)
@@ -66,6 +67,14 @@ publish /drone/state (ENU)                   HUD overlay, frame capture, ROS2 sp
 6. Update shared state (protected by `threading.Lock`)
 7. Publish `/drone/state` (ENU `PoseStamped`, frame `local_enu`)
 8. Write one row to flight trace CSV at 5 Hz (`simulator/flight_traces/trace_<ts>.csv`)
+
+### Render loop (~13 Hz steps)
+
+1. Read kinematic state from background thread (under `_kin_lock`)
+2. Update drone mesh position (`drone_pos_op`) and orientation (`drone_orient_op`)
+3. **2-axis gimbal:** `camera_local = conj(drone_quat) × yaw_only_quat` — cancels roll and pitch while preserving yaw, so the camera always looks straight down AND the top of the image follows the drone nose direction
+4. HUD update (lat / lon / alt / AGL)
+5. Capture nadir frame via Replicator annotator; publish `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl`
 
 ### Why 100 Hz matters
 
@@ -96,7 +105,7 @@ Thrust model: `thrust = mean(p_norm_4) * 2.0 * g` — at hover, mean p_norm = 0.
 | Topic | Type | Rate | Content |
 |-------|------|------|---------|
 | `/drone/state` | `geometry_msgs/PoseStamped` | 100 Hz | ENU position (z = MSL altitude), heading quaternion |
-| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Nadir RGB 640×480 |
+| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Gimbal-stabilised nadir RGB 640×480 |
 | `/drone/pose` | `geometry_msgs/PoseStamped` | ~13 Hz | Same as `/drone/state` at render rate |
 | `/drone/agl` | `std_msgs/Float64` | ~13 Hz | Altitude above ground level (m) |
 

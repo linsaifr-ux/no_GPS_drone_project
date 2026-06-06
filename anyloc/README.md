@@ -157,6 +157,16 @@ DISPLAY=:2 conda run -n isaac_sim_test --no-capture-output python3 -u anyloc/ros
 
 **VPE to MAVROS is not published by this node.** `px4_commander.py` reads `latest_estimate.json` and publishes `/mavros/vision_pose/pose_cov` with correct per-axis covariance. Publishing from both processes caused duplicate EKF2 inputs.
 
+### VO yaw convention
+
+The VO refiner (`VORefiner`) expects a `yaw_deg` argument equal to the compass bearing of the camera's image-top direction (0 = North, 90 = East). Because the camera gimbal preserves drone yaw (top of image = drone nose), this equals the drone's compass bearing:
+
+```python
+_vo_yaw = -math.degrees(self._drone_yaw)   # _drone_yaw = −_kyaw_rad (NED CW)
+```
+
+In simulation (`_kyaw_rad = 0`, drone faces North): `_vo_yaw = 0` — matches VORefiner's North-pointing convention. On real hardware with drone yaw, the formula holds automatically.
+
 ### latest_estimate.json format
 
 ```json
@@ -170,7 +180,7 @@ DISPLAY=:2 conda run -n isaac_sim_test --no-capture-output python3 -u anyloc/ros
 }
 ```
 
-> **Note on `yaw_deg`:** This field is the drone's kinematic yaw extracted from `/drone/pose`, but `/drone/pose` encodes orientation as `qz = sin(−_kyaw_rad / 2)` — not the correct ENU conversion (`π/2 − _kyaw_rad`). For a North-facing drone (`_kyaw_rad = 0`), `yaw_deg` is always `0.0` (East), which is a 90° error. `px4_commander.py` ignores this field and hardcodes ENU yaw = π/2 (North) for VPE in both Phase 1 and Phase 2, since the drone never yaws in simulation.
+> **Note on `yaw_deg`:** `/drone/pose` encodes orientation as `qz = sin(−_kyaw_rad / 2)` (should be `π/2 − _kyaw_rad`), so `yaw_deg = 0.0` for a North-facing drone — a 90° encoding error. `px4_commander.py` ignores this field and hardcodes ENU yaw = π/2 (North) for VPE in both phases.
 
 ---
 

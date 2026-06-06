@@ -938,15 +938,24 @@ _beacon.CreateRadiusAttr(0.05)
 _beacon.CreateColorAttr(Gf.Vec3f(1.0, 0.4, 0.0))
 UsdGeom.Xformable(_beacon).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.15))
 
-# Nadir camera — in a Z-up stage, default USD camera orientation looks along
-# its local -Z, which equals world -Z (straight down). No rotation needed.
+# Nadir camera with 2-axis gimbal stabilisation.
+# The camera is a child of /World/Drone, so it inherits the drone's attitude.
+# A gimbal orient op (updated every render frame) cancels roll and pitch while
+# preserving yaw, so the camera always looks straight down AND the top of the
+# image follows the drone nose direction.
+# Math: camera_local = conj(drone_quat) * yaw_only_quat
+#       → camera world orient = yaw_only (nadir + heading-aligned).
+# The translate offset keeps it 15 cm below the drone centre in drone-local space.
 # 18 mm focal length / 36×27 mm aperture → 90°×73.7° FOV, 640×480 output.
 drone_cam = UsdGeom.Camera.Define(stage, "/World/Drone/Camera")
-drone_cam.CreateFocalLengthAttr(18.0)             # 18 mm → 90° HFOV, 73.7° VFOV
+drone_cam.CreateFocalLengthAttr(18.0)
 drone_cam.CreateHorizontalApertureAttr(36.0)
-drone_cam.CreateVerticalApertureAttr(27.0)        # 4:3 matches 640×480
+drone_cam.CreateVerticalApertureAttr(27.0)
 drone_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 5000.0))
-UsdGeom.Xformable(drone_cam).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.15))
+_dcam_xf = UsdGeom.Xformable(drone_cam)
+_dcam_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.15))
+drone_cam_orient_op = _dcam_xf.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+drone_cam_orient_op.Set(Gf.Quatd(1, 0, 0, 0))   # identity until first frame
 
 # Replicator render product for the drone camera
 _rp  = rep.create.render_product("/World/Drone/Camera", (DRONE_CAM_W, DRONE_CAM_H))
@@ -1195,6 +1204,18 @@ while simulation_app.is_running():
     # ── Update drone mesh ──────────────────────────────────────────────────────
     drone_pos_op.Set(Gf.Vec3d(_x_enu, _y_enu, _z_abs))
     drone_orient_op.Set(Gf.Quatd(_qw, _qx, _qy, _qz))
+    # Gimbal stabilisation: cancel roll+pitch but preserve yaw so the camera
+    # always points straight down AND the top of the image follows the drone nose.
+    # camera_local = conj(drone_quat) * yaw_only_quat
+    # → camera world orient = yaw_only, which is nadir + heading-aligned.
+    _cy = math.cos(_yaw_CCW / 2.0)
+    _sy = math.sin(_yaw_CCW / 2.0)
+    drone_cam_orient_op.Set(Gf.Quatd(
+         _qw * _cy + _qz * _sy,   # w
+        -_qx * _cy - _qy * _sy,   # x
+         _qx * _sy - _qy * _cy,   # y
+         _qw * _sy - _qz * _cy,   # z
+    ))
 
     # ── Drain pending ROS2 events ──────────────────────────────────────────────
     if _ros2_node is not None:
