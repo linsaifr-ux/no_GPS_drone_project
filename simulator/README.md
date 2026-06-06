@@ -105,7 +105,7 @@ Thrust model: `thrust = mean(p_norm_4) * 2.0 * g` — at hover, mean p_norm = 0.
 | Topic | Type | Rate | Content |
 |-------|------|------|---------|
 | `/drone/state` | `geometry_msgs/PoseStamped` | 100 Hz | ENU position (z = MSL altitude), heading quaternion |
-| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Gimbal-stabilised nadir RGB 640×480 |
+| `/drone/camera/image_raw` | `sensor_msgs/Image` | ~6 Hz | Gimbal-stabilised nadir RGB 2048×1536 (AP-IMX900-Mini-USB3-I5) |
 | `/drone/pose` | `geometry_msgs/PoseStamped` | ~13 Hz | Same as `/drone/state` at render rate |
 | `/drone/agl` | `std_msgs/Float64` | ~13 Hz | Altitude above ground level (m) |
 

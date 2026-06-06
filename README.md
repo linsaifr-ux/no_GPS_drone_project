@@ -22,7 +22,7 @@ Autonomous drone that localises itself and detects objects without GPS, validate
 │  PX4:       PX4SimBridge TCP 4560  (HIL_ACTUATOR_CONTROLS in /       │
 │                                     HIL_SENSOR out)                  │
 │  Publishes: /drone/state (ENU PoseStamped, 100 Hz)                  │
-│             /drone/camera/image_raw (gimbal-stabilised nadir)       │
+│             /drone/camera/image_raw (2-axis gimbal nadir, 2048×1536) │
 │             /drone/pose  /drone/agl                                  │
 └───────┬──────────────────────────────────────────────────────────────┘
         │ /drone/state

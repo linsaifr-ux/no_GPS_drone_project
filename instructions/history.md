@@ -96,16 +96,50 @@ Files: `anyloc/ros2_node.py`.
 
 ---
 
+### New: AP-IMX900-Mini-USB3-I5 camera resolution match
+
+Updated all modules to match the real hardware camera. Final values are from the AP-IMX900-Mini-USB3-I5 spec sheet (initial implementation incorrectly computed FOV from raw IMX900 sensor pitch; corrected after reading the actual datasheet):
+
+| Spec | Old (sim default) | New (spec sheet) |
+|------|-------------------|-----------------|
+| Resolution | 640×480 | **2048×1536** |
+| HFOV | 90° | **88°** |
+| VFOV | 73.7° | **65.1°** |
+| DFOV | — | 113.1° |
+| Focal length | 18 mm | **3.1 mm (EFL)** |
+| Pinhole aperture H | 36 mm | **5.987 mm** (2×3.1×tan 44°) |
+| Pinhole aperture V | 27 mm | **3.957 mm** (2×3.1×tan 32.55°) |
+| GSD @ 80 m AGL | ~250 mm/px | **~75 mm/px** |
+
+> **Note on FOV:** The spec-sheet H/V values (88°×65.1°) are consistent with an equisolid wide-angle lens, not a rectilinear pinhole — `sin(44°)/sin(32.55°) = 1.337 ≈ 2048/1536 = 1.333`. Isaac Sim uses a pinhole (rectilinear) model; the spec-sheet H and V angles are used directly as the pinhole FOV, approximating the real lens.
+
+**YOLO:** `detect()` now accepts `imgsz=1280` (default). VisDrone targets are small; upsizing the inference resolution recovers small-object detections that letterbox-at-640 misses. Ultralytics letterboxes internally so no aspect-ratio distortion.
+
+**Detection postview:** rendered at 1024×768 (half native) with bounding boxes scaled proportionally (`_sx = _sy = 0.5`).
+
+> **⚠ AnyLoc database rebuild required.** The old database was built with FOV 90°×73.7°; the correct FOV is 88°×65.1°. Satellite patches in the DB correspond to the old footprint and will produce wrong matches at runtime.
+> ```bash
+> conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+> ```
+
+Files: `simulator/cesium_scene.py`, `anyloc/localizer.py`, `anyloc/build_database.py`, `anyloc/vo_refiner.py`, `detection/detector.py`, `detection/ros2_node.py`.
+
+---
+
 ### Files modified
 
 | File | Change |
 |------|--------|
 | `anyloc/ros2_node.py` | Remove duplicate VPE publisher; AGL gate (MIN_AGL=50m); write JSON every frame (VO-smoothed); VO yaw = compass bearing |
-| `detection/ros2_node.py` | Add `/drone/agl` subscriber; AGL gate (MIN_AGL=50m) |
+| `detection/ros2_node.py` | Add `/drone/agl` subscriber; AGL gate (MIN_AGL=50m); postview at 1024×768 with scaled boxes |
 | `control/px4_commander.py` | Phase 2 VPE yaw hardcoded π/2 (was reading yaw_deg=0 from JSON) |
 | `run.sh` | Add `--anyloc` and `--detection` flags; windows 4 and 5 |
 | `anyloc/README.md` | Remove `/mavros/vision_pose/pose` row; add file-based VPE note |
-| `simulator/cesium_scene.py` | 2-axis gimbal: cancel roll+pitch, preserve yaw; camera top follows drone nose |
+| `simulator/cesium_scene.py` | 2-axis gimbal: cancel roll+pitch, preserve yaw; camera top follows drone nose; AP-IMX900 2048×1536, aperture 5.987×3.957 mm, HFOV=88°, VFOV=65.1° |
+| `anyloc/localizer.py` | HFOV=88°, VFOV=65.1° |
+| `anyloc/build_database.py` | HFOV=88°, VFOV=65.1° |
+| `anyloc/vo_refiner.py` | Default cam_w=2048, cam_h=1536, hfov=88°, vfov=65.1° |
+| `detection/detector.py` | `detect(pil_img, imgsz=1280)` for better small-object detection |
 
 ---
 

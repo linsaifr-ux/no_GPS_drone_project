@@ -3,7 +3,7 @@
 YOLOv8 vehicle detector as a ROS2 node with live postview.
 
 Subscribes:
-  /drone/camera/image_raw  (sensor_msgs/Image, rgb8, 640×480)
+  /drone/camera/image_raw  (sensor_msgs/Image, rgb8, 2048×1536)
   /drone/pose              (geometry_msgs/PoseStamped, frame_id="wgs84")
 
 Publishes:
@@ -46,7 +46,7 @@ MODEL_PT = os.path.join(
 MIN_AGL = 50.0   # m — skip inference below this altitude
 
 
-def _pil_to_array(pil_img, size=(640, 480)):
+def _pil_to_array(pil_img, size=(1024, 768)):
     img = pil_img.resize(size, PILImage.LANCZOS).convert('RGB')
     t   = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8) \
                .reshape(size[1], size[0], 3)
@@ -141,9 +141,14 @@ class YOLONode(rclpy.node.Node):
             print(f"[YOLO] no vehicles  {elapsed_ms:.0f} ms  {fps:.1f} fps  "
                   f"lat={self._drone_lat:.5f} lon={self._drone_lon:.5f}")
 
-        # Annotated frame for postview
-        annotated = self._det.draw(pil_img.resize((640, 480), PILImage.LANCZOS),
-                                   detections)
+        # Annotated frame for postview — scale boxes to half-res display
+        _dw, _dh = 1024, 768
+        _sx, _sy = _dw / msg.width, _dh / msg.height
+        _scaled = [{**d, 'x1': d['x1']*_sx, 'y1': d['y1']*_sy,
+                         'x2': d['x2']*_sx, 'y2': d['y2']*_sy}
+                   for d in detections]
+        annotated = self._det.draw(pil_img.resize((_dw, _dh), PILImage.LANCZOS),
+                                   _scaled)
         with self.lock:
             self.latest_frame  = annotated
             self.latest_result = dict(
@@ -159,7 +164,7 @@ def run_postview(node: YOLONode):
     ax.axis('off')
     ax.set_facecolor('#1a1a1a')
 
-    blank = np.zeros((480, 640, 3), dtype=np.uint8)
+    blank = np.zeros((768, 1024, 3), dtype=np.uint8)
     im = ax.imshow(blank)
     ax.set_title('YOLO Vehicle Detection — waiting for frames …',
                  color='white', fontsize=11, pad=4)

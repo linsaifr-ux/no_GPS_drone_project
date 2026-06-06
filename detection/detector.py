@@ -55,16 +55,22 @@ class YOLODetector:
         print(f"[YOLO] Model ready  classes={list(self._filter.values())}  "
               f"conf_threshold={conf}")
 
-    def detect(self, pil_img: Image.Image) -> list[dict]:
+    def detect(self, pil_img: Image.Image, imgsz: int = 1280) -> list[dict]:
         """
         Run inference on a PIL image.
+
+        Args:
+            pil_img  input image (any resolution; YOLO letterboxes internally)
+            imgsz    YOLO inference size (default 1280 for IMX900 2064×1552 input;
+                     use 640 for faster inference at lower accuracy)
 
         Returns list of dicts:
             label  str    — 'car', 'motorcycle', 'bus', or 'truck'
             conf   float  — confidence score
             x1 y1 x2 y2  float — bounding box pixels (xyxy, top-left origin)
         """
-        results = self.model(pil_img, conf=self.conf, verbose=False)[0]
+        results = self.model(pil_img, conf=self.conf, verbose=False,
+                             imgsz=imgsz)[0]
         out = []
         for box in results.boxes:
             cls_id = int(box.cls[0])

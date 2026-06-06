@@ -77,7 +77,11 @@ anyloc/database/
 └── db_meta.json         # build cache (skip re-download if present)
 ```
 
-Current database: **36 673 entries**, 50 m grid, AGL 60–120 m.
+Current database: **36 673 entries**, 50 m grid, AGL 60–120 m. **Built with old FOV (90°×73.7°) — rebuild required after camera update to 88°×65.1° (AP-IMX900-Mini-USB3-I5 spec sheet):**
+
+```bash
+conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+```
 
 ---
 
@@ -150,7 +154,7 @@ DISPLAY=:2 conda run -n isaac_sim_test --no-capture-output python3 -u anyloc/ros
 
 | Direction | Topic | Type | Notes |
 |---|---|---|---|
-| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 640×480 |
+| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 2048×1536 (AP-IMX900-Mini-USB3-I5) |
 | Subscribe | `/drone/pose` | `geometry_msgs/PoseStamped` | WGS84 (lat, lon, alt_msl) |
 | Subscribe | `/drone/agl` | `std_msgs/Float64` | AGL in metres |
 | Publish | `/anyloc/pose_estimate` | `geometry_msgs/PoseWithCovarianceStamped` | AnyLoc estimate (monitoring) |

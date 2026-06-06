@@ -69,7 +69,7 @@ R_EARTH    = 6_371_000.0
 COS_LAT    = math.cos(math.radians(CENTER_LAT))
 HERE             = os.path.dirname(os.path.abspath(__file__))
 DRONE_FRAME_DIR  = os.path.join(HERE, "drone_frames")
-DRONE_CAM_W, DRONE_CAM_H = 640, 480
+DRONE_CAM_W, DRONE_CAM_H = 2048, 1536   # AP-IMX900-Mini-USB3-I5 native resolution
 DRONE_SAVE_EVERY = 1    # capture a frame every N sim steps
 DRONE_SPEED_M    = 5.0  # keyboard move step (m)
 
@@ -946,11 +946,13 @@ UsdGeom.Xformable(_beacon).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.15))
 # Math: camera_local = conj(drone_quat) * yaw_only_quat
 #       → camera world orient = yaw_only (nadir + heading-aligned).
 # The translate offset keeps it 15 cm below the drone centre in drone-local space.
-# 18 mm focal length / 36×27 mm aperture → 90°×73.7° FOV, 640×480 output.
+# AP-IMX900-Mini-USB3-I5: EFL 3.1 mm, 113.1°(D)×88°(H)×65.1°(V) — from spec sheet.
+# Pinhole aperture: 2×3.1×tan(44°)=5.987 mm H, 2×3.1×tan(32.55°)=3.957 mm V.
+# GSD ≈ 75 mm/px @ 80 m AGL.  2048×1536 output.
 drone_cam = UsdGeom.Camera.Define(stage, "/World/Drone/Camera")
-drone_cam.CreateFocalLengthAttr(18.0)
-drone_cam.CreateHorizontalApertureAttr(36.0)
-drone_cam.CreateVerticalApertureAttr(27.0)
+drone_cam.CreateFocalLengthAttr(3.1)              # AP-IMX900: EFL 3.1 mm
+drone_cam.CreateHorizontalApertureAttr(5.987)     # 2×3.1×tan(44°): HFOV=88°
+drone_cam.CreateVerticalApertureAttr(3.957)       # 2×3.1×tan(32.55°): VFOV=65.1°
 drone_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 5000.0))
 _dcam_xf = UsdGeom.Xformable(drone_cam)
 _dcam_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.15))

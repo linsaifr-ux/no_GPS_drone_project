@@ -101,7 +101,7 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 - **Render loop (~13 Hz):** reads shared kinematic state under lock; updates `/World/Drone` mesh position/orientation; captures nadir camera frames
 - **Motor layout:** ArduCopter X-frame ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
 - **SITLBridge:** `control/sitl_bridge.py` on UDP 9002 — binary servo in, JSON physics out
-- **Camera:** `/World/Drone/Camera` — nadir, 18 mm / 36×27 mm, 90°×73.7° FOV, 640×480; 2-axis gimbal-stabilised (cancel roll+pitch, preserve yaw — image is always level and top follows drone nose)
+- **Camera:** `/World/Drone/Camera` — nadir, AP-IMX900-Mini-USB3-I5 (EFL 3.1 mm, 113.1°(D)×88°(H)×65.1°(V) from spec sheet, 2048×1536, GSD ≈ 75 mm/px @ 80 m); 2-axis gimbal-stabilised (cancel roll+pitch, preserve yaw — image is always level and top follows drone nose)
 - **HUD:** `omni.ui` overlay showing live LAT / LON / ALT MSL / AGL
 - **Frame output:** `drone_frames/latest.jpg` + `latest_meta.json` every 5 sim steps
 - **ROS2 publishers:** `/drone/state`, `/drone/camera/image_raw`, `/drone/pose` (WGS84), `/drone/agl`
