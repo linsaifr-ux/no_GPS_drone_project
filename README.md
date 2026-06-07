@@ -352,3 +352,14 @@ python3 tools/plot_trace.py --all       # overlay all traces
 | Terrain | Cesium World Terrain (asset 1) | © Cesium ion |
 | Buildings | Cesium OSM Buildings (asset 96188) | © OpenStreetMap (ODbL) |
 | Satellite imagery (sim + database build) | Esri World Imagery (zoom 19, ~0.37 m/px) | © Esri / contributors |
+
+### Target Vehicles (Isaac Sim)
+
+Three procedural sedan models (`make_car()` in `cesium_scene.py`) placed inside the
+detection zone for end-to-end survey pipeline testing:
+
+| Model | NED (m) | Yaw | Strip area |
+|-------|---------|-----|------------|
+| `/World/Car_01` | N+350 E−700 | 45° NE | Strip 1 |
+| `/World/Car_02` | N+150 E−900 | 270° W | Strip 2 |
+| `/World/Car_03` | N+450 E−1100 | 135° SE | Strip 4 |

@@ -1,5 +1,33 @@
 # Project History
 
+## 2026-06-07 — Three target vehicles placed in detection zone (cesium_scene.py)
+
+Added three procedural sedan models inside the YOLO detection zone for end-to-end
+survey-detection pipeline testing.
+
+**Previous state:** one car at `(23.452028, 120.283829)` — approximately N=125, E=−235 m
+from home. This is **outside** the detection zone (nearest edge is at E≈−454).
+
+**New state:** three cars spread across the zone, one per strip region:
+
+| Prim | lat | lon | NED north | NED east | Yaw | Strip |
+|------|-----|-----|-----------|----------|-----|-------|
+| `/World/Car_01` | 23.454017 | 120.279272 | +350 m | −700 m | 45° (NE) | Strip 1 |
+| `/World/Car_02` | 23.452218 | 120.277309 | +150 m | −900 m | 270° (W) | Strip 2 |
+| `/World/Car_03` | 23.454917 | 120.275348 | +450 m | −1100 m | 135° (SE) | Strip 4 |
+
+All positions verified inside the buffered zone polygon (30 m inward from raw corners).
+Varying yaw angles give realistic parked orientations.
+
+Each model is built by `make_car()`: USD `Cube`/`Cylinder` primitives — white sedan
+body, cabin, hood, trunk, bumpers, dark tinted windows, head/tail-lights, four
+wheels with rims, and a roof identification panel. Approximate dimensions: Toyota Altis
+class (4.64 m × 1.775 m × 1.45 m).
+
+**Files changed:** `simulator/cesium_scene.py`
+
+---
+
 ## 2026-06-07 — live_trace.py: raw zone boundary + explicit legend
 
 Added the actual detection zone boundary (before the 30 m inward buffer) as a second

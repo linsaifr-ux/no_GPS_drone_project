@@ -131,6 +131,21 @@ Subscribed: `/drone/reset` (`std_msgs/Bool`) — resets drone to origin.
 - **Imagery**: Esri World Imagery (zoom 19, ~0.37 m/px effective after MAX_TEX=16384 cap)
 - **Home elevation**: loaded from `cesium_terrain_cache/` at startup; written to `control/home_elevation.json`
 
+### Target Vehicles
+
+Three USD sedan models (`make_car()`) are placed inside the YOLO detection zone for
+end-to-end testing of the survey detection pipeline:
+
+| Prim | NED north (m) | NED east (m) | Yaw | Strip area |
+|------|--------------|-------------|-----|------------|
+| `/World/Car_01` | +350 | −700 | 45° (NE) | Strip 1 |
+| `/World/Car_02` | +150 | −900 | 270° (W) | Strip 2 |
+| `/World/Car_03` | +450 | −1100 | 135° (SE) | Strip 4 |
+
+Each model is a procedural white sedan built from USD `Cube`/`Cylinder` primitives
+(body, cabin, hood, trunk, bumpers, windows, headlights, tail-lights, wheels, roof
+identification panel). Dimensions approximate a Toyota Altis (4.64 m × 1.775 m × 1.45 m).
+
 The terrain cache (`cesium_terrain_cache/`) and tile cache (`cesium_tile_cache/`) are pre-downloaded — no network required at runtime.
 
 ---

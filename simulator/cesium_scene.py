@@ -942,9 +942,12 @@ for tile_url in building_tiles:
 
 print(f"[CESIUM] Loaded {n_bld} buildings")
 
-# ── TARGET VEHICLES ────────────────────────────────────────────────────────────
-make_car("/World/Car_01", 23.452028, 120.283829, yaw_deg=0.0)
-print("[CESIUM] Car placed at 23.452028, 120.283829")
+# ── TARGET VEHICLES (inside detection zone) ───────────────────────────────────
+# Three cars spread across the lawnmower survey zone (~NED: N-48→677, E-1327→-454).
+# Positions verified inside the buffered zone polygon.
+make_car("/World/Car_01", 23.454017, 120.279272, yaw_deg=45.0)   # N=350 E=-700  strip-1 area
+make_car("/World/Car_02", 23.452218, 120.277309, yaw_deg=270.0)  # N=150 E=-900  strip-2 area
+make_car("/World/Car_03", 23.454917, 120.275348, yaw_deg=135.0)  # N=450 E=-1100 strip-4 area
 
 # ── VIEWPORT CAMERA ────────────────────────────────────────────────────────────
 cam = UsdGeom.Camera.Define(stage, "/World/Camera")
