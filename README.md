@@ -60,7 +60,7 @@ no_GPS_drone_project/
 │   ├── drone_sim.py              # headless physics rig (PX4_SIM=0/1)
 │   ├── px4_sim_bridge.py         # PX4 HIL bridge (TCP 4560, pymavlink)
 │   ├── sitl_bridge.py            # ArduPilot SIM_JSON bridge (UDP 9002)
-│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→6-strip 12m/s lawnmower+YOLO divert→RTL
+│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→6-strip 12m/s lawnmower; YOLO logs via yaw-corrected pixel projection→RTL
 │   ├── flight_commander.py       # ArduPilot mission (reference; WP nav unsolved)
 │   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
 │   ├── no_gps.parm               # ArduPilot: EK3 ExternalNav, GPS off
@@ -110,7 +110,7 @@ no_GPS_drone_project/
 | PX4-6 | End-to-end Isaac Sim waypoint flight (65 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection integration in PX4 pipeline | In progress |
 | PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | Done ✓ |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO log-in-flight (no divert) | Done ✓ |
 | PX4-10 | Jetson distributed sim (Jetson = commander+AnyLoc+YOLO; PC = Isaac+PX4) | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -350,5 +350,4 @@ python3 tools/plot_trace.py --all       # overlay all traces
 |-------|--------|---------|
 | Terrain | Cesium World Terrain (asset 1) | © Cesium ion |
 | Buildings | Cesium OSM Buildings (asset 96188) | © OpenStreetMap (ODbL) |
-| Satellite imagery (database build) | Taiwan NLSC PHOTO2 WMTS | © 內政部國土測繪中心 |
-| Validation imagery | Esri World Imagery | © Esri / contributors |
+| Satellite imagery (sim + database build) | Esri World Imagery (zoom 19, ~0.37 m/px) | © Esri / contributors |

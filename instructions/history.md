@@ -2183,3 +2183,60 @@ Node also writes `anyloc/latest_estimate.json` on each anchor for legacy `run_fl
 | `detection/ros2_node.py` | Added sys.path ROS2 fix |
 | `control/flight_commander.py` | Added sys.path ROS2 fix |
 | `simulator/cesium_scene.py` | Always writes files; publishes ROS2 on top (dual output) |
+
+---
+
+## 2026-06-07 — Imagery → Esri; YOLO threshold 0.50; detection logging without divert
+
+### Imagery: NLSC → Esri World Imagery (zoom 19)
+
+NLSC WMTS PHOTO2 tiles contain embedded watermarks (text/logos) that caused YOLO false
+positives. Switched to **Esri World Imagery** in both `cesium_scene.py` and
+`anyloc/build_database.py`:
+
+```python
+ESRI_TILE_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services"
+                 "/World_Imagery/MapServer/tile/{z}/{y}/{x}")
+SAT_ZOOM = 19   # ~0.37 m/px effective after MAX_TEX=16384 downsampling
+```
+
+Zoom 18 (old) → 0.60 m/px; zoom 19 → ~0.37 m/px effective (zoom 20 hits the same cap
+but requires 4× more tiles). Deleted cached `simulator/satellite_ground.jpg` (NLSC mosaic)
+so it re-downloads as Esri on next run. AnyLoc database must be rebuilt after this change.
+
+### YOLO confidence threshold: 0.30 → 0.50
+
+`detection/ros2_node.py` line: `self._det = YOLODetector(MODEL_PT, conf=0.50)`
+
+### Detection logging without flight divert
+
+**Previous behaviour:** YOLO detection inside buffered zone → set `SurveyState.DIVERT` →
+interrupt `go_to_ned()` early → fly to car position (10 m radius) → log at final centred
+position → resume same waypoint.
+
+**New behaviour:** YOLO detection → yaw-corrected GSD pixel projection → dedup check
+(30 m) → log immediately → survey continues unbroken.
+
+Removed: `SurveyState` enum, `DETECT_RADIUS`, `interruptible` param from `go_to_ned()`,
+DIVERT branch in survey loop, zone check in `_cb_detections()`.
+
+**Yaw-corrected projection formula** (`h` = NED heading CW from north):
+```python
+q       = self._drone.pose.orientation
+yaw_enu = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y**2 + q.z**2))
+h = -yaw_enu
+dx_m =  (cx - CAM_W/2) * gsd_x   # drone-right
+dy_m = -(cy - CAM_H/2) * gsd_y   # drone-forward
+de = dx_m*math.cos(h) + dy_m*math.sin(h)
+dn = -dx_m*math.sin(h) + dy_m*math.cos(h)
+```
+
+Derivation: camera top follows drone nose; forward direction in ENU = (sin(h), cos(h));
+right direction = (cos(h), −sin(h)). Verified at h=0 (north), h=π/2 (east), h=π (south).
+
+| File | Change |
+|------|--------|
+| `simulator/cesium_scene.py` | `ESRI_TILE_URL`, `SAT_ZOOM=19`; removed NLSC URL |
+| `anyloc/build_database.py` | Same imagery constants |
+| `detection/ros2_node.py` | `conf=0.50` |
+| `control/px4_commander.py` | Removed `SurveyState`/`DETECT_RADIUS`/`interruptible`; `_cb_detections` projects + logs; survey loop sequential |

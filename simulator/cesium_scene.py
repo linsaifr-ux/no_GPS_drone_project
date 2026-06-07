@@ -6,7 +6,7 @@ All geometry comes from Cesium ion REST API:
   Asset 1      — Cesium World Terrain (quantized-mesh-1.0)
   Asset 96188  — Cesium OSM Buildings (3D Tiles B3DM)
 
-Satellite imagery: Taiwan NLSC aerial orthophoto WMTS (PHOTO2, zoom 18).
+Satellite imagery: Esri World Imagery WMTS (zoom 18, ~0.6 m/px, no watermarks).
 
 No OSM, no SRTM, no Overpass.  Just Cesium.
 
@@ -291,11 +291,13 @@ def fetch_ion_endpoint(asset_id: int):
     base = url.rsplit("/", 1)[0] + "/"
     return url, ep["accessToken"], base
 
-# ── SATELLITE IMAGERY (Taiwan NLSC aerial orthophoto WMTS) ───────────────────
-# Free public WMTS, no API key. Layer PHOTO2 = latest orthophoto, up to zoom 20.
-# URL: https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/{z}/{y}/{x}
-SAT_ZOOM  = 18   # 0.6 m/px — NLSC supports up to zoom 20
+# ── SATELLITE IMAGERY (Esri World Imagery XYZ tiles) ─────────────────────────
+# Free, no API key. No watermarks — suitable for YOLO training/inference.
+# URL: https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+SAT_ZOOM  = 19   # ~0.37 m/px effective (mosaic downsampled to MAX_TEX=16384)
 SAT_CACHE = os.path.join(HERE, "satellite_ground.jpg")
+ESRI_TILE_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services"
+                 "/World_Imagery/MapServer/tile/{z}/{y}/{x}")
 
 def _deg2tile(lat, lon, z):
     n  = 1 << z
@@ -311,7 +313,7 @@ def _tile2deg(tx, ty, z):
     return lat, lon
 
 def fetch_satellite(margin_factor=1.5):
-    """Download Taiwan NLSC aerial orthophoto tiles for the scene area."""
+    """Download Esri World Imagery tiles for the scene area."""
     d_lat = RADIUS_M * margin_factor / 111_320.0
     d_lon = RADIUS_M * margin_factor / (111_320.0 * COS_LAT)
     tx_min, ty_min = _deg2tile(CENTER_LAT + d_lat, CENTER_LON - d_lon, SAT_ZOOM)
@@ -325,15 +327,14 @@ def fetch_satellite(margin_factor=1.5):
         return SAT_CACHE, bounds
 
     nx = tx_max - tx_min + 1; ny = ty_max - ty_min + 1
-    print(f"[SAT] Downloading {nx}×{ny} NLSC orthophoto tiles at zoom {SAT_ZOOM} …")
+    print(f"[SAT] Downloading {nx}×{ny} Esri World Imagery tiles at zoom {SAT_ZOOM} …")
     TILE   = 256
     mosaic = Image.new("RGB", (nx * TILE, ny * TILE))
     sess   = requests.Session()
     sess.headers.update({"User-Agent": "IsaacSimCesium/1.0"})
     for tx in range(tx_min, tx_max + 1):
         for ty in range(ty_min, ty_max + 1):
-            url = (f"https://wmts.nlsc.gov.tw/wmts/PHOTO2/default"
-                   f"/GoogleMapsCompatible/{SAT_ZOOM}/{ty}/{tx}")
+            url = ESRI_TILE_URL.format(z=SAT_ZOOM, y=ty, x=tx)
             for attempt in range(3):
                 try:
                     r = sess.get(url, timeout=15)

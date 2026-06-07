@@ -138,72 +138,66 @@ HOME    (0, 0)              RTL / land
 ### Trigger
 
 Subscribe to `/yolo/detections` (`vision_msgs/Detection2DArray`).  
-Trigger on any detection whose:
-- canonical label is `car`, `van`, `truck`, or `bus`
-- computed ground position is inside the buffered polygon
+Trigger on any detection whose canonical label is `car`, `van`, `truck`, or `bus`.  
+**The survey route is never interrupted.** Car positions are logged in-flight from the
+pixel offset alone; the drone continues to the next waypoint without diverting.
 
-### Ground position from bounding box
+### Ground position from bounding box (yaw-corrected)
 
 ```python
 GSD_x = 2 * AGL * tan(radians(HFOV / 2)) / CAM_W   # ≈ 0.1226 m/px at 65 m
 GSD_y = 2 * AGL * tan(radians(VFOV / 2)) / CAM_H   # ≈ 0.1082 m/px at 65 m
 
-Δeast  =  (bbox_cx − CAM_W / 2) * GSD_x
-Δnorth = −(bbox_cy − CAM_H / 2) * GSD_y   # pixel Y down = south
+# Drone heading from pose quaternion (camera top follows drone nose)
+q       = drone.pose.orientation
+yaw_enu = atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y² + q.z²))
+h       = -yaw_enu                        # NED heading (rad, CW from north)
+
+dx_m =  (bbox_cx − CAM_W / 2) * GSD_x   # drone-right  (+east when h=0)
+dy_m = −(bbox_cy − CAM_H / 2) * GSD_y   # drone-forward (+north when h=0)
+
+Δeast  = dx_m * cos(h) + dy_m * sin(h)
+Δnorth = −dx_m * sin(h) + dy_m * cos(h)
 
 obj_north = cur_north + Δnorth
 obj_east  = cur_east  + Δeast
 ```
 
-### Divert procedure
+### Log procedure
 
-1. Save `(resume_north, resume_east)` = current strip waypoint target + index into route.
-2. Publish `SurveyState = DIVERT`.
-3. Fly to `(obj_north, obj_east)` at 12 m/s; wait for horiz_err < 10 m.
-4. Log detection to `detections.csv`:
+1. Compute `(obj_north, obj_east)` using the yaw-corrected formula above.
+2. Check dedup: skip if within `DEDUP_RADIUS = 30 m` of any already-logged position.
+3. Log highest-confidence vehicle to `detections.csv`:
    ```
    timestamp, category, confidence, lat, lon, agl_m
    ```
-   where lat/lon derived from `(cur_north, cur_east)` after centering.
-5. If multiple vehicles detected in one frame, log all but fly to highest-confidence only.
-6. Set `SurveyState = SURVEY` and resume from saved waypoint index.
-
-### Boundary guard
-
-Before issuing any setpoint (survey or divert):
-
-```python
-def _in_buffered_zone(north_m, east_m):
-    """Point-in-polygon test against buffered boundary vertices."""
-    # NW'(642,−1215)  NE'(507,−489)  SE'(−13,−587)  SW'(121,−1293)
-    # Uses crossing number algorithm
-    ...
-```
-
-If a computed divert target lies outside the zone, log the detection at the current
-position and skip the divert flight.
+   where lat/lon derived from `(obj_north, obj_east)`.
+4. Append `(obj_north, obj_east)` to `_logged_positions`.
 
 ### Deduplication guard
 
-After a vehicle is logged, its position `(north_m, east_m)` is appended to
+After a vehicle is logged its position `(north_m, east_m)` is appended to
 `self._logged_positions`. Any subsequent detection whose estimated ground position
-falls within `DEDUP_RADIUS = 30 m` of an already-logged entry is silently discarded
-(no divert flight, no additional log row). The 30 m radius covers the ~20 m AnyLoc
-position uncertainty, so the same physical car cannot re-trigger a divert on the
-next pass or while still in frame after resuming. A genuinely different car more than
-30 m from any logged entry triggers a normal divert.
+falls within `DEDUP_RADIUS = 30 m` of an already-logged entry is silently discarded.
+The 30 m radius covers the ~20 m AnyLoc position uncertainty, preventing the same
+physical car from being re-logged on successive passes or frames.
+
+### Boundary visualisation
+
+`_in_buffered_zone()` and `ZONE_VERTS` are kept in `px4_commander.py` for use by
+`tools/live_trace.py` (zone polygon overlay). They are no longer used to gate
+detection logging.
 
 ---
 
-## Code Changes Required (`control/px4_commander.py`)
+## Implementation (`control/px4_commander.py`)
 
-### 1. Constants
+### Constants
 
 ```python
-SURVEY_SPEED   = 12.0    # m/s — strip cruise speed
-DETECT_RADIUS  = 10.0    # m — centering arrival threshold
-DEDUP_RADIUS   = 30.0    # m — suppress re-divert within this of a logged position
-SURVEY_WPS = [           # (north_m, east_m, agl_m)
+SURVEY_SPEED  = 12.0   # m/s — strip cruise speed
+DEDUP_RADIUS  = 30.0   # m — suppress duplicate log within this radius
+SURVEY_WPS = [         # (north_m, east_m, agl_m)
     (210.0,   -545.0,  65.0),  # ENTRY: south end strip E
     (517.0,   -545.0,  65.0),  # WP01: north end strip E
     (545.0,   -695.0,  65.0),  # WP02: north end strip 1
@@ -219,116 +213,62 @@ SURVEY_WPS = [           # (north_m, east_m, agl_m)
 ]
 ```
 
-### 2. State machine
-
-```python
-class SurveyState(Enum):
-    SURVEY = "survey"
-    DIVERT = "divert"
-    RESUME = "resume"
-```
-
-### 3. YOLO subscription
+### YOLO subscription
 
 ```python
 from vision_msgs.msg import Detection2DArray
 
-self._survey_state  = SurveyState.SURVEY
-self._resume_idx    = 0
-self._resume_target = None
+self._logged_positions = []   # (north_m, east_m) dedup list
 self.create_subscription(Detection2DArray, "/yolo/detections",
-                         self._cb_detections, 1)
+                         self._cb_detections, sensor_qos)
 ```
 
-### 4. `_cb_detections(msg)`
+### `_cb_detections(msg)`
 
 ```python
 def _cb_detections(self, msg):
-    if self._survey_state != SurveyState.SURVEY:
-        return   # already diverting
+    if self._drone is None:
+        return
     vehicles = [d for d in msg.detections
-                if d.results[0].hypothesis.class_id in ("car","van","truck","bus")]
+                if d.results[0].hypothesis.class_id in VEHICLE_CLASSES]
     if not vehicles:
         return
-    best = max(vehicles, key=lambda d: d.results[0].hypothesis.score)
-    cx = best.bbox.center.position.x
-    cy = best.bbox.center.position.y
-    agl = self._drone_agl
-    gsd_x = 2 * agl * math.tan(math.radians(44.0)) / 1024
-    gsd_y = 2 * agl * math.tan(math.radians(32.55)) / 768
-    dn = -(cy - 384) * gsd_y
-    de =  (cx - 512) * gsd_x
-    obj_n = self._cur_north + dn
-    obj_e = self._cur_east  + de
-    if not _in_buffered_zone(obj_n, obj_e):
-        return
-    self._divert_target = (obj_n, obj_e)
-    self._divert_cat    = best.results[0].hypothesis.class_id
-    self._divert_conf   = best.results[0].hypothesis.score
-    self._survey_state  = SurveyState.DIVERT
+    ds    = self._drone.pose.position
+    cur_n, cur_e = ds.y, ds.x
+    agl   = max(1.0, ds.z - HOME_ALT_MSL)
+    gsd_x = 2 * agl * math.tan(math.radians(HFOV_DEG / 2)) / CAM_W
+    gsd_y = 2 * agl * math.tan(math.radians(VFOV_DEG / 2)) / CAM_H
+    best  = max(vehicles, key=lambda d: d.results[0].hypothesis.score)
+    cx, cy = best.bbox.center.position.x, best.bbox.center.position.y
+    q       = self._drone.pose.orientation
+    yaw_enu = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y**2 + q.z**2))
+    h = -yaw_enu
+    dx_m =  (cx - CAM_W/2) * gsd_x
+    dy_m = -(cy - CAM_H/2) * gsd_y
+    de = dx_m*math.cos(h) + dy_m*math.sin(h)
+    dn = -dx_m*math.sin(h) + dy_m*math.cos(h)
+    obj_n, obj_e = cur_n + dn, cur_e + de
+    for ln, le in self._logged_positions:
+        if math.hypot(obj_n - ln, obj_e - le) < DEDUP_RADIUS:
+            return
+    self._log_detection(best.results[0].hypothesis.class_id,
+                        best.results[0].hypothesis.score,
+                        obj_n, obj_e, agl)
 ```
 
-### 5. `_in_buffered_zone(north_m, east_m)` helper
+### Survey loop
 
 ```python
-BUFFERED_VERTS = [
-    (642, -1215),  # NW'
-    (507,  -489),  # NE'
-    (-13,  -587),  # SE'
-    (121, -1293),  # SW'
-]
-
-def _in_buffered_zone(north_m, east_m):
-    verts = BUFFERED_VERTS
-    n = len(verts)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        ni, ei = verts[i]
-        nj, ej = verts[j]
-        if ((ei > east_m) != (ej > east_m)) and \
-           (north_m < (nj - ni) * (east_m - ei) / (ej - ei) + ni):
-            inside = not inside
-        j = i
-    return inside
-```
-
-### 6. `_strip_limits(east_m)` helper
-
-```python
-def _strip_limits(east_m):
-    """Return (south_m, north_m) of the buffered polygon at given east."""
-    # Intersect vertical line x=east_m with each edge and collect crossings.
-    edges = [
-        ((642,-1215),(507,-489)),    # northern
-        ((507,-489), (-13,-587)),    # eastern
-        ((-13,-587), (121,-1293)),   # southern
-        ((121,-1293),(642,-1215)),   # western
-    ]
-    crossings = []
-    for (n1,e1),(n2,e2) in edges:
-        if (e1 <= east_m < e2) or (e2 <= east_m < e1):
-            t = (east_m - e1) / (e2 - e1)
-            crossings.append(n1 + t * (n2 - n1))
-    if len(crossings) < 2:
-        return None
-    return min(crossings), max(crossings)
-```
-
-### 7. Detection log
-
-```python
-DET_LOG = "detections.csv"
-
-# On first detection (or startup):
-with open(DET_LOG, "w") as f:
-    f.write("timestamp,category,confidence,lat,lon,agl_m\n")
-
-# On each detection after centering:
-lat = HOME_LAT + cur_north / M_PER_DEG
-lon = HOME_LON + cur_east  / (M_PER_DEG * COS_LAT)
-with open(DET_LOG, "a") as f:
-    f.write(f"{time.time():.3f},{category},{conf:.3f},{lat:.6f},{lon:.6f},{agl:.1f}\n")
+wp_idx = 0
+while wp_idx < len(SURVEY_WPS):
+    wn, we, wagl = SURVEY_WPS[wp_idx]
+    reached = cmd.go_to_ned(wn, we, wagl, timeout=WAYPOINT_TIMEOUT,
+                            speed=SURVEY_SPEED)
+    if reached:
+        ...log arrival...
+    else:
+        print(f"WP {wp_idx+1} TIMEOUT — skipping")
+    wp_idx += 1
 ```
 
 ---
@@ -346,7 +286,7 @@ with open(DET_LOG, "a") as f:
 | W → Home | 1255 m | 104.6 s |
 | **Total** | **≈ 5444 m** | **≈ 466 s ≈ 7.8 min** |
 
-Detection diversions add ~20–30 s each (10 m approach + log + resume).
+No detection diversions — cars are logged in-flight; flight time is fixed at ~7.8 min.
 
 ---
 

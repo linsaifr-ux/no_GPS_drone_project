@@ -3,9 +3,9 @@
 PX4 flight commander (MAVROS2) — external-vision no-GPS, survey mission.
 
 Full mission: 6-strip lawnmower survey of the detection zone west of home,
-at 12 m/s / 65 m AGL / ~7.8 min. When YOLO detects a vehicle inside the
-buffered zone, diverts to centre the target in frame, logs to detections.csv,
-then resumes the survey.
+at 12 m/s / 65 m AGL / ~7.8 min. YOLO detections are projected to world
+coordinates via yaw-corrected GSD and logged to detections.csv without
+interrupting the survey route.
 
 Key differences from ArduPilot flight_commander.py:
   - No set_gp_origin: PX4 EKF2 auto-sets its local frame origin from first EV pose.
@@ -30,7 +30,6 @@ import os
 import sys
 import threading
 import time
-from enum import Enum
 
 _ROS2_SITE = "/opt/ros/jazzy/lib/python3.12/site-packages"
 if os.path.isdir(_ROS2_SITE) and _ROS2_SITE not in sys.path:
@@ -73,8 +72,7 @@ WAYPOINT_TIMEOUT     = 900.0  # s per waypoint
 MIN_LOCALISATION_AGL = 50.0   # m — below this use truth VPE; above, use AnyLoc
 
 SURVEY_SPEED   = 12.0   # m/s — strip cruise speed
-DETECT_RADIUS  = 10.0   # m   — vehicle centring arrival threshold
-DEDUP_RADIUS   = 30.0   # m   — suppress re-divert if within this of a logged position
+DEDUP_RADIUS   = 30.0   # m   — suppress duplicate log within this radius of an existing entry
 
 COS_LAT   = math.cos(math.radians(HOME_LAT))
 M_PER_DEG = 111_320.0
@@ -125,12 +123,6 @@ ESTIMATE_JSON = os.path.join(
 )
 
 
-# ── Survey state ───────────────────────────────────────────────────────────────
-class SurveyState(Enum):
-    SURVEY = "survey"
-    DIVERT = "divert"
-
-
 # ── Zone boundary helper ───────────────────────────────────────────────────────
 def _in_buffered_zone(north_m, east_m):
     """Ray-casting point-in-polygon test against the buffered zone boundary."""
@@ -156,13 +148,8 @@ class PX4Commander(rclpy.node.Node):
         self._local_vel = None   # /mavros/local_position/velocity_local (ENU)
         self._drone     = None   # /drone/state  (ENU, kinematic truth)
 
-        # Survey / detection state
-        self._survey_state     = SurveyState.SURVEY
-        self._divert_n         = 0.0
-        self._divert_e         = 0.0
-        self._divert_cat       = ""
-        self._divert_conf      = 0.0
-        self._logged_positions = []   # (north_m, east_m) — dedup guard
+        # Detection dedup guard
+        self._logged_positions = []   # (north_m, east_m) list
 
         # Subscribers
         from geometry_msgs.msg import PoseStamped
@@ -203,12 +190,9 @@ class PX4Commander(rclpy.node.Node):
 
     def _cb_detections(self, msg):
         """
-        Process YOLO detections. On vehicle inside buffered zone: set DIVERT.
-        Runs in a ROS2 spin context — only writes to self._survey_state and divert
-        fields (plain Python assignment is GIL-safe for simple types).
+        Project YOLO detections to world coordinates via yaw-corrected GSD and log
+        to detections.csv. Does not alter the flight path.
         """
-        if self._survey_state != SurveyState.SURVEY:
-            return  # already handling a detection
         if self._drone is None:
             return
 
@@ -218,7 +202,7 @@ class PX4Commander(rclpy.node.Node):
         if not vehicles:
             return
 
-        ds = self._drone.pose.position
+        ds    = self._drone.pose.position
         cur_n = ds.y
         cur_e = ds.x
         agl   = max(1.0, ds.z - HOME_ALT_MSL)
@@ -229,32 +213,30 @@ class PX4Commander(rclpy.node.Node):
         best = max(vehicles, key=lambda d: d.results[0].hypothesis.score)
         cx = best.bbox.center.position.x
         cy = best.bbox.center.position.y
-        dn =  -(cy - CAM_H / 2.0) * gsd_y   # pixel Y down = south
-        de =   (cx - CAM_W / 2.0) * gsd_x
+
+        # Yaw-corrected pixel-to-ENU projection.
+        # Camera top always follows drone nose; h = NED heading (CW from north).
+        q       = self._drone.pose.orientation
+        yaw_enu = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+        h    = -yaw_enu
+        dx_m =  (cx - CAM_W / 2.0) * gsd_x   # drone-right  (+east when h=0)
+        dy_m = -(cy - CAM_H / 2.0) * gsd_y   # drone-forward (+north when h=0)
+        de   = dx_m * math.cos(h) + dy_m * math.sin(h)
+        dn   = -dx_m * math.sin(h) + dy_m * math.cos(h)
 
         obj_n = cur_n + dn
         obj_e = cur_e + de
         cat   = best.results[0].hypothesis.class_id
         conf  = best.results[0].hypothesis.score
 
-        if not _in_buffered_zone(obj_n, obj_e):
-            # Object outside buffered zone — log current position, no divert
-            print(f"[PX4Cmd] {cat} detected outside zone — logging position only")
-            self._log_detection(cat, conf, cur_n, cur_e, agl)
-            return
-
-        # Suppress re-divert if already logged a vehicle within DEDUP_RADIUS
+        # Skip if already logged a vehicle within DEDUP_RADIUS
         for ln, le in self._logged_positions:
             if math.hypot(obj_n - ln, obj_e - le) < DEDUP_RADIUS:
-                print(f"[PX4Cmd] {cat} within {DEDUP_RADIUS:.0f} m of logged entry — skipping")
                 return
 
-        self._divert_n    = obj_n
-        self._divert_e    = obj_e
-        self._divert_cat  = cat
-        self._divert_conf = conf
-        self._survey_state = SurveyState.DIVERT
-        print(f"[PX4Cmd] {cat} conf={conf:.2f}  obj N={obj_n:+.1f} E={obj_e:+.1f}"
+        self._log_detection(cat, conf, obj_n, obj_e, agl)
+        print(f"[PX4Cmd] {cat} conf={conf:.2f}  N={obj_n:+.1f} E={obj_e:+.1f}"
               f"  (Δn={dn:+.1f} Δe={de:+.1f} m)")
 
     def _log_detection(self, category, confidence, north_m, east_m, agl_m):
@@ -497,16 +479,15 @@ class PX4Commander(rclpy.node.Node):
 
     # ── Waypoint navigation ────────────────────────────────────────────────────
     def go_to_ned(self, north, east, agl, timeout=WAYPOINT_TIMEOUT,
-                  speed=5.0, radius=None, interruptible=False):
+                  speed=5.0, radius=None):
         """
         Fly to (north, east, agl) via OFFBOARD velocity setpoints.
         MAVROS converts ENU velocity → NED; PX4 velocity controller closes the loop.
 
-        speed        horizontal cruise speed in m/s (default 5.0; survey uses 12.0)
-        radius       arrival distance in m (default WAYPOINT_RADIUS = 60 m)
-        interruptible if True, returns False early when self._survey_state == DIVERT
+        speed   horizontal cruise speed in m/s (default 5.0; survey uses 12.0)
+        radius  arrival distance in m (default WAYPOINT_RADIUS = 60 m)
 
-        Returns True when within radius of target; False on timeout or interruption.
+        Returns True when within radius of target; False on timeout.
         """
         NAV_SPEED_V = 2.0
         ALT_KP      = 0.4
@@ -573,9 +554,6 @@ class PX4Commander(rclpy.node.Node):
 
             if hdist <= arrival_r:
                 return True
-
-            if interruptible and self._survey_state == SurveyState.DIVERT:
-                return False  # interrupted by detection callback
 
         return False
 
@@ -708,45 +686,18 @@ def main():
 
             reached = cmd.go_to_ned(wn, we, wagl,
                                     timeout=WAYPOINT_TIMEOUT,
-                                    speed=SURVEY_SPEED,
-                                    interruptible=True)
+                                    speed=SURVEY_SPEED)
 
-            if cmd._survey_state == SurveyState.DIVERT:
-                # ── Detection divert ──────────────────────────────────────────
-                divert_n = cmd._divert_n
-                divert_e = cmd._divert_e
-                print(f"[PX4Cmd] DIVERT: {cmd._divert_cat}"
-                      f" conf={cmd._divert_conf:.2f}"
-                      f"  → N={divert_n:+.1f} E={divert_e:+.1f}")
-
-                cmd.go_to_ned(divert_n, divert_e, TAKEOFF_ALT,
-                              timeout=60.0,
-                              speed=SURVEY_SPEED,
-                              radius=DETECT_RADIUS,
-                              interruptible=False)
-
-                # Log at final centred position
-                if cmd._drone is not None:
-                    ds      = cmd._drone.pose.position
-                    agl_now = ds.z - HOME_ALT_MSL
-                    cmd._log_detection(cmd._divert_cat, cmd._divert_conf,
-                                       ds.y, ds.x, agl_now)
-
-                cmd._survey_state = SurveyState.SURVEY
-                # Resume toward the same survey waypoint (wp_idx unchanged)
-
-            elif reached:
+            if reached:
                 if cmd._drone is not None:
                     ds  = cmd._drone.pose.position
                     dx  = ds.x - we; dy = ds.y - wn
                     print(f"[PX4Cmd] WP {wp_idx+1} ARRIVED ✓"
                           f"  E={ds.x:+.1f} N={ds.y:+.1f}"
                           f"  horiz_err={math.hypot(dx, dy):.1f} m")
-                wp_idx += 1
-
             else:
                 print(f"[PX4Cmd] WP {wp_idx+1} TIMEOUT — skipping")
-                wp_idx += 1
+            wp_idx += 1
 
         # Survey complete — RTL
         print("[PX4Cmd] === SURVEY COMPLETE — RTL ===")

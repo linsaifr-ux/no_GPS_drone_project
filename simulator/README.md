@@ -128,7 +128,7 @@ Subscribed: `/drone/reset` (`std_msgs/Bool`) — resets drone to origin.
 
 - **Terrain**: Cesium World Terrain (asset 1) — 2 km radius around 23.4509°N, 120.2861°E
 - **Buildings**: Cesium OSM Buildings (asset 96188)
-- **Imagery**: Esri World Imagery (WMTS) with NLSC fallback
+- **Imagery**: Esri World Imagery (zoom 19, ~0.37 m/px effective after MAX_TEX=16384 cap)
 - **Home elevation**: loaded from `cesium_terrain_cache/` at startup; written to `control/home_elevation.json`
 
 The terrain cache (`cesium_terrain_cache/`) and tile cache (`cesium_tile_cache/`) are pre-downloaded — no network required at runtime.

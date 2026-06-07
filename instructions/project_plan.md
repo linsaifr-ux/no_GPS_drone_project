@@ -96,7 +96,7 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
 - **Buildings:** Cesium OSM Buildings (asset 96188) — B3DM, ~83 buildings
-- **Imagery:** Taiwan NLSC PHOTO2 orthophoto WMTS (zoom 18); `satellite_ground.jpg` 11264×11264 px, 0.60 m/px, 28 MB; `MAX_TEX=16384` (raised from 8192 to preserve native resolution)
+- **Imagery:** Esri World Imagery WMTS (zoom 19, ~0.37 m/px effective); `satellite_ground.jpg` re-downloaded on first run after deletion; `MAX_TEX=16384`
 - **Physics thread (100 Hz):** `_run_physics()` — kinematic 6-DOF model + `SITLBridge`; publishes `/drone/state`; rate decoupled from render loop
 - **Render loop (~13 Hz):** reads shared kinematic state under lock; updates `/World/Drone` mesh position/orientation; captures nadir camera frames
 - **Motor layout:** ArduCopter X-frame ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
@@ -124,7 +124,7 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 **Status:** Working — AnyLoc + VO; ~2,820-entry database (65 m AGL only — single layer matching mission cruise altitude); ~15–20 m anchor error
 
 **Database build** (`anyloc/build_database.py`) — self-contained, no Isaac Sim required:
-- Downloads NLSC PHOTO2 tiles automatically if `satellite_ground.jpg` missing
+- Downloads Esri World Imagery tiles (zoom 19) automatically if `satellite_ground.jpg` missing
 - Single AGL: `--agl-min 65 --agl-max 65` (1 level × ~2820 positions); was 13 levels × 36,673 entries
 - 3-pass memory-safe: crop→disk, sample 2000 for codebook, batch VLADs (peak ~4.5 GB RAM)
 - `db_meta.json` cache: Pass 1 skipped on subsequent `--rebuild` runs
@@ -136,7 +136,7 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 5a. Flight Control — PX4 path (`control/px4_commander.py`) **[ACTIVE]**
 
-**Status:** Survey mission implemented ✓ (PX4-9 Done). 12 m/s lawnmower, YOLO divert+log.
+**Status:** Survey mission implemented ✓ (PX4-9 Done). 12 m/s lawnmower, YOLO log-in-flight (no divert).
 
 ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
 
@@ -145,19 +145,19 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 2. Switch to OFFBOARD mode + arm
 3. Climb to 65 m AGL (`takeoff()`)
 4. Hold 5 s
-5. `go_to_ned(speed=12, interruptible=True)` — iterate 12 survey waypoints
-   - On DIVERT (YOLO detection inside buffered zone, not within 30 m of a logged entry): fly to object at 10 m radius, log, resume
-   - On SURVEY arrival (60 m radius): advance waypoint index
+5. `go_to_ned(speed=12)` — iterate 12 survey waypoints sequentially
+   - YOLO detections: yaw-corrected GSD pixel projection → dedup (30 m) → log to `detections.csv`; survey never interrupted
+   - On arrival (60 m radius) or timeout: advance waypoint index
 6. RTL on survey complete or Ctrl-C
 
 **Survey constants (module level):**
 - `SURVEY_WPS` — 12 boustrophedon waypoints at 65 m AGL (see `instructions/survey_mission_plan.md`)
-- `SURVEY_SPEED = 12.0` m/s, `DETECT_RADIUS = 10.0` m, `ZONE_VERTS` — 30 m inward buffered boundary
+- `SURVEY_SPEED = 12.0` m/s, `DEDUP_RADIUS = 30.0` m, `ZONE_VERTS` — buffered boundary (visualisation only)
 - `CAM_W/H = 1024/768`, `HFOV_DEG = 88`, `VFOV_DEG = 65.1` — for GSD pixel-to-ground mapping
 - `DET_LOG = detections.csv` — auto-header on first write
 
-**New methods:** `_cb_detections()`, `_log_detection()`, `_in_buffered_zone()`  
-**Updated:** `go_to_ned(speed, radius, interruptible)` — returns False early on DIVERT
+**Key methods:** `_cb_detections()` (project + log, no state change), `_log_detection()`, `_in_buffered_zone()` (live_trace.py only)  
+**`go_to_ned(speed, radius)`** — no `interruptible` param; never returns early
 
 **VPE two-phase:**
 - Phase 1 (AGL < 50 m): kinematic truth, cov = 0.1 m²
@@ -299,7 +299,7 @@ bash control/launch_commander.sh
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| 1 | Isaac Sim scene: Cesium terrain + NLSC imagery + OSM buildings | Done |
+| 1 | Isaac Sim scene: Cesium terrain + satellite imagery + OSM buildings | Done |
 | 2 | Virtual drone + nadir camera + HUD publishing frames | Done |
 | 3 | AnyLoc database built from simulated views | Done |
 | 4 | AnyLoc localisation working + dual postview | Done |
@@ -330,7 +330,7 @@ bash control/launch_commander.sh
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
 | PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | Done ✓ |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO log-in-flight (no divert) | Done ✓ |
 | PX4-10 | Jetson distributed sim: Jetson runs commander+AnyLoc+YOLO, PC runs Isaac+PX4 | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |

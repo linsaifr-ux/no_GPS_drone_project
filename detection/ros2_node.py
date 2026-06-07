@@ -57,7 +57,7 @@ class YOLONode(rclpy.node.Node):
     def __init__(self):
         super().__init__("yolo_detector")
 
-        self._det = YOLODetector(MODEL_PT, conf=0.30)
+        self._det = YOLODetector(MODEL_PT, conf=0.50)
 
         self._drone_lat  = 0.0
         self._drone_lon  = 0.0
