@@ -108,7 +108,10 @@ no_GPS_drone_project/
 | PX4-4 | Waypoint nav ported to px4_commander.py (65 m, 699 m leg) | Done |
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (65 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
-| 7 | AnyLoc + detection integration in PX4 pipeline | In progress |
+| PX4-7 | AnyLoc + detection integration in PX4 pipeline | In progress |
+| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ (impl pending) |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | TODO |
+| PX4-10 | Jetson distributed sim (Jetson = commander+AnyLoc+YOLO; PC = Isaac+PX4) | TODO |
 | 8 | Deploy to real hardware | TODO |
 
 ---

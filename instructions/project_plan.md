@@ -136,11 +136,11 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 5a. Flight Control — PX4 path (`control/px4_commander.py`) **[ACTIVE]**
 
-**Status:** Full mission Done ✓ — 65 m AGL takeoff, 699 m waypoint (N=531, E=−454), horiz_err < 60 m confirmed in both headless and Isaac Sim runs. (Was 90 m AGL; reduced 2026-06-07.)
+**Status:** Full mission Done ✓ — 65 m AGL takeoff, single test waypoint (N=531, E=−454) confirmed. Survey mission planned; implementation pending (PX4-9).
 
 ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
 
-**Mission sequence:**
+**Mission sequence (current — single waypoint):**
 1. Pre-stream 40 position setpoints at 20 Hz (PX4 requires setpoints before OFFBOARD)
 2. Switch to OFFBOARD mode
 3. Arm
@@ -149,6 +149,12 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 6. `go_to_ned()` — carrot navigation: publish position target 25 m ahead toward WP; within 25 m snap to exact target; wait for horiz_err < 60 m
 7. Hold 5 s at WP
 8. Ctrl-C → RTL
+
+**Planned mission (survey — see `instructions/survey_mission_plan.md`):**
+- 6-strip lawnmower survey at 12 m/s, 65 m AGL
+- Detection zone: 800 m × 650 m west of home; 30 m inward buffer; 6 strips at 150 m spacing
+- Detection response: YOLO car → centre in frame → log (lat, lon, category) → resume
+- Estimated flight time: ≈ 7.8 min (was 24 min at 9 strips / 5 m/s)
 
 **VPE two-phase:**
 - Phase 1 (AGL < 50 m): kinematic truth, cov = 0.1 m²
@@ -320,6 +326,9 @@ bash control/launch_commander.sh
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done ✓ |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
+| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ (plan written; impl pending) |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | TODO |
+| PX4-10 | Jetson distributed sim: Jetson runs commander+AnyLoc+YOLO, PC runs Isaac+PX4 | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
 | 7 | Full pipeline: AnyLoc + VO + detection → PX4 commands | TODO |

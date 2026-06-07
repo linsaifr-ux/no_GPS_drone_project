@@ -64,9 +64,15 @@ conda run -n isaac_sim_test --no-capture-output python3 detection/ros2_node.py
 
 | Direction | Topic | Type | Notes |
 |---|---|---|---|
-| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 640×480 |
+| Subscribe | `/drone/camera/image_raw` | `sensor_msgs/Image` | rgb8, 1024×768 |
 | Subscribe | `/drone/pose` | `geometry_msgs/PoseStamped` | ENU pose (for geo-tagging) |
+| Subscribe | `/drone/agl` | `std_msgs/Float64` | AGL in metres — inference gated on AGL ≥ 50 m |
 | Publish | `/yolo/detections` | `vision_msgs/Detection2DArray` | bounding boxes + class + confidence |
+
+**Survey mission integration:** `px4_commander.py` subscribes to `/yolo/detections` and on
+vehicle detection inside the survey zone flies to centre the target in frame, then appends
+to `detections.csv` (timestamp, category, confidence, lat, lon, agl_m). No changes to this
+node are required — it publishes detections and the commander handles the response.
 
 ### Detection2D fields
 

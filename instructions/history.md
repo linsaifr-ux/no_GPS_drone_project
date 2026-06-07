@@ -1,5 +1,68 @@
 # Project History
 
+## 2026-06-07 — Survey mission planned: lawnmower route + car detection response
+
+### Plan: detection zone survey at 12 m/s, 6 strips, 65 m AGL
+
+Detection zone defined by four GPS corners west of home (23.450868°N, 120.286135°E):
+
+| Corner | Lat | Lon | NED north (m) | NED east (m) |
+|--------|-----|-----|---------------|--------------|
+| NW | 23.45695 | 120.27399 | +677 | −1240 |
+| NE | 23.45564 | 120.28169 | +531 | −454 |
+| SE | 23.45044 | 120.28062 | −48  | −563 |
+| SW | 23.45174 | 120.27314 | +97  | −1327 |
+
+Zone dimensions: ≈ 800 m E-W × 650 m N-S (≈ 0.52 km²). AnyLoc error ~20 m → 30 m
+inward buffer applied to all boundary edges. Buffered corners:
+NW'(642,−1215), NE'(507,−489), SE'(−13,−587), SW'(121,−1293).
+
+**Original plan (9 strips, 100 m spacing, 5 m/s) → ≈ 24 min flight time.**  
+**Revised plan (6 strips, 150 m spacing, 12 m/s) → ≈ 7.8 min flight time.**
+
+Trade-off: 25 m unscanned gap between strips (150 m spacing vs 125 m footprint). Cars
+in the exact centre of a gap could be missed; cars on roads or in typical parking areas
+will be in camera coverage on at least one strip.
+
+#### Ordered waypoints (north_m, east_m, 65.0 m AGL)
+
+```
+HOME   (0, 0)          takeoff at 12 m/s cruise
+ENTRY: (210,  −545)    south end strip E (partial, NE wedge)
+WP01:  (517,  −545)    north end strip E
+WP02:  (545,  −695)    north end strip 1
+WP03:  (8,    −695)    south end strip 1
+WP04:  (36,   −845)    south end strip 2
+WP05:  (573,  −845)    north end strip 2
+WP06:  (601,  −995)    north end strip 3
+WP07:  (65,   −995)    south end strip 3
+WP08:  (93,   −1145)   south end strip 4
+WP09:  (629,  −1145)   north end strip 4
+WP10:  (408,  −1250)   north end strip W (partial, SW wedge)
+WP11:  (113,  −1250)   south end strip W
+HOME   (0, 0)          RTL / land
+```
+
+#### Detection response
+
+When YOLO detects a vehicle (car/van/truck/bus) inside the buffered zone:
+1. Compute ground offset from bounding box centre (GSD_x≈0.123 m/px, GSD_y≈0.108 m/px).
+2. Fly to centre the vehicle in frame; arrival threshold 10 m.
+3. Append to `detections.csv`: `timestamp, category, confidence, lat, lon, agl_m`.
+4. Resume survey from saved waypoint index.
+
+If divert target is outside buffered zone, log position only — no divert flight.
+
+#### Code changes required (not yet implemented)
+
+| File | Change |
+|------|--------|
+| `control/px4_commander.py` | Replace `WAYPOINTS` with 12-entry `SURVEY_WPS`; add `SURVEY_SPEED=12.0`; `SurveyState` enum; YOLO subscriber; `_cb_detections()`; `_in_buffered_zone()`; `_strip_limits()`; detection CSV log |
+
+Full implementation details in `instructions/survey_mission_plan.md`.
+
+---
+
 ## 2026-06-07 — Mission AGL 90 m → 65 m; AnyLoc database single-altitude; Jetson distributed plan
 
 ### Change: mission cruise altitude 90 m → 65 m

@@ -44,9 +44,10 @@ Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop i
 - Vision injection: 20 Hz `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov` + velocity to `/mavros/vision_speed/speed_twist`
 - Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
 - VPE heading: ENU yaw = π/2 (North) in **both** phases. `/drone/pose` encodes `−_kyaw_rad` not `π/2−_kyaw_rad`, so `yaw_deg=0` in the JSON maps to East, not North. Since the drone never yaws, π/2 is always correct and avoids a 90° EKF2 heading jump at the Phase 1→2 transition.
-- Mission: pre-stream setpoints → OFFBOARD → arm → climb to 90 m → hold 5 s → carrot nav to WP (531 m N, −454 m E) → hold → Ctrl-C → RTL
+- **Current mission (single WP test):** climb 65 m → carrot nav to (531 m N, −454 m E) → hold → RTL
+- **Planned mission (survey — impl pending):** 12 m/s lawnmower survey over detection zone west of home; 6 strips at 150 m spacing (7.8 min); YOLO vehicle detection → centre in frame → log (lat, lon, category, confidence) to `detections.csv` → resume route. See `instructions/survey_mission_plan.md`.
 - `HOLDTEST=1`: 3 m hold gate (Phase 3 regression test)
-- `TAKEOFF_ALT=<m>`: override cruise altitude (default 90 m)
+- `TAKEOFF_ALT=<m>`: override cruise altitude (default 65 m)
 - In-air restart: detects AGL > 5 m at startup and skips takeoff
 
 **`flight_commander.py`** — ArduPilot/MAVROS2 commander (reference; WP nav unresolved).
@@ -131,9 +132,11 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 | 1 | Done | Bridge↔PX4 validated: 27k+ HIL_SENSOR frames, EKF2 level attitude |
 | 2 | Done | Vision + MAVROS↔PX4 link; EKF tracks truth |
 | 3 | Done | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift |
-| 4 | Done | Waypoint nav in `px4_commander.py`: 90 m AGL, 699 m leg, RTL |
+| 4 | Done | Waypoint nav in `px4_commander.py`: 65 m AGL, 699 m leg, RTL |
 | 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
 | 6 | Done ✓ | End-to-end Isaac Sim waypoint flight: horiz_err < 60 m at 699 m leg |
+| 7 | In progress | AnyLoc + detection integration in full pipeline |
+| 8 | Planned | Survey mission: 6-strip lawnmower at 12 m/s + YOLO detection divert/log |
 
 ---
 
