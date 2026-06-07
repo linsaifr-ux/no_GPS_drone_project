@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-PX4 flight commander (MAVROS2) — external-vision no-GPS.
+PX4 flight commander (MAVROS2) — external-vision no-GPS, survey mission.
 
-Full mission equivalent of flight_commander.py ported to PX4 OFFBOARD mode.
+Full mission: 6-strip lawnmower survey of the detection zone west of home,
+at 12 m/s / 65 m AGL / ~7.8 min. When YOLO detects a vehicle inside the
+buffered zone, diverts to centre the target in frame, logs to detections.csv,
+then resumes the survey.
 
 Key differences from ArduPilot flight_commander.py:
   - No set_gp_origin: PX4 EKF2 auto-sets its local frame origin from first EV pose.
@@ -10,16 +13,15 @@ Key differences from ArduPilot flight_commander.py:
   - No NAV_TAKEOFF: climb via OFFBOARD position setpoints (monitored from drone_state).
   - Vision via /mavros/vision_pose/pose_cov (PoseWithCovarianceStamped) so EKF2
     can weight Phase-1 vs Phase-2 VPE correctly.
-  - go_to_ned() uses a position carrot (25 m ahead) — PX4's position loop is stable,
-    unlike ArduPilot AC_PosControl which inverted direction.
+  - go_to_ned() uses velocity setpoints — PX4 velocity controller closes the loop.
 
 Environment variables:
   HOLDTEST=1         run Phase-3 hold gate (HOLD_AGL m) instead of full mission
-  TAKEOFF_ALT=<m>    override mission cruise altitude (default 90.0 m)
+  TAKEOFF_ALT=<m>    override mission cruise altitude (default 65.0 m)
 
 Run:
   source /opt/ros/jazzy/setup.bash
-  python3 control/px4_commander.py              # full mission
+  python3 control/px4_commander.py              # survey mission
   HOLDTEST=1 python3 control/px4_commander.py   # hold-gate only
 """
 import json
@@ -28,6 +30,7 @@ import os
 import sys
 import threading
 import time
+from enum import Enum
 
 _ROS2_SITE = "/opt/ros/jazzy/lib/python3.12/site-packages"
 if os.path.isdir(_ROS2_SITE) and _ROS2_SITE not in sys.path:
@@ -39,6 +42,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistStamped
 from mavros_msgs.msg import PositionTarget, State
 from mavros_msgs.srv import CommandBool, SetMode
+
+try:
+    from vision_msgs.msg import Detection2DArray
+    _HAVE_VISION_MSGS = True
+except ImportError:
+    _HAVE_VISION_MSGS = False
 
 _SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          durability=DurabilityPolicy.VOLATILE, depth=10)
@@ -59,22 +68,83 @@ except (FileNotFoundError, KeyError):
 # ── Mission parameters ─────────────────────────────────────────────────────────
 TAKEOFF_ALT          = float(os.environ.get("TAKEOFF_ALT", "65.0"))
 HOLD_AGL             = 3.0    # m — Phase-3 gate altitude (HOLDTEST mode)
-WAYPOINT_RADIUS      = 60.0   # m — arrival threshold
+WAYPOINT_RADIUS      = 60.0   # m — survey waypoint arrival threshold
 WAYPOINT_TIMEOUT     = 900.0  # s per waypoint
 MIN_LOCALISATION_AGL = 50.0   # m — below this use truth VPE; above, use AnyLoc
+
+SURVEY_SPEED   = 12.0   # m/s — strip cruise speed
+DETECT_RADIUS  = 10.0   # m   — vehicle centring arrival threshold
 
 COS_LAT   = math.cos(math.radians(HOME_LAT))
 M_PER_DEG = 111_320.0
 
-# Target: 23.45564°N, 120.28169°E  (N=+531.2 m, E=−453.9 m, dist≈699 m)
-WAYPOINTS = [
-    (531.2, -453.9, TAKEOFF_ALT),   # (north_m, east_m, agl_m)
+# ── Survey waypoints (north_m, east_m, agl_m relative to home) ────────────────
+# 6-strip boustrophedon lawnmower; 150 m E-W spacing; 65 m AGL; ~5.4 km total.
+# Detection zone: 800 m × 650 m west of home, 30 m inward buffer applied.
+SURVEY_WPS = [
+    (210.0,   -545.0,  TAKEOFF_ALT),  # ENTRY: south end strip E (NE wedge)
+    (517.0,   -545.0,  TAKEOFF_ALT),  # WP01 : north end strip E
+    (545.0,   -695.0,  TAKEOFF_ALT),  # WP02 : north end strip 1
+    (8.0,     -695.0,  TAKEOFF_ALT),  # WP03 : south end strip 1
+    (36.0,    -845.0,  TAKEOFF_ALT),  # WP04 : south end strip 2
+    (573.0,   -845.0,  TAKEOFF_ALT),  # WP05 : north end strip 2
+    (601.0,   -995.0,  TAKEOFF_ALT),  # WP06 : north end strip 3
+    (65.0,    -995.0,  TAKEOFF_ALT),  # WP07 : south end strip 3
+    (93.0,   -1145.0,  TAKEOFF_ALT),  # WP08 : south end strip 4
+    (629.0,  -1145.0,  TAKEOFF_ALT),  # WP09 : north end strip 4
+    (408.0,  -1250.0,  TAKEOFF_ALT),  # WP10 : north end strip W (SW wedge)
+    (113.0,  -1250.0,  TAKEOFF_ALT),  # WP11 : south end strip W
 ]
+
+# ── Detection zone — buffered boundary (30 m inward from raw corners) ──────────
+# CW vertices in (north_m, east_m): NW'→NE'→SE'→SW'
+ZONE_VERTS = [
+    (642.0, -1215.0),   # NW'
+    (507.0,  -489.0),   # NE'
+    (-13.0,  -587.0),   # SE'
+    (121.0, -1293.0),   # SW'
+]
+
+# Camera parameters (AP-IMX900-Mini-USB3-I5 at 1024×768 publish resolution)
+CAM_W     = 1024
+CAM_H     = 768
+HFOV_DEG  = 88.0
+VFOV_DEG  = 65.1
+
+VEHICLE_CLASSES = {"car", "van", "truck", "bus"}
+
+DET_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "detections.csv"
+)
 
 ESTIMATE_JSON = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "anyloc", "latest_estimate.json"
 )
+
+
+# ── Survey state ───────────────────────────────────────────────────────────────
+class SurveyState(Enum):
+    SURVEY = "survey"
+    DIVERT = "divert"
+
+
+# ── Zone boundary helper ───────────────────────────────────────────────────────
+def _in_buffered_zone(north_m, east_m):
+    """Ray-casting point-in-polygon test against the buffered zone boundary."""
+    verts = ZONE_VERTS
+    n = len(verts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        ni, ei = verts[i]
+        nj, ej = verts[j]
+        if ((ei > east_m) != (ej > east_m)) and \
+           (north_m < (nj - ni) * (east_m - ei) / (ej - ei) + ni):
+            inside = not inside
+        j = i
+    return inside
 
 
 class PX4Commander(rclpy.node.Node):
@@ -85,6 +155,13 @@ class PX4Commander(rclpy.node.Node):
         self._local_vel = None   # /mavros/local_position/velocity_local (ENU)
         self._drone     = None   # /drone/state  (ENU, kinematic truth)
 
+        # Survey / detection state
+        self._survey_state = SurveyState.SURVEY
+        self._divert_n     = 0.0
+        self._divert_e     = 0.0
+        self._divert_cat   = ""
+        self._divert_conf  = 0.0
+
         # Subscribers
         from geometry_msgs.msg import PoseStamped
         self.create_subscription(State, "/mavros/state", self._cb_state, 10)
@@ -94,6 +171,13 @@ class PX4Commander(rclpy.node.Node):
                                  self._cb_vel, _SENSOR_QOS)
         self.create_subscription(PoseStamped, "/drone/state",
                                  self._cb_drone, _SENSOR_QOS)
+
+        if _HAVE_VISION_MSGS:
+            self.create_subscription(Detection2DArray, "/yolo/detections",
+                                     self._cb_detections, _SENSOR_QOS)
+            self.get_logger().info("YOLO detection subscriber active")
+        else:
+            self.get_logger().warn("vision_msgs not found — YOLO detection disabled")
 
         # Publishers
         self._vpe_pub  = self.create_publisher(
@@ -115,12 +199,75 @@ class PX4Commander(rclpy.node.Node):
     def _cb_vel(self, m):    self._local_vel = m
     def _cb_drone(self, m):  self._drone     = m
 
+    def _cb_detections(self, msg):
+        """
+        Process YOLO detections. On vehicle inside buffered zone: set DIVERT.
+        Runs in a ROS2 spin context — only writes to self._survey_state and divert
+        fields (plain Python assignment is GIL-safe for simple types).
+        """
+        if self._survey_state != SurveyState.SURVEY:
+            return  # already handling a detection
+        if self._drone is None:
+            return
+
+        vehicles = [d for d in msg.detections
+                    if d.results and
+                       d.results[0].hypothesis.class_id in VEHICLE_CLASSES]
+        if not vehicles:
+            return
+
+        ds = self._drone.pose.position
+        cur_n = ds.y
+        cur_e = ds.x
+        agl   = max(1.0, ds.z - HOME_ALT_MSL)
+
+        gsd_x = 2.0 * agl * math.tan(math.radians(HFOV_DEG / 2.0)) / CAM_W
+        gsd_y = 2.0 * agl * math.tan(math.radians(VFOV_DEG / 2.0)) / CAM_H
+
+        best = max(vehicles, key=lambda d: d.results[0].hypothesis.score)
+        cx = best.bbox.center.position.x
+        cy = best.bbox.center.position.y
+        dn =  -(cy - CAM_H / 2.0) * gsd_y   # pixel Y down = south
+        de =   (cx - CAM_W / 2.0) * gsd_x
+
+        obj_n = cur_n + dn
+        obj_e = cur_e + de
+        cat   = best.results[0].hypothesis.class_id
+        conf  = best.results[0].hypothesis.score
+
+        if not _in_buffered_zone(obj_n, obj_e):
+            # Object outside buffered zone — log current position, no divert
+            print(f"[PX4Cmd] {cat} detected outside zone — logging position only")
+            self._log_detection(cat, conf, cur_n, cur_e, agl)
+            return
+
+        self._divert_n    = obj_n
+        self._divert_e    = obj_e
+        self._divert_cat  = cat
+        self._divert_conf = conf
+        self._survey_state = SurveyState.DIVERT
+        print(f"[PX4Cmd] {cat} conf={conf:.2f}  obj N={obj_n:+.1f} E={obj_e:+.1f}"
+              f"  (Δn={dn:+.1f} Δe={de:+.1f} m)")
+
+    def _log_detection(self, category, confidence, north_m, east_m, agl_m):
+        """Append one row to detections.csv."""
+        lat = HOME_LAT + north_m / M_PER_DEG
+        lon = HOME_LON + east_m  / (M_PER_DEG * COS_LAT)
+        need_header = not os.path.exists(DET_LOG)
+        with open(DET_LOG, "a") as f:
+            if need_header:
+                f.write("timestamp,category,confidence,lat,lon,agl_m\n")
+            f.write(f"{time.time():.3f},{category},{confidence:.3f},"
+                    f"{lat:.6f},{lon:.6f},{agl_m:.1f}\n")
+        print(f"[PX4Cmd] logged: {category} conf={confidence:.2f}"
+              f"  lat={lat:.6f} lon={lon:.6f}  agl={agl_m:.1f} m")
+
     # ── Vision injection thread ────────────────────────────────────────────────
     def start_vision(self, stop):
         """
         20 Hz background thread: publish VPE + velocity to MAVROS → PX4 EKF2.
 
-        Two-phase strategy (mirrors flight_commander.py):
+        Two-phase strategy:
           Phase 1 (AGL < MIN_LOCALISATION_AGL):
             position = drone_state kinematic truth, cov_xy = 0.1 m²
           Phase 2 (AGL ≥ MIN_LOCALISATION_AGL):
@@ -142,21 +289,14 @@ class PX4Commander(rclpy.node.Node):
             while not stop.is_set():
                 t0 = time.time()
 
-                # AGL from EKF2 local position (ENU z = Up = AGL above origin)
                 agl = 0.0
                 if self._local_pos is not None:
                     agl = max(0.0, self._local_pos.pose.position.z)
 
-                # True AGL from kinematic model (authoritative altitude source)
                 drone_agl = 0.0
                 if self._drone is not None:
                     drone_agl = max(0.0, self._drone.pose.position.z - HOME_ALT_MSL)
 
-                # Phase 2: read AnyLoc estimate when high enough.
-                # Use kinematic drone_agl (truth), NOT EKF agl — stale EKF state
-                # from a previous flight would otherwise trigger Phase 2 on the
-                # ground, sending altitude=0 VPE while EKF thinks we're at 60+ m,
-                # which confuses the position controller.
                 if drone_agl >= MIN_LOCALISATION_AGL:
                     if not phase_logged:
                         print(f"[PX4Cmd] AGL {drone_agl:.0f} m ≥ {MIN_LOCALISATION_AGL:.0f} m"
@@ -171,11 +311,6 @@ class PX4Commander(rclpy.node.Node):
                             if (est.get("agl_m", 0.0) >= MIN_LOCALISATION_AGL
                                     and err_m < 100.0):
                                 lat  = est["est_lat"]; lon = est["est_lon"]
-                                # Always π/2 (ENU North): the kinematic drone never
-                                # yaws and /drone/pose encodes -_kyaw_rad (not π/2-_kyaw_rad),
-                                # giving yaw_deg=0 (East) when the drone actually faces
-                                # North. Hardcoding π/2 matches Phase 1 and avoids a
-                                # 90° VPE yaw jump at the Phase 1→2 transition.
                                 yaw  = math.pi / 2.0
                                 n_v  = (lat - HOME_LAT) * M_PER_DEG
                                 e_v  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
@@ -188,7 +323,6 @@ class PX4Commander(rclpy.node.Node):
                     except (FileNotFoundError, KeyError, json.JSONDecodeError):
                         pass
 
-                # Select position and covariance
                 if agl >= MIN_LOCALISATION_AGL and anyloc_est is not None:
                     east_v, north_v, yaw_v, cov_xy = anyloc_est
                 else:
@@ -197,33 +331,27 @@ class PX4Commander(rclpy.node.Node):
                         north_v = self._drone.pose.position.y
                     else:
                         east_v, north_v = 0.0, 0.0
-                    yaw_v  = math.pi / 2.0   # ENU yaw 90° = facing North
+                    yaw_v  = math.pi / 2.0
                     cov_xy = 0.1
 
-                # Publish VPE (heading-only quaternion, ENU frame)
                 hy  = yaw_v / 2.0
                 msg = PoseWithCovarianceStamped()
                 msg.header.stamp    = self.get_clock().now().to_msg()
-                msg.header.frame_id = "map"   # ENU
+                msg.header.frame_id = "map"
                 msg.pose.pose.position.x    = east_v
                 msg.pose.pose.position.y    = north_v
                 msg.pose.pose.position.z    = drone_agl
                 msg.pose.pose.orientation.z = math.sin(hy)
                 msg.pose.pose.orientation.w = math.cos(hy)
                 cov = [0.0] * 36
-                cov[0]  = cov_xy  # East variance
-                cov[7]  = cov_xy  # North variance
-                cov[14] = 0.25    # altitude: 0.5 m std
-                cov[21] = 0.09    # roll
-                cov[28] = 0.09    # pitch
-                cov[35] = 0.09    # yaw
+                cov[0]  = cov_xy; cov[7]  = cov_xy; cov[14] = 0.25
+                cov[21] = 0.09;   cov[28] = 0.09;   cov[35] = 0.09
                 msg.pose.covariance = cov
                 self._vpe_pub.publish(msg)
                 n_sent += 1
                 if n_sent == 1:
                     print("[PX4Cmd] vision thread started (Phase 1 — truth)")
 
-                # Velocity aiding: differentiate drone_state for ENU velocity
                 if self._drone is not None:
                     ds = self._drone.pose.position
                     now_t = time.time()
@@ -233,14 +361,14 @@ class PX4Commander(rclpy.node.Node):
                             tw = TwistStamped()
                             tw.header.stamp    = msg.header.stamp
                             tw.header.frame_id = "map"
-                            tw.twist.linear.x  = (ds.x - last_ds[0]) / dt_v  # ENU East
-                            tw.twist.linear.y  = (ds.y - last_ds[1]) / dt_v  # ENU North
-                            tw.twist.linear.z  = (ds.z - last_ds[2]) / dt_v  # ENU Up
+                            tw.twist.linear.x  = (ds.x - last_ds[0]) / dt_v
+                            tw.twist.linear.y  = (ds.y - last_ds[1]) / dt_v
+                            tw.twist.linear.z  = (ds.z - last_ds[2]) / dt_v
                             self._vspd_pub.publish(tw)
                     last_ds = (ds.x, ds.y, ds.z, now_t)
 
                 elapsed = time.time() - t0
-                time.sleep(max(0.0, 0.05 - elapsed))   # 20 Hz
+                time.sleep(max(0.0, 0.05 - elapsed))
 
         t = threading.Thread(target=loop, daemon=True)
         t.start()
@@ -276,7 +404,6 @@ class PX4Commander(rclpy.node.Node):
         return ok
 
     def _agl(self):
-        """Current AGL from drone_state (truth), falling back to EKF local pos z."""
         if self._drone is not None:
             return self._drone.pose.position.z - HOME_ALT_MSL
         if self._local_pos is not None:
@@ -303,11 +430,6 @@ class PX4Commander(rclpy.node.Node):
 
     # ── Pre-stream + switch to OFFBOARD + arm ──────────────────────────────────
     def engage_offboard(self, east, north, up, n_pre=40):
-        """
-        Stream n_pre setpoints at 20 Hz, then switch OFFBOARD and arm.
-        PX4 requires the setpoint stream to be active before accepting OFFBOARD.
-        Returns True if OFFBOARD + armed within timeout.
-        """
         sp = self.make_sp(east, north, up)
         for _ in range(n_pre):
             sp.header.stamp = self.get_clock().now().to_msg()
@@ -317,15 +439,12 @@ class PX4Commander(rclpy.node.Node):
         if not self.set_mode("OFFBOARD"):
             return False
 
-        # Keep streaming setpoints while waiting for sensor health to settle.
-        # BARO can transiently go stale right after mode change; give it 2 s.
         settle_end = time.time() + 2.0
         while time.time() < settle_end:
             sp.header.stamp = self.get_clock().now().to_msg()
             self._sp_pub.publish(sp)
             rclpy.spin_once(self, timeout_sec=0.05)
 
-        # Retry arm up to 10 times with 1-second intervals.
         for attempt in range(10):
             if self.arm():
                 return True
@@ -340,11 +459,6 @@ class PX4Commander(rclpy.node.Node):
 
     # ── Takeoff ────────────────────────────────────────────────────────────────
     def takeoff(self, alt_agl, timeout=180.0):
-        """
-        Climb to alt_agl via OFFBOARD position setpoints; keep streaming throughout.
-        Monitors drone_state (kinematic truth) for actual AGL.
-        Returns True when within 2 m of target.
-        """
         self.get_logger().info(f"Climbing to {alt_agl:.0f} m AGL …")
         e0 = self._drone.pose.position.x if self._drone else 0.0
         n0 = self._drone.pose.position.y if self._drone else 0.0
@@ -373,17 +487,22 @@ class PX4Commander(rclpy.node.Node):
         return False
 
     # ── Waypoint navigation ────────────────────────────────────────────────────
-    def go_to_ned(self, north, east, agl, timeout=WAYPOINT_TIMEOUT):
+    def go_to_ned(self, north, east, agl, timeout=WAYPOINT_TIMEOUT,
+                  speed=5.0, radius=None, interruptible=False):
         """
         Fly to (north, east, agl) via OFFBOARD velocity setpoints.
         MAVROS converts ENU velocity → NED; PX4 velocity controller closes the loop.
-        Returns True when within WAYPOINT_RADIUS of the target.
-        """
-        NAV_SPEED_H = 5.0   # m/s horizontal cruise
-        NAV_SPEED_V = 2.0   # m/s vertical limit
-        ALT_KP      = 0.4   # altitude error → desired vz
 
-        # Velocity-only: ignore position and acceleration
+        speed        horizontal cruise speed in m/s (default 5.0; survey uses 12.0)
+        radius       arrival distance in m (default WAYPOINT_RADIUS = 60 m)
+        interruptible if True, returns False early when self._survey_state == DIVERT
+
+        Returns True when within radius of target; False on timeout or interruption.
+        """
+        NAV_SPEED_V = 2.0
+        ALT_KP      = 0.4
+        arrival_r   = radius if radius is not None else WAYPOINT_RADIUS
+
         _VMASK = (PositionTarget.IGNORE_PX | PositionTarget.IGNORE_PY |
                   PositionTarget.IGNORE_PZ |
                   PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY |
@@ -406,14 +525,14 @@ class PX4Commander(rclpy.node.Node):
                 rclpy.spin_once(self, timeout_sec=0.1)
                 continue
 
-            dx = cur_e - east    # East error  (positive = drone E of target)
-            dy = cur_n - north   # North error (positive = drone N of target)
+            dx = cur_e - east
+            dy = cur_n - north
             hdist = math.hypot(dx, dy)
 
-            speed = min(NAV_SPEED_H, hdist)
+            spd = min(speed, hdist)
             if hdist > 0.5:
-                v_e = -dx / hdist * speed   # ENU East toward target
-                v_n = -dy / hdist * speed   # ENU North toward target
+                v_e = -dx / hdist * spd
+                v_n = -dy / hdist * spd
             else:
                 v_e = v_n = 0.0
 
@@ -422,9 +541,9 @@ class PX4Commander(rclpy.node.Node):
             sp = PositionTarget()
             sp.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
             sp.type_mask = _VMASK
-            sp.velocity.x = float(v_e)    # ENU East  (MAVROS converts to NED)
-            sp.velocity.y = float(v_n)    # ENU North
-            sp.velocity.z = float(v_up)   # ENU Up
+            sp.velocity.x = float(v_e)
+            sp.velocity.y = float(v_n)
+            sp.velocity.z = float(v_up)
             sp.header.stamp = self.get_clock().now().to_msg()
             self._sp_pub.publish(sp)
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -439,12 +558,15 @@ class PX4Commander(rclpy.node.Node):
                 if self._local_vel:
                     lv = self._local_vel.twist.linear
                     vel_s = f"  vm=({lv.x:+.1f},{lv.y:+.1f})"
-                print(f"[PX4Cmd] WP  errN={dy:+.1f} errE={dx:+.1f}"
+                print(f"[PX4Cmd] errN={dy:+.1f} errE={dx:+.1f}"
                       f"  AGL={drone_agl:.1f} m  dist={hdist:.1f} m{ekf}{vel_s}")
                 last_print = now
 
-            if hdist <= WAYPOINT_RADIUS:
+            if hdist <= arrival_r:
                 return True
+
+            if interruptible and self._survey_state == SurveyState.DIVERT:
+                return False  # interrupted by detection callback
 
         return False
 
@@ -456,7 +578,6 @@ def main():
     cmd = PX4Commander()
     stop = threading.Event()
 
-    # Overwrite stale AnyLoc estimate so Phase 2 always starts from kinematic truth.
     try:
         os.makedirs(os.path.dirname(ESTIMATE_JSON), exist_ok=True)
         with open(ESTIMATE_JSON, "w") as _ef:
@@ -466,15 +587,12 @@ def main():
 
     cmd.start_vision(stop)
 
-    # Wait for MAVROS to connect to PX4
     print("[PX4Cmd] waiting for MAVROS connection …")
     if not cmd._spin_until(lambda: cmd._state.connected, 60.0):
         print("[PX4Cmd] MAVROS not connected — start PX4 + MAVROS first")
         stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
     print("[PX4Cmd] MAVROS connected ✓")
 
-    # Wait for drone_state and local_position to arrive.
-    # EKF2 needs time to initialize from VPE on a fresh start (can take 60-90 s).
     print("[PX4Cmd] waiting for EKF local position (up to 120 s) …")
     _last_diag = [time.time()]
     def _wait_cond():
@@ -487,16 +605,9 @@ def main():
         return cmd._local_pos is not None and cmd._drone is not None
     start_t = time.time()
     if not cmd._spin_until(_wait_cond, 120.0):
-        print(f"[PX4Cmd] no /drone/state or /mavros/local_position after 120 s"
-              f"  drone={'OK' if cmd._drone is not None else 'None'}"
-              f"  local_pos={'OK' if cmd._local_pos is not None else 'None'}")
+        print(f"[PX4Cmd] no /drone/state or /mavros/local_position after 120 s")
         stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # Settle: let EKF2 initialise its local frame from the first VPE batch.
-    # After a previous flight the EKF retains its last altitude (e.g. 60+ m).
-    # VPE (Phase 1, kinematic ground truth at z=0) will override this, but EKF
-    # needs time to converge. Wait until EKF z is within 5 m of ground before
-    # arming, or proceed after 15 s with a warning.
     print("[PX4Cmd] waiting for EKF z to converge to ground …")
     def _ekf_near_ground():
         return (cmd._local_pos is not None and
@@ -508,13 +619,11 @@ def main():
         ekf_z = cmd._local_pos.pose.position.z if cmd._local_pos else 0.0
         print(f"[PX4Cmd] EKF z={ekf_z:.2f} m — converged ✓")
 
-    # In-air restart detection: skip takeoff sequence if already airborne
     start_agl = cmd._agl()
     in_air = start_agl > 5.0
     if in_air:
         print(f"[PX4Cmd] in-air restart at {start_agl:.0f} m AGL — skipping takeoff")
         if cmd._state.mode != "OFFBOARD":
-            print(f"[PX4Cmd] mode={cmd._state.mode}, switching to OFFBOARD …")
             e0 = cmd._drone.pose.position.x if cmd._drone else 0.0
             n0 = cmd._drone.pose.position.y if cmd._drone else 0.0
             sp = cmd.make_sp(e0, n0, start_agl)
@@ -551,65 +660,96 @@ def main():
         print("[PX4Cmd] === gate done ===")
         stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-    # ── Full mission ──────────────────────────────────────────────────────────
-    if not in_air:
-        # Pre-stream at ground-level hold setpoint, then engage OFFBOARD
-        e0 = cmd._drone.pose.position.x if cmd._drone else 0.0
-        n0 = cmd._drone.pose.position.y if cmd._drone else 0.0
-        print(f"[PX4Cmd] engaging OFFBOARD at ground  E={e0:+.1f} N={n0:+.1f} …")
-        if not cmd.engage_offboard(e0, n0, 0.5):
-            print("[PX4Cmd] ABORT: engage_offboard failed")
-            stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
-
-        # Takeoff to cruise altitude
-        if not cmd.takeoff(TAKEOFF_ALT):
-            print("[PX4Cmd] ABORT: takeoff failed")
-            stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
-
-    # Hold briefly at cruise altitude before starting waypoints
-    if cmd._drone is not None:
-        hold_e = cmd._drone.pose.position.x
-        hold_n = cmd._drone.pose.position.y
-    else:
-        hold_e, hold_n = 0.0, 0.0
-    print(f"[PX4Cmd] holding 5 s at {TAKEOFF_ALT:.0f} m AGL …")
-    t_hold = time.time() + 5.0
-    sp = cmd.make_sp(hold_e, hold_n, TAKEOFF_ALT)
-    while time.time() < t_hold:
-        sp.header.stamp = cmd.get_clock().now().to_msg()
-        cmd._sp_pub.publish(sp)
-        rclpy.spin_once(cmd, timeout_sec=0.05)
-
-    # Waypoint navigation
+    # ── Full survey mission ───────────────────────────────────────────────────
     try:
-        for i, (wn, we, wagl) in enumerate(WAYPOINTS):
-            print(f"[PX4Cmd] WP {i+1}/{len(WAYPOINTS)}  N={wn:+.0f} E={we:+.0f}"
-                  f"  AGL={wagl:.0f} m")
-            reached = cmd.go_to_ned(wn, we, wagl, timeout=WAYPOINT_TIMEOUT)
-            if cmd._drone is not None:
-                ds  = cmd._drone.pose.position
-                agl = ds.z - HOME_ALT_MSL
-                dx  = ds.x - we; dy = ds.y - wn
-                print(f"[PX4Cmd] WP {i+1} {'ARRIVED ✓' if reached else 'TIMEOUT'}  "
-                      f"pos E={ds.x:+.1f} N={ds.y:+.1f} AGL={agl:.1f} m  "
-                      f"horiz_err={math.hypot(dx, dy):.1f} m")
-            time.sleep(1.0)
+        if not in_air:
+            e0 = cmd._drone.pose.position.x if cmd._drone else 0.0
+            n0 = cmd._drone.pose.position.y if cmd._drone else 0.0
+            print(f"[PX4Cmd] engaging OFFBOARD at ground  E={e0:+.1f} N={n0:+.1f} …")
+            if not cmd.engage_offboard(e0, n0, 0.5):
+                print("[PX4Cmd] ABORT: engage_offboard failed")
+                stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
-        # Hold at final waypoint — Ctrl-C triggers RTL
-        print("[PX4Cmd] Holding at target — Ctrl-C to RTL")
-        e_tgt = WAYPOINTS[-1][1]; n_tgt = WAYPOINTS[-1][0]
-        sp_hold = cmd.make_sp(e_tgt, n_tgt, WAYPOINTS[-1][2])
-        try:
-            while True:
-                sp_hold.header.stamp = cmd.get_clock().now().to_msg()
-                cmd._sp_pub.publish(sp_hold)
-                rclpy.spin_once(cmd, timeout_sec=0.1)
-        except KeyboardInterrupt:
-            print("[PX4Cmd] Ctrl-C — RTL")
-            cmd.set_mode("RTL")
-            cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
-            print("[PX4Cmd] Disarmed — landed ✓")
+            if not cmd.takeoff(TAKEOFF_ALT):
+                print("[PX4Cmd] ABORT: takeoff failed")
+                stop.set(); cmd.destroy_node(); rclpy.shutdown(); return
 
+        # Hold briefly at cruise altitude before starting survey
+        if cmd._drone is not None:
+            hold_e = cmd._drone.pose.position.x
+            hold_n = cmd._drone.pose.position.y
+        else:
+            hold_e, hold_n = 0.0, 0.0
+        print(f"[PX4Cmd] holding 5 s at {TAKEOFF_ALT:.0f} m AGL …")
+        t_hold = time.time() + 5.0
+        sp = cmd.make_sp(hold_e, hold_n, TAKEOFF_ALT)
+        while time.time() < t_hold:
+            sp.header.stamp = cmd.get_clock().now().to_msg()
+            cmd._sp_pub.publish(sp)
+            rclpy.spin_once(cmd, timeout_sec=0.05)
+
+        # ── Survey loop ───────────────────────────────────────────────────────
+        print(f"[PX4Cmd] === SURVEY START  {len(SURVEY_WPS)} waypoints"
+              f"  speed={SURVEY_SPEED:.0f} m/s ===")
+        wp_idx = 0
+        while wp_idx < len(SURVEY_WPS):
+            wn, we, wagl = SURVEY_WPS[wp_idx]
+            print(f"[PX4Cmd] SURVEY WP {wp_idx+1}/{len(SURVEY_WPS)}"
+                  f"  N={wn:+.0f} E={we:+.0f} AGL={wagl:.0f} m")
+
+            reached = cmd.go_to_ned(wn, we, wagl,
+                                    timeout=WAYPOINT_TIMEOUT,
+                                    speed=SURVEY_SPEED,
+                                    interruptible=True)
+
+            if cmd._survey_state == SurveyState.DIVERT:
+                # ── Detection divert ──────────────────────────────────────────
+                divert_n = cmd._divert_n
+                divert_e = cmd._divert_e
+                print(f"[PX4Cmd] DIVERT: {cmd._divert_cat}"
+                      f" conf={cmd._divert_conf:.2f}"
+                      f"  → N={divert_n:+.1f} E={divert_e:+.1f}")
+
+                cmd.go_to_ned(divert_n, divert_e, TAKEOFF_ALT,
+                              timeout=60.0,
+                              speed=SURVEY_SPEED,
+                              radius=DETECT_RADIUS,
+                              interruptible=False)
+
+                # Log at final centred position
+                if cmd._drone is not None:
+                    ds      = cmd._drone.pose.position
+                    agl_now = ds.z - HOME_ALT_MSL
+                    cmd._log_detection(cmd._divert_cat, cmd._divert_conf,
+                                       ds.y, ds.x, agl_now)
+
+                cmd._survey_state = SurveyState.SURVEY
+                # Resume toward the same survey waypoint (wp_idx unchanged)
+
+            elif reached:
+                if cmd._drone is not None:
+                    ds  = cmd._drone.pose.position
+                    dx  = ds.x - we; dy = ds.y - wn
+                    print(f"[PX4Cmd] WP {wp_idx+1} ARRIVED ✓"
+                          f"  E={ds.x:+.1f} N={ds.y:+.1f}"
+                          f"  horiz_err={math.hypot(dx, dy):.1f} m")
+                wp_idx += 1
+
+            else:
+                print(f"[PX4Cmd] WP {wp_idx+1} TIMEOUT — skipping")
+                wp_idx += 1
+
+        # Survey complete — RTL
+        print("[PX4Cmd] === SURVEY COMPLETE — RTL ===")
+        cmd.set_mode("RTL")
+        cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
+        print("[PX4Cmd] Disarmed — landed ✓")
+
+    except KeyboardInterrupt:
+        print("[PX4Cmd] Ctrl-C — RTL")
+        cmd.set_mode("RTL")
+        cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
+        print("[PX4Cmd] Disarmed ✓")
     except Exception as exc:
         print(f"[PX4Cmd] mission aborted: {exc}")
     finally:

@@ -6,11 +6,18 @@ Usage:
     python3 tools/live_trace.py               # auto-attach to latest/newest trace
     python3 tools/live_trace.py <trace.csv>   # specific file
 
+Overlays:
+  - Planned survey route (12 waypoints, 6-strip lawnmower)
+  - Buffered detection zone boundary
+  - Detected vehicles from detections.csv (refreshed live)
+  - AGL target line at 65 m
+
 The window updates at ~5 Hz as drone_sim.py / cesium_scene.py writes new rows.
 Close the window to stop.
 """
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -18,19 +25,54 @@ import time
 try:
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
-    from matplotlib.patches import Circle
+    from matplotlib.patches import Polygon as MplPolygon
     import numpy as np
 except ImportError:
     sys.exit("matplotlib + numpy required:  pip install matplotlib numpy")
 
 HERE      = os.path.dirname(os.path.abspath(__file__))
-TRACE_DIR = os.path.join(HERE, "..", "simulator", "flight_traces")
+PROJ_ROOT = os.path.join(HERE, "..")
+TRACE_DIR = os.path.join(PROJ_ROOT, "simulator", "flight_traces")
+DET_LOG   = os.path.join(PROJ_ROOT, "detections.csv")
 
-WP_NORTH, WP_EAST = 531.2, -453.9
-WP_RADIUS         = 60.0
-TARGET_AGL        = 90.0
+# ── Survey constants (mirror of px4_commander.py) ─────────────────────────────
+HOME_LAT  = 23.450868
+HOME_LON  = 120.286135
+COS_LAT   = math.cos(math.radians(HOME_LAT))
+M_PER_DEG = 111_320.0
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+TARGET_AGL = 65.0
+WP_RADIUS  = 60.0
+
+# (north_m, east_m) — same order as SURVEY_WPS in px4_commander.py
+SURVEY_WPS = [
+    (210.0,   -545.0),
+    (517.0,   -545.0),
+    (545.0,   -695.0),
+    (8.0,     -695.0),
+    (36.0,    -845.0),
+    (573.0,   -845.0),
+    (601.0,   -995.0),
+    (65.0,    -995.0),
+    (93.0,   -1145.0),
+    (629.0,  -1145.0),
+    (408.0,  -1250.0),
+    (113.0,  -1250.0),
+]
+
+# Buffered zone boundary (30 m inward), CW: NW'→NE'→SE'→SW'
+ZONE_VERTS = [
+    (642.0, -1215.0),
+    (507.0,  -489.0),
+    (-13.0,  -587.0),
+    (121.0, -1293.0),
+]
+
+# Category colours for detection markers
+_CAT_COLOR = {"car": "#ff4444", "van": "#ff88aa", "truck": "#ff8800", "bus": "#ffcc00"}
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def newest_trace():
     os.makedirs(TRACE_DIR, exist_ok=True)
@@ -50,7 +92,7 @@ def read_csv_fast(path):
     """Return (t, east, north, agl) numpy arrays from a partially-written CSV."""
     t, e, n, agl = [], [], [], []
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -59,15 +101,35 @@ def read_csv_fast(path):
                     n.append(float(row["north_m"]))
                     agl.append(float(row["agl_m"]))
                 except (ValueError, KeyError):
-                    pass   # skip incomplete last row
+                    pass
     except FileNotFoundError:
         pass
-    return (np.array(t), np.array(e), np.array(n), np.array(agl))
+    return np.array(t), np.array(e), np.array(n), np.array(agl)
 
 
-# ── build figure ───────────────────────────────────────────────────────────────
+def read_detections():
+    """Return list of (east_m, north_m, category) from detections.csv."""
+    dets = []
+    try:
+        with open(DET_LOG) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    lat = float(row["lat"])
+                    lon = float(row["lon"])
+                    north = (lat - HOME_LAT) * M_PER_DEG
+                    east  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
+                    dets.append((east, north, row["category"]))
+                except (ValueError, KeyError):
+                    pass
+    except FileNotFoundError:
+        pass
+    return dets
 
-fig, (ax_top, ax_alt) = plt.subplots(1, 2, figsize=(13, 6))
+
+# ── Build figure ───────────────────────────────────────────────────────────────
+
+fig, (ax_top, ax_alt) = plt.subplots(1, 2, figsize=(14, 7))
 fig.patch.set_facecolor("#1e1e2e")
 for ax in (ax_top, ax_alt):
     ax.set_facecolor("#2a2a3e")
@@ -79,98 +141,141 @@ for ax in (ax_top, ax_alt):
         spine.set_edgecolor("#555577")
     ax.grid(True, color="#444466", linewidth=0.5)
 
-# Top view static elements
-wp_circle = Circle((WP_EAST, WP_NORTH), WP_RADIUS,
-                   fill=False, color="#ff6060", linestyle="--", linewidth=1.2)
-ax_top.add_patch(wp_circle)
-ax_top.plot(WP_EAST, WP_NORTH, "*", color="#ff6060", markersize=14, label="Waypoint")
-ax_top.plot(0, 0, "^", color="#aaffaa", markersize=9, label="Home")
-ax_top.set_xlabel("East (m)"); ax_top.set_ylabel("North (m)")
+# ── Top view — static elements ─────────────────────────────────────────────────
+
+# Buffered zone polygon
+_zone_xy = [(e, n) for n, e in ZONE_VERTS]   # matplotlib uses (x=east, y=north)
+zone_poly = MplPolygon(_zone_xy, closed=True,
+                        fill=True, facecolor="#ff880011", edgecolor="#ff8800",
+                        linestyle="--", linewidth=1.0, zorder=1)
+ax_top.add_patch(zone_poly)
+
+# Planned survey route — connect WPs in order (east, north)
+_route_e = [0.0] + [e for _, e in SURVEY_WPS]
+_route_n = [0.0] + [n for n, _ in SURVEY_WPS]
+ax_top.plot(_route_e, _route_n,
+            color="#666688", linewidth=0.8, linestyle=":", zorder=2, label="Planned route")
+
+# WP markers + labels
+for idx, (wn, we) in enumerate(SURVEY_WPS):
+    label = "ENTRY" if idx == 0 else f"WP{idx:02d}"
+    ax_top.plot(we, wn, ".", color="#8888bb", markersize=6, zorder=3)
+    ax_top.annotate(label, (we, wn), textcoords="offset points", xytext=(4, 2),
+                    color="#8888bb", fontsize=6, zorder=3)
+
+# Home
+ax_top.plot(0, 0, "^", color="#aaffaa", markersize=9, zorder=4, label="Home")
+
+ax_top.set_xlabel("East (m)")
+ax_top.set_ylabel("North (m)")
 ax_top.set_title("Top view — live", pad=8)
 ax_top.set_aspect("equal")
-ax_top.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=8)
 
-# Altitude view static elements
-ax_alt.axhline(TARGET_AGL, color="#ffaa44", linestyle=":", linewidth=1.0, label=f"Target {TARGET_AGL:.0f} m")
-ax_alt.set_xlabel("Time (s)"); ax_alt.set_ylabel("AGL (m)")
+# ── Altitude view — static elements ───────────────────────────────────────────
+
+ax_alt.axhline(TARGET_AGL, color="#ffaa44", linestyle=":", linewidth=1.0,
+               label=f"Target {TARGET_AGL:.0f} m")
+ax_alt.set_xlabel("Time (s)")
+ax_alt.set_ylabel("AGL (m)")
 ax_alt.set_title("Altitude — live", pad=8)
-ax_alt.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=8)
 
-# Dynamic line objects
-trace_line,  = ax_top.plot([], [], color="#4488ff", linewidth=1.5)
-pos_dot,     = ax_top.plot([], [], "o", color="#ffffff", markersize=7, zorder=5)
-alt_line,    = ax_alt.plot([], [], color="#44ddaa", linewidth=1.5)
-time_dot,    = ax_alt.plot([], [], "o", color="#ffffff", markersize=7, zorder=5)
+# ── Dynamic artists ────────────────────────────────────────────────────────────
+
+trace_line, = ax_top.plot([], [], color="#4488ff", linewidth=1.5, zorder=5, label="Actual path")
+pos_dot,    = ax_top.plot([], [], "o", color="#ffffff", markersize=7, zorder=7)
+det_scatter = ax_top.scatter([], [], s=100, marker="*", zorder=8,
+                              color="#ff4444", label="Detection")
+
+alt_line,  = ax_alt.plot([], [], color="#44ddaa", linewidth=1.5)
+time_dot,  = ax_alt.plot([], [], "o", color="#ffffff", markersize=7, zorder=5)
+
+ax_top.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=7,
+              loc="upper right")
+ax_alt.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=8)
 
 status_txt = fig.text(0.5, 0.01, "", ha="center", color="#aaaacc", fontsize=9)
 plt.tight_layout(rect=[0, 0.03, 1, 1])
 
-# ── animation ──────────────────────────────────────────────────────────────────
+# ── Axis limits ────────────────────────────────────────────────────────────────
+
+# Pre-set to cover the survey zone
+ax_top.set_xlim(-1450, 250)
+ax_top.set_ylim(-200, 800)
+ax_alt.set_xlim(0, 120)
+ax_alt.set_ylim(0, TARGET_AGL + 20)
 
 _csv_path = [None]
-
-# Axis limits — expand as data grows
-_xlim = [-600, 100]
-_ylim = [-100, 600]
-_tlim = [0, 60]
-_alim = [0, 100]
-
-ax_top.set_xlim(*_xlim)
-ax_top.set_ylim(*_ylim)
-ax_alt.set_xlim(*_tlim)
-ax_alt.set_ylim(*_alim)
+_det_last_mtime = [0.0]
+_det_cache = [[]]   # list of (east, north, cat)
 
 
-def _expand(ax, set_xlim, set_ylim, xs, ys, margin=50):
-    changed = False
+def _expand_top(xs, ys, margin=80):
     if len(xs) == 0:
-        return False
-    xmin, xmax = np.min(xs) - margin, np.max(xs) + margin
-    ymin, ymax = np.min(ys) - margin, np.max(ys) + margin
-    cur_xl, cur_xr = ax.get_xlim()
-    cur_yb, cur_yt = ax.get_ylim()
-    if xmin < cur_xl or xmax > cur_xr:
-        set_xlim(min(xmin, cur_xl), max(xmax, cur_xr)); changed = True
-    if ymin < cur_yb or ymax > cur_yt:
-        set_ylim(min(ymin, cur_yb), max(ymax, cur_yt)); changed = True
-    return changed
+        return
+    xl, xr = ax_top.get_xlim(); yb, yt = ax_top.get_ylim()
+    nxl = min(np.min(xs) - margin, xl); nxr = max(np.max(xs) + margin, xr)
+    nyb = min(np.min(ys) - margin, yb); nyt = max(np.max(ys) + margin, yt)
+    if nxl != xl or nxr != xr: ax_top.set_xlim(nxl, nxr)
+    if nyb != yb or nyt != yt: ax_top.set_ylim(nyb, nyt)
+    ax_top.set_aspect("equal", adjustable="datalim")
 
 
 def update(_frame):
     path = _csv_path[0]
     if path is None:
-        return trace_line, pos_dot, alt_line, time_dot, status_txt
+        return trace_line, pos_dot, alt_line, time_dot, det_scatter, status_txt
 
     t, e, n, agl = read_csv_fast(path)
 
     if len(t) < 2:
         status_txt.set_text(f"Waiting for data … ({os.path.basename(path)})")
-        return trace_line, pos_dot, alt_line, time_dot, status_txt
+        return trace_line, pos_dot, alt_line, time_dot, det_scatter, status_txt
 
     trace_line.set_data(e, n)
     pos_dot.set_data([e[-1]], [n[-1]])
     alt_line.set_data(t, agl)
     time_dot.set_data([t[-1]], [agl[-1]])
 
-    # Auto-expand axes
-    _expand(ax_top, ax_top.set_xlim, ax_top.set_ylim,
-            np.append(e, [WP_EAST, 0]), np.append(n, [WP_NORTH, 0]))
-    ax_top.set_aspect("equal", adjustable="datalim")
+    # Auto-expand top view to keep drone visible
+    all_e = np.append(e, _route_e)
+    all_n = np.append(n, _route_n)
+    _expand_top(all_e, all_n)
 
-    t_range = max(t[-1] + 10, ax_alt.get_xlim()[1])
-    ax_alt.set_xlim(0, t_range)
-    agl_max = max(np.max(agl) + 10, ax_alt.get_ylim()[1])
-    ax_alt.set_ylim(0, agl_max)
+    ax_alt.set_xlim(0, max(t[-1] + 15, ax_alt.get_xlim()[1]))
+    ax_alt.set_ylim(0, max(np.max(agl) + 10, ax_alt.get_ylim()[1]))
 
-    dist = np.hypot(e[-1] - WP_EAST, n[-1] - WP_NORTH)
+    # Refresh detections if file changed
+    try:
+        mtime = os.path.getmtime(DET_LOG)
+    except FileNotFoundError:
+        mtime = 0.0
+    if mtime != _det_last_mtime[0]:
+        _det_cache[0] = read_detections()
+        _det_last_mtime[0] = mtime
+
+    dets = _det_cache[0]
+    if dets:
+        det_e = np.array([d[0] for d in dets])
+        det_n = np.array([d[1] for d in dets])
+        det_scatter.set_offsets(np.c_[det_e, det_n])
+        det_scatter.set_sizes([100] * len(dets))
+
+    # Nearest survey WP
+    dists = [math.hypot(e[-1] - we, n[-1] - wn) for wn, we in SURVEY_WPS]
+    nearest_idx = int(np.argmin(dists))
+    nearest_d   = dists[nearest_idx]
+    wp_label = "ENTRY" if nearest_idx == 0 else f"WP{nearest_idx:02d}"
+
+    det_info = f"  dets={len(dets)}" if dets else ""
     status_txt.set_text(
         f"t={t[-1]:.0f}s  E={e[-1]:+.0f}  N={n[-1]:+.0f}  "
-        f"AGL={agl[-1]:.1f}m  dist_to_WP={dist:.0f}m"
+        f"AGL={agl[-1]:.1f}m  nearest={wp_label}({nearest_d:.0f}m){det_info}"
     )
-    return trace_line, pos_dot, alt_line, time_dot, status_txt
+    return trace_line, pos_dot, alt_line, time_dot, det_scatter, status_txt
 
 
-ani = animation.FuncAnimation(fig, update, interval=200, blit=False, cache_frame_data=False)
+ani = animation.FuncAnimation(fig, update, interval=200,
+                               blit=False, cache_frame_data=False)
 
 
 def main():
@@ -187,6 +292,8 @@ def main():
         path = newest_trace()
 
     print(f"Live trace: {path}")
+    if os.path.exists(DET_LOG):
+        print(f"Detections: {DET_LOG}")
     fig.canvas.manager.set_window_title(f"Live trace — {os.path.basename(path)}")
     _csv_path[0] = path
     plt.show()

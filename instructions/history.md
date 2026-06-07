@@ -1,5 +1,91 @@
 # Project History
 
+## 2026-06-07 — live_trace.py updated for survey mission
+
+`tools/live_trace.py` updated to match the survey mission in `px4_commander.py`.
+
+**Top-view additions:**
+- **Buffered zone boundary** — orange dashed polygon (30 m inward from raw zone corners)
+  filled with a faint orange tint; `ZONE_VERTS` mirrored from `px4_commander.py`
+- **Planned survey route** — grey dotted line from Home through all 12 `SURVEY_WPS` in order,
+  so flown path vs planned route can be compared visually
+- **WP labels** — small grey dots with labels (ENTRY, WP01–WP11)
+- **Detection markers** — red stars plotted from `detections.csv`; file mtime is checked each
+  frame so new detections appear within 200 ms without restarting the viewer
+
+**Other changes:**
+- `TARGET_AGL` 90 m → 65 m (dashed reference in altitude panel)
+- Initial axis limits pre-set to cover the full survey zone (E −1450..250, N −200..800)
+- Status bar: `nearest=WPxx(dist m)` instead of `dist_to_WP` (single hardcoded point);
+  appends `dets=N` when detections are logged
+- `HOME_LAT/LON` + geodetic conversion added so detection lat/lon → plot coordinates
+
+**Files changed:** `tools/live_trace.py`
+
+---
+
+## 2026-06-07 — Survey mission implemented: px4_commander.py PX4-9 ✓
+
+### `control/px4_commander.py` — complete rewrite for 6-strip lawnmower survey
+
+Previous file: `WAYPOINTS` with a single test WP at (531.2, −453.9); `go_to_ned()` at 5 m/s hardcoded.
+
+New file replaces the single-WP test with a full survey mission at 12 m/s / 65 m AGL:
+
+#### Module-level additions
+
+| Symbol | Value | Purpose |
+|--------|-------|---------|
+| `SURVEY_WPS` | 12 entries | 6-strip boustrophedon waypoints at 65 m AGL |
+| `SURVEY_SPEED` | 12.0 m/s | strip cruise speed |
+| `DETECT_RADIUS` | 10.0 m | vehicle centring arrival threshold |
+| `ZONE_VERTS` | 4 CW corners | 30 m inward buffered boundary (NW'→NE'→SE'→SW') |
+| `CAM_W/H` | 1024 / 768 | camera resolution for GSD computation |
+| `HFOV_DEG / VFOV_DEG` | 88.0 / 65.1 | camera half-angle for ground offset |
+| `VEHICLE_CLASSES` | car,van,truck,bus | classes that trigger a divert |
+| `DET_LOG` | `detections.csv` | detection log path (project root) |
+| `SurveyState` | enum SURVEY/DIVERT | state machine for main survey loop |
+| `_in_buffered_zone(n, e)` | module function | ray-casting point-in-polygon |
+
+#### New methods
+
+- **`_cb_detections(msg)`**: subscribes to `/yolo/detections` (vision_msgs 5.x Jazzy —
+  `bbox.center.position.x/y`). Computes ground offset from bbox centre using GSD at current AGL.
+  If object inside `ZONE_VERTS`: sets `_survey_state = DIVERT` and records divert target.
+  If outside zone: logs position only (no flight divert).
+  Ignores new detections while already in DIVERT state.
+
+- **`_log_detection(cat, conf, n, e, agl)`**: appends one CSV row to `detections.csv`
+  (`timestamp, category, confidence, lat, lon, agl_m`). Auto-writes header on first row.
+
+#### `go_to_ned()` signature change
+
+`go_to_ned(north, east, agl, timeout, speed=5.0, radius=None, interruptible=False)`
+
+- `speed`: horizontal cruise (survey uses 12.0, divert uses 12.0)
+- `radius`: arrival distance (survey uses 60 m default; divert uses `DETECT_RADIUS = 10 m`)
+- `interruptible`: if `True`, returns `False` immediately when `_survey_state == DIVERT`
+
+#### Survey state machine in `main()`
+
+```
+while wp_idx < len(SURVEY_WPS):
+    go_to_ned(WP, speed=12, interruptible=True)
+    if DIVERT:
+        go_to_ned(divert_target, radius=10, interruptible=False)
+        _log_detection(...)
+        _survey_state = SURVEY        # resume same wp_idx
+    elif reached:
+        wp_idx += 1                   # advance
+    else:                             # timeout
+        wp_idx += 1                   # skip
+→ set_mode("RTL") → wait disarm
+```
+
+Ctrl-C at any point → RTL.
+
+---
+
 ## 2026-06-07 — Survey mission planned: lawnmower route + car detection response
 
 ### Plan: detection zone survey at 12 m/s, 6 strips, 65 m AGL
@@ -53,13 +139,13 @@ When YOLO detects a vehicle (car/van/truck/bus) inside the buffered zone:
 
 If divert target is outside buffered zone, log position only — no divert flight.
 
-#### Code changes required (not yet implemented)
+#### Code changes (implemented 2026-06-07 — PX4-9 ✓)
 
 | File | Change |
 |------|--------|
-| `control/px4_commander.py` | Replace `WAYPOINTS` with 12-entry `SURVEY_WPS`; add `SURVEY_SPEED=12.0`; `SurveyState` enum; YOLO subscriber; `_cb_detections()`; `_in_buffered_zone()`; `_strip_limits()`; detection CSV log |
+| `control/px4_commander.py` | Full survey mission — see section below |
 
-Full implementation details in `instructions/survey_mission_plan.md`.
+Full plan: `instructions/survey_mission_plan.md`.
 
 ---
 
@@ -397,9 +483,10 @@ t_s, east_m, north_m, agl_m, vn_ms, ve_ms
 ```
 
 **`tools/live_trace.py`** — real-time viewer using `matplotlib.animation.FuncAnimation` at 200 ms:
-- Dark theme; top view (accumulating path + home + waypoint circle) + altitude vs time panel
-- Status bar: `t / E / N / AGL / dist_to_WP`
-- Auto-expands axes as drone moves; auto-finds newest CSV (waits if none exists)
+- Dark theme; top view + altitude vs time panel
+- Overlays: survey route, buffered zone boundary, detection markers (updated 2026-06-07)
+- Status bar: `t / E / N / AGL / nearest WP / det count`
+- Auto-expands axes; auto-finds newest CSV (waits if none exists)
 - Usage: `python3 tools/live_trace.py [<file>]`
 
 **`tools/plot_trace.py`** — post-flight two-panel plot:

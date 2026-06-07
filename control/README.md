@@ -44,8 +44,8 @@ Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop i
 - Vision injection: 20 Hz `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov` + velocity to `/mavros/vision_speed/speed_twist`
 - Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
 - VPE heading: ENU yaw = π/2 (North) in **both** phases. `/drone/pose` encodes `−_kyaw_rad` not `π/2−_kyaw_rad`, so `yaw_deg=0` in the JSON maps to East, not North. Since the drone never yaws, π/2 is always correct and avoids a 90° EKF2 heading jump at the Phase 1→2 transition.
-- **Current mission (single WP test):** climb 65 m → carrot nav to (531 m N, −454 m E) → hold → RTL
-- **Planned mission (survey — impl pending):** 12 m/s lawnmower survey over detection zone west of home; 6 strips at 150 m spacing (7.8 min); YOLO vehicle detection → centre in frame → log (lat, lon, category, confidence) to `detections.csv` → resume route. See `instructions/survey_mission_plan.md`.
+- **Survey mission:** climb 65 m → 6-strip lawnmower at 12 m/s / 150 m spacing (~7.8 min); YOLO vehicle detection inside buffered zone → centre target in frame → log to `detections.csv` (timestamp, category, confidence, lat, lon, agl_m) → resume. Divert radius 10 m; survey radius 60 m.
+- See `instructions/survey_mission_plan.md` for zone geometry, strip table, and waypoint list.
 - `HOLDTEST=1`: 3 m hold gate (Phase 3 regression test)
 - `TAKEOFF_ALT=<m>`: override cruise altitude (default 65 m)
 - In-air restart: detects AGL > 5 m at startup and skips takeoff
@@ -136,7 +136,7 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 | 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
 | 6 | Done ✓ | End-to-end Isaac Sim waypoint flight: horiz_err < 60 m at 699 m leg |
 | 7 | In progress | AnyLoc + detection integration in full pipeline |
-| 8 | Planned | Survey mission: 6-strip lawnmower at 12 m/s + YOLO detection divert/log |
+| 8 | Done ✓ | Survey mission: 6-strip lawnmower at 12 m/s + YOLO detection divert/log |
 
 ---
 

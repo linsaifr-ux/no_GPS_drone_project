@@ -41,7 +41,7 @@ DINOv2+VLAD localisation  YOLOv8 detection
  ── PX4 path (active) ─────────────────────────────────────────────────
  PX4 SITL (TCP 4560 HIL) → UDP 14540/14580 → MAVROS2
  /mavros/vision_pose/pose_cov → EKF2 (EV_CTRL=15)
- px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→WP→RTL
+ px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→6-strip survey 12m/s→RTL
 ```
 
 **Headless fallback:** `control/drone_sim.py` provides the same kinematic bridge without Isaac Sim — used for fast control-loop testing. Not used when Isaac Sim runs.
@@ -60,7 +60,7 @@ no_GPS_drone_project/
 │   ├── drone_sim.py              # headless physics rig (PX4_SIM=0/1)
 │   ├── px4_sim_bridge.py         # PX4 HIL bridge (TCP 4560, pymavlink)
 │   ├── sitl_bridge.py            # ArduPilot SIM_JSON bridge (UDP 9002)
-│   ├── px4_commander.py          # PX4 mission: OFFBOARD→65m→WP(699m)→RTL
+│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→6-strip 12m/s lawnmower+YOLO divert→RTL
 │   ├── flight_commander.py       # ArduPilot mission (reference; WP nav unsolved)
 │   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
 │   ├── no_gps.parm               # ArduPilot: EK3 ExternalNav, GPS off
@@ -81,7 +81,7 @@ no_GPS_drone_project/
 │   ├── ros2_node.py              # ROS2: sub /drone/camera → pub /yolo/detections
 │   └── run_ros2_detector.sh      # launch script
 ├── tools/                        # Post-flight and live analysis tools
-│   ├── live_trace.py             # Real-time flight-trace viewer (FuncAnimation, 200 ms)
+│   ├── live_trace.py             # Real-time viewer: survey route + zone + detections overlay
 │   └── plot_trace.py             # Post-flight two-panel plot (top view + altitude)
 ├── yolov8l_visdrone.pt           # YOLOv8l fine-tuned on VisDrone (active)
 └── third_party/ardupilot/        # ArduPilot source (SITL binary inside)
@@ -109,8 +109,8 @@ no_GPS_drone_project/
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (65 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection integration in PX4 pipeline | In progress |
-| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ (impl pending) |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | TODO |
+| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | Done ✓ |
 | PX4-10 | Jetson distributed sim (Jetson = commander+AnyLoc+YOLO; PC = Isaac+PX4) | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -331,6 +331,10 @@ t_s, east_m, north_m, agl_m, vn_ms, ve_ms
 python3 tools/live_trace.py              # auto-attach to latest trace
 DISPLAY=:2 python3 tools/live_trace.py  # headless display
 ```
+
+Overlays: planned 6-strip survey route, buffered zone boundary, detection markers from
+`detections.csv` (refreshed live), 65 m AGL target line. Status bar shows nearest WP name
++ distance and running detection count.
 
 **Post-flight plot** (saves `simulator/flight_traces/trace_plot.png`):
 ```bash

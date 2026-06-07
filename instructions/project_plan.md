@@ -136,25 +136,28 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 ### 5a. Flight Control — PX4 path (`control/px4_commander.py`) **[ACTIVE]**
 
-**Status:** Full mission Done ✓ — 65 m AGL takeoff, single test waypoint (N=531, E=−454) confirmed. Survey mission planned; implementation pending (PX4-9).
+**Status:** Survey mission implemented ✓ (PX4-9 Done). 12 m/s lawnmower, YOLO divert+log.
 
 ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
 
-**Mission sequence (current — single waypoint):**
+**Mission sequence (survey):**
 1. Pre-stream 40 position setpoints at 20 Hz (PX4 requires setpoints before OFFBOARD)
-2. Switch to OFFBOARD mode
-3. Arm
-4. Climb to 65 m AGL (continuous setpoints in `takeoff()`)
-5. Hold 5 s
-6. `go_to_ned()` — carrot navigation: publish position target 25 m ahead toward WP; within 25 m snap to exact target; wait for horiz_err < 60 m
-7. Hold 5 s at WP
-8. Ctrl-C → RTL
+2. Switch to OFFBOARD mode + arm
+3. Climb to 65 m AGL (`takeoff()`)
+4. Hold 5 s
+5. `go_to_ned(speed=12, interruptible=True)` — iterate 12 survey waypoints
+   - On DIVERT (YOLO detection inside buffered zone): fly to object at 10 m radius, log, resume
+   - On SURVEY arrival (60 m radius): advance waypoint index
+6. RTL on survey complete or Ctrl-C
 
-**Planned mission (survey — see `instructions/survey_mission_plan.md`):**
-- 6-strip lawnmower survey at 12 m/s, 65 m AGL
-- Detection zone: 800 m × 650 m west of home; 30 m inward buffer; 6 strips at 150 m spacing
-- Detection response: YOLO car → centre in frame → log (lat, lon, category) → resume
-- Estimated flight time: ≈ 7.8 min (was 24 min at 9 strips / 5 m/s)
+**Survey constants (module level):**
+- `SURVEY_WPS` — 12 boustrophedon waypoints at 65 m AGL (see `instructions/survey_mission_plan.md`)
+- `SURVEY_SPEED = 12.0` m/s, `DETECT_RADIUS = 10.0` m, `ZONE_VERTS` — 30 m inward buffered boundary
+- `CAM_W/H = 1024/768`, `HFOV_DEG = 88`, `VFOV_DEG = 65.1` — for GSD pixel-to-ground mapping
+- `DET_LOG = detections.csv` — auto-header on first write
+
+**New methods:** `_cb_detections()`, `_log_detection()`, `_in_buffered_zone()`  
+**Updated:** `go_to_ned(speed, radius, interruptible)` — returns False early on DIVERT
 
 **VPE two-phase:**
 - Phase 1 (AGL < 50 m): kinematic truth, cov = 0.1 m²
@@ -326,8 +329,8 @@ bash control/launch_commander.sh
 | PX4-5 | Isaac Sim pipeline wired (`run.sh --tmux --px4`) | Done ✓ |
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
-| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ (plan written; impl pending) |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | TODO |
+| PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
+| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO divert+log | Done ✓ |
 | PX4-10 | Jetson distributed sim: Jetson runs commander+AnyLoc+YOLO, PC runs Isaac+PX4 | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
