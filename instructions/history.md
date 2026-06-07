@@ -1,5 +1,41 @@
 # Project History
 
+## 2026-06-07 — Survey route changed from N-S strips to E-W strips
+
+**Motivation:** The detection zone is ~873 m E-W × 655 m N-S. Flying E-W strips
+(along the long axis) gives ~730 m per full strip vs ~537 m for N-S strips, so
+the same area is covered with fewer strips and simpler transitions.
+
+**Old route (N-S strips, 6 strips):**
+- Strips at fixed E positions: −545, −695, −845, −995, −1145, −1250 m
+- 150 m E-W spacing; strips ran N-S
+- 12 waypoints; ~5.4 km; ~7.6 min
+
+**New route (E-W strips, 5 strips):**
+- Strips at fixed N positions: 60, 210, 360, 510, 580 m
+- 150 m N-S spacing; strips run E-W; enter from east (closest to home), boustrophedon S→N
+
+| Strip | N (m) | E west | E east | Length | Type |
+|-------|-------|--------|--------|--------|------|
+| S  |  60 | −972  | −573  | 399 m | partial (SE boundary) |
+| 1  | 210 | −1280 | −545  | 735 m | full |
+| 2  | 360 | −1257 | −517  | 740 m | full |
+| 3  | 510 | −1235 | −505  | 730 m | full |
+| N  | 580 | −1224 | −882  | 342 m | partial (NW corner) |
+
+- 10 waypoints; ~5.9 km; ~8.2 min
+- Extra ~460 m vs old route comes from two diagonal transitions at the edge partials
+  (WP01→WP02: 342 m NW; WP07→WP08: 383 m NW)
+- All three target vehicles remain in coverage: Car_01 (N=350) → strip 2,
+  Car_02 (N=150) → strip 1, Car_03 (N=450) → strip 3
+
+**Cross-track swath unchanged** — 125 m (HFOV) perpendicular to flight regardless of
+heading; 150 m spacing → 25 m gap, same as before.
+
+**Files changed:** `control/px4_commander.py` (SURVEY_WPS), `tools/live_trace.py` (SURVEY_WPS mirror)
+
+---
+
 ## 2026-06-07 — Three target vehicles placed in detection zone (cesium_scene.py)
 
 Added three procedural sedan models inside the YOLO detection zone for end-to-end

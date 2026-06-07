@@ -41,7 +41,7 @@ DINOv2+VLAD localisation  YOLOv8 detection
  ── PX4 path (active) ─────────────────────────────────────────────────
  PX4 SITL (TCP 4560 HIL) → UDP 14540/14580 → MAVROS2
  /mavros/vision_pose/pose_cov → EKF2 (EV_CTRL=15)
- px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→6-strip survey 12m/s→fly home→AUTO.LAND
+ px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→5-strip E-W survey 12m/s→fly home→AUTO.LAND
 ```
 
 **Headless fallback:** `control/drone_sim.py` provides the same kinematic bridge without Isaac Sim — used for fast control-loop testing. Not used when Isaac Sim runs.
@@ -60,7 +60,7 @@ no_GPS_drone_project/
 │   ├── drone_sim.py              # headless physics rig (PX4_SIM=0/1)
 │   ├── px4_sim_bridge.py         # PX4 HIL bridge (TCP 4560, pymavlink)
 │   ├── sitl_bridge.py            # ArduPilot SIM_JSON bridge (UDP 9002)
-│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→6-strip 12m/s lawnmower; YOLO logs via yaw-corrected pixel projection→fly home→AUTO.LAND
+│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→5-strip E-W 12m/s lawnmower; YOLO logs via yaw-corrected pixel projection→fly home→AUTO.LAND
 │   ├── flight_commander.py       # ArduPilot mission (reference; WP nav unsolved)
 │   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
 │   ├── no_gps.parm               # ArduPilot: EK3 ExternalNav, GPS off
@@ -332,7 +332,7 @@ python3 tools/live_trace.py              # auto-attach to latest trace
 DISPLAY=:2 python3 tools/live_trace.py  # headless display
 ```
 
-Overlays: planned 6-strip survey route, raw zone boundary (solid white), buffered zone
+Overlays: planned 5-strip E-W survey route, raw zone boundary (solid white), buffered zone
 boundary 30 m inward (orange dashed), detection markers from `detections.csv` (refreshed
 live, filtered to current flight only), 65 m AGL target line.
 Status bar shows nearest WP name + distance and running detection count.

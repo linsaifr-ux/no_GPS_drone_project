@@ -78,21 +78,25 @@ COS_LAT   = math.cos(math.radians(HOME_LAT))
 M_PER_DEG = 111_320.0
 
 # ── Survey waypoints (north_m, east_m, agl_m relative to home) ────────────────
-# 6-strip boustrophedon lawnmower; 150 m E-W spacing; 65 m AGL; ~5.4 km total.
-# Detection zone: 800 m × 650 m west of home, 30 m inward buffer applied.
+# 5-strip E-W boustrophedon lawnmower; 150 m N-S spacing; 65 m AGL; ~5.9 km.
+# Strips run east-west (long axis); enter from east (closest to home), S→N.
+# E limits at each N clipped to the 30 m-buffered zone polygon.
+#   Strip S (N= 60): partial SE boundary,  399 m
+#   Strip 1 (N=210): full,                 735 m
+#   Strip 2 (N=360): full,                 740 m
+#   Strip 3 (N=510): full,                 730 m
+#   Strip N (N=580): partial NW corner,    342 m
 SURVEY_WPS = [
-    (210.0,   -545.0,  TAKEOFF_ALT),  # ENTRY: south end strip E (NE wedge)
-    (517.0,   -545.0,  TAKEOFF_ALT),  # WP01 : north end strip E
-    (545.0,   -695.0,  TAKEOFF_ALT),  # WP02 : north end strip 1
-    (8.0,     -695.0,  TAKEOFF_ALT),  # WP03 : south end strip 1
-    (36.0,    -845.0,  TAKEOFF_ALT),  # WP04 : south end strip 2
-    (573.0,   -845.0,  TAKEOFF_ALT),  # WP05 : north end strip 2
-    (601.0,   -995.0,  TAKEOFF_ALT),  # WP06 : north end strip 3
-    (65.0,    -995.0,  TAKEOFF_ALT),  # WP07 : south end strip 3
-    (93.0,   -1145.0,  TAKEOFF_ALT),  # WP08 : south end strip 4
-    (629.0,  -1145.0,  TAKEOFF_ALT),  # WP09 : north end strip 4
-    (408.0,  -1250.0,  TAKEOFF_ALT),  # WP10 : north end strip W (SW wedge)
-    (113.0,  -1250.0,  TAKEOFF_ALT),  # WP11 : south end strip W
+    (60.0,    -573.0,  TAKEOFF_ALT),  # ENTRY: E end strip S (SE boundary)  → fly W
+    (60.0,    -972.0,  TAKEOFF_ALT),  # WP01 : W end strip S
+    (210.0,  -1280.0,  TAKEOFF_ALT),  # WP02 : W end strip 1                → fly E
+    (210.0,   -545.0,  TAKEOFF_ALT),  # WP03 : E end strip 1
+    (360.0,   -517.0,  TAKEOFF_ALT),  # WP04 : E end strip 2                → fly W
+    (360.0,  -1257.0,  TAKEOFF_ALT),  # WP05 : W end strip 2
+    (510.0,  -1235.0,  TAKEOFF_ALT),  # WP06 : W end strip 3                → fly E
+    (510.0,   -505.0,  TAKEOFF_ALT),  # WP07 : E end strip 3
+    (580.0,   -882.0,  TAKEOFF_ALT),  # WP08 : E end strip N (NW corner)    → fly W
+    (580.0,  -1224.0,  TAKEOFF_ALT),  # WP09 : W end strip N
 ]
 
 # ── Detection zone — buffered boundary (30 m inward from raw corners) ──────────
