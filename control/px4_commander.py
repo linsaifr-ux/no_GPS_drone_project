@@ -74,6 +74,7 @@ MIN_LOCALISATION_AGL = 50.0   # m — below this use truth VPE; above, use AnyLo
 
 SURVEY_SPEED   = 12.0   # m/s — strip cruise speed
 DETECT_RADIUS  = 10.0   # m   — vehicle centring arrival threshold
+DEDUP_RADIUS   = 30.0   # m   — suppress re-divert if within this of a logged position
 
 COS_LAT   = math.cos(math.radians(HOME_LAT))
 M_PER_DEG = 111_320.0
@@ -156,11 +157,12 @@ class PX4Commander(rclpy.node.Node):
         self._drone     = None   # /drone/state  (ENU, kinematic truth)
 
         # Survey / detection state
-        self._survey_state = SurveyState.SURVEY
-        self._divert_n     = 0.0
-        self._divert_e     = 0.0
-        self._divert_cat   = ""
-        self._divert_conf  = 0.0
+        self._survey_state     = SurveyState.SURVEY
+        self._divert_n         = 0.0
+        self._divert_e         = 0.0
+        self._divert_cat       = ""
+        self._divert_conf      = 0.0
+        self._logged_positions = []   # (north_m, east_m) — dedup guard
 
         # Subscribers
         from geometry_msgs.msg import PoseStamped
@@ -241,6 +243,12 @@ class PX4Commander(rclpy.node.Node):
             self._log_detection(cat, conf, cur_n, cur_e, agl)
             return
 
+        # Suppress re-divert if already logged a vehicle within DEDUP_RADIUS
+        for ln, le in self._logged_positions:
+            if math.hypot(obj_n - ln, obj_e - le) < DEDUP_RADIUS:
+                print(f"[PX4Cmd] {cat} within {DEDUP_RADIUS:.0f} m of logged entry — skipping")
+                return
+
         self._divert_n    = obj_n
         self._divert_e    = obj_e
         self._divert_cat  = cat
@@ -250,7 +258,7 @@ class PX4Commander(rclpy.node.Node):
               f"  (Δn={dn:+.1f} Δe={de:+.1f} m)")
 
     def _log_detection(self, category, confidence, north_m, east_m, agl_m):
-        """Append one row to detections.csv."""
+        """Append one row to detections.csv and record position for dedup."""
         lat = HOME_LAT + north_m / M_PER_DEG
         lon = HOME_LON + east_m  / (M_PER_DEG * COS_LAT)
         need_header = not os.path.exists(DET_LOG)
@@ -259,6 +267,7 @@ class PX4Commander(rclpy.node.Node):
                 f.write("timestamp,category,confidence,lat,lon,agl_m\n")
             f.write(f"{time.time():.3f},{category},{confidence:.3f},"
                     f"{lat:.6f},{lon:.6f},{agl_m:.1f}\n")
+        self._logged_positions.append((north_m, east_m))
         print(f"[PX4Cmd] logged: {category} conf={confidence:.2f}"
               f"  lat={lat:.6f} lon={lon:.6f}  agl={agl_m:.1f} m")
 

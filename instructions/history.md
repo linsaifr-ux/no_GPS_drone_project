@@ -1,5 +1,63 @@
 # Project History
 
+## 2026-06-07 — live_trace.py: filter detections to current flight only
+
+**Problem:** `detections.csv` accumulates across flights (px4_commander.py appends,
+never clears). On a new flight, `live_trace.py` showed all markers from every previous
+flight, cluttering the map.
+
+**Fix:** Parse the flight start time from the trace filename
+(`trace_YYYYMMDD_HHMMSS.csv` → Unix epoch) and pass it as `min_timestamp` to
+`read_detections()`. Any CSV row whose `timestamp` field predates the current flight
+is skipped. If the filename format cannot be parsed (e.g. a renamed file), the filter
+falls back to `min_timestamp=0.0` and all rows are shown.
+
+```python
+# in main():
+dt = datetime.datetime.strptime(fname, "trace_%Y%m%d_%H%M%S.csv")
+_flight_start_epoch[0] = dt.timestamp()
+
+# in read_detections():
+if float(row["timestamp"]) < min_timestamp:
+    continue
+```
+
+**Files changed:** `tools/live_trace.py`
+
+---
+
+## 2026-06-07 — Detection deduplication added to px4_commander.py
+
+**Problem:** After logging a vehicle and resuming the survey route, the same car
+remained in the camera frame and `_cb_detections()` immediately fired again,
+triggering a second divert to the same target. The drone would yo-yo between the
+survey waypoint and the car indefinitely.
+
+**Fix:** Location-based deduplication in `_cb_detections()`:
+
+```python
+DEDUP_RADIUS = 30.0   # m — suppress re-divert within this of a logged position
+
+# in __init__:
+self._logged_positions = []   # (north_m, east_m) of logged detections
+
+# in _cb_detections(), before setting DIVERT:
+for ln, le in self._logged_positions:
+    if math.hypot(obj_n - ln, obj_e - le) < DEDUP_RADIUS:
+        return   # already logged — skip divert
+
+# in _log_detection():
+self._logged_positions.append((north_m, east_m))
+```
+
+The 30 m radius covers the ~20 m AnyLoc position uncertainty so the same physical
+car does not re-trigger even if its estimated position drifts between passes.
+A different car more than 30 m away still triggers a normal divert.
+
+**Files changed:** `control/px4_commander.py`
+
+---
+
 ## 2026-06-07 — live_trace.py updated for survey mission
 
 `tools/live_trace.py` updated to match the survey mission in `px4_commander.py`.
@@ -11,7 +69,8 @@
   so flown path vs planned route can be compared visually
 - **WP labels** — small grey dots with labels (ENTRY, WP01–WP11)
 - **Detection markers** — red stars plotted from `detections.csv`; file mtime is checked each
-  frame so new detections appear within 200 ms without restarting the viewer
+  frame so new detections appear within 200 ms; filtered to current flight only by
+  comparing `timestamp` against flight start epoch parsed from the trace filename
 
 **Other changes:**
 - `TARGET_AGL` 90 m → 65 m (dashed reference in altitude panel)

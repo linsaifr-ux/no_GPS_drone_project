@@ -17,6 +17,7 @@ Close the window to stop.
 """
 import argparse
 import csv
+import datetime
 import math
 import os
 import sys
@@ -107,14 +108,20 @@ def read_csv_fast(path):
     return np.array(t), np.array(e), np.array(n), np.array(agl)
 
 
-def read_detections():
-    """Return list of (east_m, north_m, category) from detections.csv."""
+def read_detections(min_timestamp=0.0):
+    """Return list of (east_m, north_m, category) from detections.csv.
+
+    Only rows whose Unix timestamp >= min_timestamp are returned, so detections
+    from previous flights (which share the same CSV file) are not shown.
+    """
     dets = []
     try:
         with open(DET_LOG) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
+                    if float(row["timestamp"]) < min_timestamp:
+                        continue
                     lat = float(row["lat"])
                     lon = float(row["lon"])
                     north = (lat - HOME_LAT) * M_PER_DEG
@@ -204,9 +211,10 @@ ax_top.set_ylim(-200, 800)
 ax_alt.set_xlim(0, 120)
 ax_alt.set_ylim(0, TARGET_AGL + 20)
 
-_csv_path = [None]
-_det_last_mtime = [0.0]
-_det_cache = [[]]   # list of (east, north, cat)
+_csv_path          = [None]
+_det_last_mtime    = [0.0]
+_det_cache         = [[]]   # list of (east, north, cat)
+_flight_start_epoch = [0.0]  # Unix timestamp of the current flight (from trace filename)
 
 
 def _expand_top(xs, ys, margin=80):
@@ -250,7 +258,7 @@ def update(_frame):
     except FileNotFoundError:
         mtime = 0.0
     if mtime != _det_last_mtime[0]:
-        _det_cache[0] = read_detections()
+        _det_cache[0] = read_detections(min_timestamp=_flight_start_epoch[0])
         _det_last_mtime[0] = mtime
 
     dets = _det_cache[0]
@@ -291,10 +299,20 @@ def main():
     else:
         path = newest_trace()
 
+    # Parse flight start time from filename (trace_YYYYMMDD_HHMMSS.csv).
+    # Detections older than this are from previous flights and are hidden.
+    fname = os.path.basename(path)
+    try:
+        dt = datetime.datetime.strptime(fname, "trace_%Y%m%d_%H%M%S.csv")
+        _flight_start_epoch[0] = dt.timestamp()
+        print(f"Flight start: {dt.strftime('%Y-%m-%d %H:%M:%S')} — older detections hidden")
+    except ValueError:
+        _flight_start_epoch[0] = 0.0   # unknown format: show all detections
+
     print(f"Live trace: {path}")
     if os.path.exists(DET_LOG):
         print(f"Detections: {DET_LOG}")
-    fig.canvas.manager.set_window_title(f"Live trace — {os.path.basename(path)}")
+    fig.canvas.manager.set_window_title(f"Live trace — {fname}")
     _csv_path[0] = path
     plt.show()
 

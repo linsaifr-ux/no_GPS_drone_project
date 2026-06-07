@@ -183,6 +183,16 @@ def _in_buffered_zone(north_m, east_m):
 If a computed divert target lies outside the zone, log the detection at the current
 position and skip the divert flight.
 
+### Deduplication guard
+
+After a vehicle is logged, its position `(north_m, east_m)` is appended to
+`self._logged_positions`. Any subsequent detection whose estimated ground position
+falls within `DEDUP_RADIUS = 30 m` of an already-logged entry is silently discarded
+(no divert flight, no additional log row). The 30 m radius covers the ~20 m AnyLoc
+position uncertainty, so the same physical car cannot re-trigger a divert on the
+next pass or while still in frame after resuming. A genuinely different car more than
+30 m from any logged entry triggers a normal divert.
+
 ---
 
 ## Code Changes Required (`control/px4_commander.py`)
@@ -192,6 +202,7 @@ position and skip the divert flight.
 ```python
 SURVEY_SPEED   = 12.0    # m/s — strip cruise speed
 DETECT_RADIUS  = 10.0    # m — centering arrival threshold
+DEDUP_RADIUS   = 30.0    # m — suppress re-divert within this of a logged position
 SURVEY_WPS = [           # (north_m, east_m, agl_m)
     (210.0,   -545.0,  65.0),  # ENTRY: south end strip E
     (517.0,   -545.0,  65.0),  # WP01: north end strip E

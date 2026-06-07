@@ -146,7 +146,7 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 3. Climb to 65 m AGL (`takeoff()`)
 4. Hold 5 s
 5. `go_to_ned(speed=12, interruptible=True)` — iterate 12 survey waypoints
-   - On DIVERT (YOLO detection inside buffered zone): fly to object at 10 m radius, log, resume
+   - On DIVERT (YOLO detection inside buffered zone, not within 30 m of a logged entry): fly to object at 10 m radius, log, resume
    - On SURVEY arrival (60 m radius): advance waypoint index
 6. RTL on survey complete or Ctrl-C
 

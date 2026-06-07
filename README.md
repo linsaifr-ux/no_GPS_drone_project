@@ -333,8 +333,8 @@ DISPLAY=:2 python3 tools/live_trace.py  # headless display
 ```
 
 Overlays: planned 6-strip survey route, buffered zone boundary, detection markers from
-`detections.csv` (refreshed live), 65 m AGL target line. Status bar shows nearest WP name
-+ distance and running detection count.
+`detections.csv` (refreshed live, filtered to current flight only), 65 m AGL target line.
+Status bar shows nearest WP name + distance and running detection count.
 
 **Post-flight plot** (saves `simulator/flight_traces/trace_plot.png`):
 ```bash
