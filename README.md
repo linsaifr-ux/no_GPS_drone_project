@@ -166,21 +166,22 @@ Switch with `Ctrl-B 0–5`. The commander prints `[PX4Cmd]` progress to window 3
 
 > **AnyLoc startup:** the database is now ~2,820 entries (AGL 65 m only). Load time is much shorter than the old 36,673-entry database.
 
-### Run — distributed (Isaac Sim on PC, AnyLoc + YOLO on Jetson Orin NX)
+### Run — distributed (PC = sim only, Jetson = everything that runs on real drone)
 
 ```bash
-# PC — sim + commander only (no --anyloc / --detection; those run on Jetson)
+# PC — Isaac Sim + PX4 SITL + MAVProxy bridge only
 export ROS_DOMAIN_ID=0
-bash run.sh --tmux --px4
+bash run.sh --tmux --px4 --jetson-sim
 
-# Jetson — inference nodes (same LAN, same ROS_DOMAIN_ID)
+# Jetson Orin NX — MAVROS + Commander + AnyLoc + YOLO (same as real hardware)
 export ROS_DOMAIN_ID=0
-source /opt/ros/jazzy/setup.bash
-bash anyloc/run_ros2_localizer.sh        # terminal 1
-bash detection/run_ros2_detector.sh      # terminal 2
+bash run_jetson.sh
 ```
 
-See `instructions/jetson_distributed_plan.md` for network setup, code changes required, and real hardware transition notes.
+tmux on PC: **0 Isaac · 1 PX4 · 2 MAVProxy**  
+tmux on Jetson: **0 MAVROS · 1 Commander · 2 AnyLoc · 3 Detection**
+
+See `instructions/jetson_distributed_plan.md` for network setup, MAVProxy bridge details, code changes required, and real hardware transition notes.
 
 ### Run — headless (no Isaac Sim, for control-loop testing)
 

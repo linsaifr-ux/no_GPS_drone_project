@@ -1,71 +1,114 @@
-# Plan: Distributed Sim — PC runs Isaac Sim, Jetson runs AnyLoc + YOLO
+# Plan: Distributed Sim — PC runs Isaac Sim + PX4 SITL, Jetson runs everything else
 
 ## Goal
 
-Run heavy inference (AnyLoc, YOLO) on Jetson while Isaac Sim, PX4 SITL, MAVROS, and the
-commander remain on the PC. Camera frames flow PC → Jetson; VPE flows Jetson → PC → MAVROS.
+Simulate the real drone software stack on Jetson Orin NX while the PC provides the
+virtual environment. On real hardware the Jetson runs MAVROS, commander, AnyLoc, and
+YOLO — so the sim must run those same components on Jetson.
 
 ---
 
 ## What Runs Where
 
-| Component | Machine | Notes |
-|---|---|---|
-| Isaac Sim (`cesium_scene.py`) | PC | publishes camera + pose + agl |
-| PX4 SITL | PC | TCP 4560 |
-| MAVROS | PC | UDP 14540/14580 |
-| `px4_commander.py` | PC | Phase 1 VPE from local kinematic truth; Phase 2 VPE from AnyLoc topic |
-| `anyloc/ros2_node.py` | Jetson | subscribes to camera; publishes `/anyloc/pose_estimate` |
-| `detection/ros2_node.py` | Jetson | subscribes to camera; publishes `/yolo/detections` |
+| Component | Sim (PC) | Sim (Jetson) | Real drone |
+|---|---|---|---|
+| Isaac Sim (`cesium_scene.py`) | ✓ | — | — (real camera) |
+| PX4 SITL | ✓ | — | — (Pixhawk) |
+| **MAVProxy bridge** | ✓ (new) | — | — |
+| MAVROS | — | ✓ | ✓ → Pixhawk serial |
+| `px4_commander.py` | — | ✓ | ✓ |
+| `anyloc/ros2_node.py` | — | ✓ | ✓ |
+| `detection/ros2_node.py` | — | ✓ | ✓ |
+
+Everything in the Jetson column is identical to what runs on the real drone.
 
 ---
 
-## Network Requirements
+## Network
 
-- Same LAN — Gigabit Ethernet strongly preferred
-- `ROS_DOMAIN_ID=0` on both machines (must match)
+- Jetson Orin NX RJ45 → same router/switch as PC
+- `ROS_DOMAIN_ID=0` on both machines
 - Both source `/opt/ros/jazzy/setup.bash`
 
-**Bandwidth (raw image):** 1024 × 768 × 3 B × 5 fps ≈ 11.5 MB/s ≈ 92 Mbps  
-→ Fine on Gigabit Ethernet. On WiFi, add compressed image transport (see section 5).
+```
+PC                          Jetson Orin NX
+────────────────────────    ──────────────────────────
+Isaac Sim                   MAVROS
+PX4 SITL                    px4_commander.py
+MAVProxy  ←──UDP──────────► anyloc/ros2_node.py
+          ──UDP──────────►   detection/ros2_node.py
+          ◄─────────────── 
+```
 
 ---
 
-## Topic Data Flows
+## MAVLink Routing — MAVProxy Bridge (Option A)
+
+PX4 SITL and MAVROS normally talk over localhost UDP. With MAVROS on Jetson,
+MAVProxy on PC bridges between PX4 SITL and the network.
+
+**How it works:**
 
 ```
-PC (Isaac Sim)                              Jetson
-──────────────────────────────────────────────────────────────
-cesium_scene.py
-  /drone/camera/image_raw  ──────────────► anyloc/ros2_node.py
-  /drone/pose              ──────────────► anyloc/ros2_node.py
-  /drone/agl               ──────────────► anyloc/ros2_node.py
-                                           detection/ros2_node.py
-                                                │
-                           ◄──────────────  /anyloc/pose_estimate
-                           ◄──────────────  /yolo/detections
-
-px4_commander.py
-  subscribes /anyloc/pose_estimate  (arrives from Jetson over DDS)
-  publishes  /mavros/vision_pose/pose_cov  (to local MAVROS)
+PX4 SITL (listens :14580, sends to :14540)
+    ↕  UDP localhost
+MAVProxy on PC
+  --master udp:127.0.0.1:14580   ← connects to PX4's listening port
+  --out    udp:<JETSON_IP>:14540  → forwards MAVLink to Jetson
+    ↕  UDP over LAN
+MAVROS on Jetson (binds :14540, replies to source automatically)
 ```
 
-ROS2 DDS peer discovery handles cross-machine topic routing automatically — no extra
-brokers or configuration needed beyond matching `ROS_DOMAIN_ID`.
+MAVProxy is fully bidirectional — MAVROS commands flow back through it to PX4.
+PX4 SITL still sends to :14540 on localhost; those packets are harmlessly dropped
+since nothing binds that port on PC anymore.
+
+**MAVProxy command (PC):**
+```bash
+mavproxy.py \
+    --master=udp:127.0.0.1:14580 \
+    --out=udp:<JETSON_IP>:14540 \
+    --daemon
+```
+
+**MAVROS fcu_url (Jetson):**
+```
+udp://:14540@
+```
+Same as current — MAVROS binds :14540 and learns the reply address from received packets.
+
+---
+
+## ROS2 Topic Data Flows
+
+ROS2 DDS handles these automatically with matching `ROS_DOMAIN_ID`:
+
+```
+PC (Isaac Sim)                       Jetson
+─────────────────────────────────────────────────────
+/drone/camera/image_raw  ──────────► anyloc/ros2_node.py
+/drone/pose              ──────────► anyloc/ros2_node.py
+/drone/agl               ──────────► anyloc/ros2_node.py
+                                     detection/ros2_node.py
+/drone/state             ──────────► px4_commander.py  (Phase 1 VPE truth)
+
+                         Jetson-internal (no network hop):
+                         /anyloc/pose_estimate → px4_commander.py
+                         /mavros/* ↔ px4_commander.py
+```
+
+No ROS2 topics need to flow Jetson → PC. MAVLink (not ROS2) carries PX4 commands.
 
 ---
 
 ## Code Changes Required
 
-### 1. `anyloc/ros2_node.py` — pass `error_m` into `_publish()`
+### 1. `anyloc/ros2_node.py` — dynamic covariance in `_publish()`
 
-Currently `_publish()` uses a hardcoded covariance (20 m² XY). The commander needs
-dynamic covariance `max(1, error_m²)` to weight AnyLoc estimates correctly. Fix: pass
-`error_m` to `_publish()` and compute the same covariance the commander currently
-computes from JSON.
+Currently uses hardcoded XY covariance (20 m²). Commander needs `max(1, error_m²)`.
 
 ```python
-# _cb_image calls:
+# _cb_image passes error_m:
 self._publish(est_lat, est_lon, drone_alt, error_m=err_m)
 
 # _publish signature:
@@ -73,91 +116,118 @@ def _publish(self, lat, lon, alt_msl, error_m: float = 20.0):
     ...
     xy_var = max(1.0, error_m ** 2)
     cov[0] = cov[7] = xy_var
-    cov[14] = 0.25   # altitude: 0.5 m std (kept tight — baro handles this)
+    cov[14] = 0.25
 ```
 
-### 2. `px4_commander.py` — subscribe to `/anyloc/pose_estimate` instead of reading JSON
+### 2. `px4_commander.py` — subscribe to `/anyloc/pose_estimate` instead of JSON
 
-Phase 1 VPE (kinematic truth) is unchanged — commander still reads `/drone/state`
-locally. Phase 2 VPE switches from JSON polling to a ROS2 subscription:
+Phase 1 VPE (kinematic truth from `/drone/state`) is unchanged — DDS delivers it from PC.
+Phase 2 switches from JSON file polling to ROS2 subscription:
 
 ```python
-# Add subscriber in __init__:
+from geometry_msgs.msg import PoseWithCovarianceStamped
+
+# In __init__:
+self._anyloc_msg   = None
+self._anyloc_stamp = 0.0
 self.create_subscription(
     PoseWithCovarianceStamped, "/anyloc/pose_estimate",
     self._cb_anyloc, 1)
 
 def _cb_anyloc(self, msg):
-    self._anyloc_msg = msg          # store latest; VPE thread reads this
+    self._anyloc_msg   = msg
     self._anyloc_stamp = time.time()
+```
 
-# In VPE thread, Phase 2:
+In the VPE thread Phase 2 block, replace JSON read with:
+```python
 msg = self._anyloc_msg
 if msg is not None and (time.time() - self._anyloc_stamp) < 2.0:
     # use msg.pose.pose.position.{x,y,z} and msg.pose.covariance directly
-    # no JSON file read needed
 ```
 
-Remove the JSON file polling loop entirely from the VPE thread.
+Remove the JSON polling loop entirely.
 
-### 3. (WiFi only) Compressed image transport
+### 3. `run.sh` — add `--jetson-sim` mode
 
-If using WiFi, publish a JPEG-compressed image alongside the raw topic to cut bandwidth
-from ~92 Mbps to ~5–15 Mbps. Requires `ros-jazzy-image-transport` and
-`ros-jazzy-compressed-image-transport` on both machines.
+On PC, `--jetson-sim` skips MAVROS and Commander windows and adds a MAVProxy window:
 
-In `cesium_scene.py`, publish `sensor_msgs/CompressedImage` on
-`/drone/camera/image_raw/compressed`. AnyLoc and YOLO nodes subscribe to the compressed
-topic. No other changes needed — `image_transport` handles encode/decode.
+```bash
+bash run.sh --tmux --px4 --jetson-sim            # PC side
+bash run.sh --tmux --px4 --jetson-sim --no-window # PC side, headless Isaac Sim
+```
+
+Windows on PC: **0 Isaac · 1 PX4 · 2 MAVProxy**
+
+### 4. New `run_jetson.sh` — launch all drone-side services on Jetson
+
+```bash
+bash run_jetson.sh          # MAVROS + Commander + AnyLoc + YOLO in tmux
+```
+
+Windows on Jetson: **0 MAVROS · 1 Commander · 2 AnyLoc · 3 Detection**
 
 ---
 
 ## Jetson Setup
 
 ```bash
-# 1. Copy repo to Jetson (or git clone)
-rsync -av --exclude=third_party/ /path/to/no_GPS_drone_project/ jetson:~/no_GPS_drone_project/
+# 1. Copy repo (exclude sim-only files and third_party)
+rsync -av --exclude=third_party/ --exclude=simulator/ \
+    /path/to/no_GPS_drone_project/ jetson:~/no_GPS_drone_project/
 
-# 2. Copy AnyLoc database (~small now: ~2820 entries at AGL 65 m)
+# 2. Copy AnyLoc database (~2 820 entries at AGL 65 m, small)
 rsync -av anyloc/database/ jetson:~/no_GPS_drone_project/anyloc/database/
 
 # 3. Copy YOLO model weights
 rsync -av yolov8l_visdrone.pt jetson:~/no_GPS_drone_project/
 
-# 4. On Jetson — set domain ID and source ROS2
+# 4. Environment on Jetson
 echo 'export ROS_DOMAIN_ID=0' >> ~/.bashrc
-echo 'source /opt/ros/jazzy/setup.bash' >> ~/.bashrc
 source ~/.bashrc
-
-# 5. On Jetson — run inference nodes
-bash anyloc/run_ros2_localizer.sh
-bash detection/run_ros2_detector.sh   # in another terminal
 ```
+
+---
+
+## Full Launch Sequence
+
+**PC:**
+```bash
+export ROS_DOMAIN_ID=0
+bash run.sh --tmux --px4 --jetson-sim    # Isaac Sim + PX4 SITL + MAVProxy
+```
+
+**Jetson:**
+```bash
+export ROS_DOMAIN_ID=0
+bash run_jetson.sh                        # MAVROS + Commander + AnyLoc + YOLO
+```
+
+---
+
+## Verification
 
 ```bash
-# On PC — set same domain ID (if not already set)
-export ROS_DOMAIN_ID=0
+# Jetson: camera frames arriving from PC
+ros2 topic hz /drone/camera/image_raw     # expect ~5 Hz
 
-# Run simulation as normal — no other changes
-bash run.sh --tmux --px4
-# (do NOT pass --anyloc or --detection — those run on Jetson now)
+# PC: AnyLoc estimates arriving from Jetson
+ros2 topic hz /anyloc/pose_estimate       # expect ~5 Hz
+
+# Jetson: MAVROS connected (MAVProxy bridge working)
+ros2 topic echo /mavros/state             # expect connected=True, armed=False
 ```
 
 ---
 
-## Verification Steps
+## Real Hardware Transition
 
-1. On Jetson: `ros2 topic hz /drone/camera/image_raw` — should show ~5 Hz arriving from PC
-2. On PC: `ros2 topic hz /anyloc/pose_estimate` — should show ~5 Hz arriving from Jetson
-3. On PC: `ros2 topic echo /anyloc/pose_estimate` — check lat/lon values are plausible
-4. Fly the mission; watch commander window for `[PX4Cmd] Phase 2` switching on AnyLoc estimate
+Jetson `run_jetson.sh` is identical. Only two things change:
 
----
+| | Sim | Real hardware |
+|---|---|---|
+| MAVROS `fcu_url` | `udp://:14540@` (via MAVProxy) | `/dev/ttyTHS1:921600` (Pixhawk serial) |
+| Commander Phase 1 VPE | kinematic truth from `/drone/state` | skip (EKF2 uses real IMU + baro) |
 
-## Real Hardware Transition (future)
-
-When moving to real hardware, the split is the same (Jetson runs AnyLoc + YOLO) but:
-- No Isaac Sim — real camera driver publishes `/drone/camera/image_raw`
-- No Phase 1 kinematic truth VPE — EKF2 uses real IMU + baro during climb
-- MAVROS connects to Pixhawk over serial, not UDP
-- Commander gets a `--real-hw` flag to skip Phase 1 VPE injection
+Add `--real-hw` flag to commander to skip Phase 1 VPE injection.
+The `run_jetson.sh` script passes `--real-hw` on real hardware and nothing in sim.

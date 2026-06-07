@@ -27,21 +27,29 @@ Files: `anyloc/build_database.py`, `anyloc/README.md`.
 
 ---
 
-### Plan: distributed sim — PC runs Isaac Sim, Jetson Orin NX runs AnyLoc + YOLO
+### Plan: distributed sim — PC runs Isaac Sim + PX4 SITL, Jetson runs everything else
 
-Written to `instructions/jetson_distributed_plan.md`. Summary:
+Written to `instructions/jetson_distributed_plan.md`. Jetson runs the identical software
+stack it will run on the real drone: MAVROS, commander, AnyLoc, YOLO. PC is pure
+simulation infrastructure.
 
-- **Network:** Jetson Orin NX RJ45 Gigabit Ethernet → same router as PC. `ROS_DOMAIN_ID=0`
-  on both. ROS2 DDS handles peer discovery automatically.
-- **Topics PC → Jetson:** `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl`
-- **Topics Jetson → PC:** `/anyloc/pose_estimate`, `/yolo/detections`
-- **Code change 1:** `anyloc/ros2_node.py` `_publish()` — pass `error_m` for dynamic
-  covariance `max(1, error_m²)` instead of hardcoded 20 m²
+- **Network:** Jetson Orin NX RJ45 → same router as PC. `ROS_DOMAIN_ID=0` on both.
+- **MAVLink bridge (Option A):** MAVProxy on PC connects to PX4 SITL (:14580) and
+  forwards MAVLink to Jetson (:14540). MAVROS on Jetson uses `udp://:14540@` unchanged.
+  No PX4 SITL config changes needed.
+- **Topics PC → Jetson (DDS):** `/drone/camera/image_raw`, `/drone/pose`, `/drone/agl`,
+  `/drone/state` (for Phase 1 kinematic truth VPE)
+- **No topics Jetson → PC** — MAVLink (not ROS2) carries PX4 commands via MAVProxy
+- **Code change 1:** `anyloc/ros2_node.py` `_publish()` — dynamic covariance
+  `max(1, error_m²)` instead of hardcoded 20 m²
 - **Code change 2:** `px4_commander.py` — subscribe to `/anyloc/pose_estimate` instead
-  of polling `latest_estimate.json`; Phase 1 kinematic truth VPE unchanged (local)
-- **Code change 3 (WiFi only):** compressed image transport to cut 92 Mbps → ~10 Mbps
-- **Real hardware note:** same Jetson split applies; Phase 1 VPE injection removed
-  (EKF2 uses real IMU + baro); MAVROS connects to Pixhawk via serial
+  of polling `latest_estimate.json`
+- **Code change 3:** `run.sh` — `--jetson-sim` flag: PC launches Isaac + PX4 + MAVProxy
+  (no MAVROS, no commander windows)
+- **Code change 4:** new `run_jetson.sh` — Jetson launches MAVROS + Commander + AnyLoc
+  + YOLO in tmux
+- **Real hardware:** `run_jetson.sh` passes `--real-hw` to commander (skips Phase 1 VPE);
+  MAVROS `fcu_url` changed to `/dev/ttyTHS1:921600`
 
 Files: `instructions/jetson_distributed_plan.md` (new).
 
