@@ -3,8 +3,8 @@
 ## Overview
 
 Autonomous lawnmower survey of a defined detection zone west of home. When YOLO detects a
-vehicle inside the zone, the drone diverts to centre the target in frame, logs the
-geolocation, then resumes the survey route.
+vehicle inside the zone, its ground position is computed via yaw-corrected GSD projection
+and logged to `detections.csv`. The drone never diverts — the survey route runs uninterrupted.
 
 | Parameter | Value |
 |-----------|-------|
@@ -111,7 +111,7 @@ WP09:   (629,  −1145)       north end of strip 4
 WP10:   (408,  −1250)       north end of strip W  (transition SW)
 WP11:   (113,  −1250)       south end of strip W
 
-HOME    (0, 0)              RTL / land
+HOME    (0, 0)              fly home → AUTO.LAND
 ```
 
 ### Reference lat/lon for each waypoint

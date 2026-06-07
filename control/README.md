@@ -132,7 +132,7 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 | 1 | Done | Bridge↔PX4 validated: 27k+ HIL_SENSOR frames, EKF2 level attitude |
 | 2 | Done | Vision + MAVROS↔PX4 link; EKF tracks truth |
 | 3 | Done | Position-hold gate: 3 m AGL, 40 s, <0.3 m drift |
-| 4 | Done | Waypoint nav in `px4_commander.py`: 65 m AGL, 699 m leg, RTL |
+| 4 | Done | Waypoint nav in `px4_commander.py`: 65 m AGL, 699 m leg, fly-home + AUTO.LAND |
 | 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
 | 6 | Done ✓ | End-to-end Isaac Sim waypoint flight: horiz_err < 60 m at 699 m leg |
 | 7 | In progress | AnyLoc + detection integration in full pipeline |

@@ -148,7 +148,8 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoi
 5. `go_to_ned(speed=12)` — iterate 12 survey waypoints sequentially
    - YOLO detections: yaw-corrected GSD pixel projection → dedup (30 m) → log to `detections.csv`; survey never interrupted
    - On arrival (60 m radius) or timeout: advance waypoint index
-6. RTL on survey complete or Ctrl-C
+6. Survey complete: `go_to_ned(0, 0, TAKEOFF_ALT)` fly home → `AUTO.LAND`
+   (RTL not used — requires GPS-derived home; unreliable with external vision only)
 
 **Survey constants (module level):**
 - `SURVEY_WPS` — 12 boustrophedon waypoints at 65 m AGL (see `instructions/survey_mission_plan.md`)

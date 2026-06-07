@@ -699,15 +699,20 @@ def main():
                 print(f"[PX4Cmd] WP {wp_idx+1} TIMEOUT — skipping")
             wp_idx += 1
 
-        # Survey complete — RTL
-        print("[PX4Cmd] === SURVEY COMPLETE — RTL ===")
-        cmd.set_mode("RTL")
+        # Survey complete — fly back to home, then land
+        # RTL mode requires a GPS-derived home and is unreliable with external
+        # vision only. Stay in OFFBOARD and command home explicitly instead.
+        print("[PX4Cmd] === SURVEY COMPLETE — returning home ===")
+        cmd.go_to_ned(0.0, 0.0, TAKEOFF_ALT, timeout=300.0, speed=SURVEY_SPEED)
+        print("[PX4Cmd] Over home — AUTO.LAND")
+        cmd.set_mode("AUTO.LAND")
         cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
         print("[PX4Cmd] Disarmed — landed ✓")
 
     except KeyboardInterrupt:
-        print("[PX4Cmd] Ctrl-C — RTL")
-        cmd.set_mode("RTL")
+        print("[PX4Cmd] Ctrl-C — returning home")
+        cmd.go_to_ned(0.0, 0.0, TAKEOFF_ALT, timeout=120.0, speed=SURVEY_SPEED)
+        cmd.set_mode("AUTO.LAND")
         cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
         print("[PX4Cmd] Disarmed ✓")
     except Exception as exc:

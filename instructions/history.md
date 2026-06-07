@@ -1,5 +1,105 @@
 # Project History
 
+## 2026-06-07 — live_trace.py: raw zone boundary + explicit legend
+
+Added the actual detection zone boundary (before the 30 m inward buffer) as a second
+polygon overlay to `tools/live_trace.py`.
+
+**Changes:**
+- Added `RAW_ZONE_VERTS` constant (NW/NE/SE/SW raw corners in N/E metres from home):
+  ```python
+  RAW_ZONE_VERTS = [
+      (677.0, -1240.0),  # NW
+      (531.0,  -454.0),  # NE
+      (-48.0,  -563.0),  # SE
+      ( 97.0, -1327.0),  # SW
+  ]
+  ```
+- Added solid white polygon (`fill=False, edgecolor="#ffffff", linewidth=1.5`) for the
+  raw zone boundary — drawn before the existing orange dashed buffered zone polygon.
+- Replaced auto-generated legend with an explicit `handles=` list using `Line2D` proxy
+  artists, covering both zone boundaries, planned route, actual path, home marker, and
+  detection marker. (Auto-legend lost the zone patches; proxy artists fix this.)
+- Updated docstring to list both overlays.
+
+**Live_trace top view now shows:**
+- **Solid white** = actual detection area boundary (raw corners)
+- **Orange dashed with faint fill** = 30 m inward buffered boundary (was the only boundary before)
+
+**Files changed:** `tools/live_trace.py`
+
+---
+
+## 2026-06-07 — Survey complete: RTL replaced by explicit fly-home + AUTO.LAND
+
+**Problem:** After completing all 12 survey waypoints the drone kept flying south instead
+of returning home.
+
+**Root cause:** `set_mode("RTL")` in PX4 requires a GPS-derived home position. With
+external-vision-only localisation there is no GPS home. When RTL silently fails or is
+ignored, the last active velocity setpoint (southward, toward WP11) continues to execute
+indefinitely in OFFBOARD mode.
+
+**Fix:** Stay in OFFBOARD mode and command the return explicitly:
+```python
+# Survey complete — fly back to home, then land
+cmd.go_to_ned(0.0, 0.0, TAKEOFF_ALT, timeout=300.0, speed=SURVEY_SPEED)
+cmd.set_mode("AUTO.LAND")
+cmd._spin_until(lambda: not cmd._state.armed, timeout=150.0)
+```
+Same fix applied to the `KeyboardInterrupt` handler. `go_to_ned()` continuously publishes
+position setpoints during the return, so OFFBOARD mode never drops and the drone reliably
+reaches home before switching to AUTO.LAND.
+
+**Files changed:** `control/px4_commander.py`
+
+---
+
+## 2026-06-07 — Refactor: DIVERT state machine removed; yaw-corrected pixel projection only
+
+**What changed:** The previous detection response (divert to centre the car in frame,
+then log) was replaced with a pure position-calculation approach. The drone never
+interrupts the survey route.
+
+**Removed:**
+- `SurveyState` enum (`SURVEY` / `DIVERT`)
+- `DETECT_RADIUS = 10.0` constant
+- `interruptible` parameter from `go_to_ned()`
+- `_survey_state`, `_divert_n`, `_divert_e`, `_divert_cat`, `_divert_conf` from `__init__`
+- ~80 lines of DIVERT branch in `main()` survey loop
+
+**New `_cb_detections()`** — project pixel offset to world coordinates using
+yaw-corrected GSD, apply dedup, log. No state changes, no flight interruption:
+```python
+q       = self._drone.pose.orientation
+yaw_enu = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y**2 + q.z**2))
+h    = -yaw_enu                              # NED heading (CW from north)
+dx_m =  (cx - CAM_W / 2) * gsd_x            # drone-right
+dy_m = -(cy - CAM_H / 2) * gsd_y            # drone-forward
+de   = dx_m * math.cos(h) + dy_m * math.sin(h)
+dn   = -dx_m * math.sin(h) + dy_m * math.cos(h)
+obj_n = cur_n + dn;  obj_e = cur_e + de
+```
+
+**Survey loop** simplified to sequential `wp_idx += 1` — no DIVERT branch:
+```python
+while wp_idx < len(SURVEY_WPS):
+    reached = cmd.go_to_ned(wn, we, wagl, timeout=WAYPOINT_TIMEOUT, speed=SURVEY_SPEED)
+    wp_idx += 1
+```
+
+**Why:** The divert approach required re-acquiring AnyLoc anchor at the off-route position,
+then navigating back — adding ~30 s per detection and risking position drift. Pixel
+projection gives sufficient (~30 m) accuracy for a car location log without any flight
+interruption. The 30 m `DEDUP_RADIUS` prevents re-logging from successive passes.
+
+**YOLO confidence threshold** also raised 0.30 → 0.50 in this session to reduce false
+positives from satellite imagery watermarks.
+
+**Files changed:** `control/px4_commander.py`
+
+---
+
 ## 2026-06-07 — live_trace.py: filter detections to current flight only
 
 **Problem:** `detections.csv` accumulates across flights (px4_commander.py appends,
@@ -2240,3 +2340,32 @@ right direction = (cos(h), −sin(h)). Verified at h=0 (north), h=π/2 (east), h
 | `anyloc/build_database.py` | Same imagery constants |
 | `detection/ros2_node.py` | `conf=0.50` |
 | `control/px4_commander.py` | Removed `SurveyState`/`DETECT_RADIUS`/`interruptible`; `_cb_detections` projects + logs; survey loop sequential |
+
+---
+
+## 2026-06-07 — RTL → explicit fly-home + AUTO.LAND
+
+**Symptom:** After completing all survey waypoints the drone flew south indefinitely and
+never returned to the takeoff point.
+
+**Root cause:** `set_mode("RTL")` is unreliable with external-vision-only PX4. PX4's RTL
+mode requires a GPS-derived home position. When it fails or is ignored, the drone stays
+in OFFBOARD mode executing the last published velocity setpoint — which pointed south
+(toward WP11 at N=113) — and keeps flying that direction without stopping.
+
+**Fix:** Stay in OFFBOARD mode after the survey; use `go_to_ned(0, 0, TAKEOFF_ALT)` to
+fly home under continuous setpoint control, then `set_mode("AUTO.LAND")` for the final
+descent. Same change applied to the Ctrl-C handler.
+
+```python
+# Before
+cmd.set_mode("RTL")
+
+# After
+cmd.go_to_ned(0.0, 0.0, TAKEOFF_ALT, timeout=300.0, speed=SURVEY_SPEED)
+cmd.set_mode("AUTO.LAND")
+```
+
+| File | Change |
+|------|--------|
+| `control/px4_commander.py` | Survey-complete + Ctrl-C: fly home via `go_to_ned` then `AUTO.LAND` |

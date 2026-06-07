@@ -8,7 +8,8 @@ Usage:
 
 Overlays:
   - Planned survey route (12 waypoints, 6-strip lawnmower)
-  - Buffered detection zone boundary
+  - Raw detection zone boundary (solid white)
+  - Buffered boundary 30 m inward (orange dashed)
   - Detected vehicles from detections.csv (refreshed live)
   - AGL target line at 65 m
 
@@ -59,6 +60,14 @@ SURVEY_WPS = [
     (629.0,  -1145.0),
     (408.0,  -1250.0),
     (113.0,  -1250.0),
+]
+
+# Raw detection zone boundary (actual area corners), CW: NW→NE→SE→SW
+RAW_ZONE_VERTS = [
+    (677.0, -1240.0),  # NW
+    (531.0,  -454.0),  # NE
+    (-48.0,  -563.0),  # SE
+    ( 97.0, -1327.0),  # SW
 ]
 
 # Buffered zone boundary (30 m inward), CW: NW'→NE'→SE'→SW'
@@ -150,8 +159,15 @@ for ax in (ax_top, ax_alt):
 
 # ── Top view — static elements ─────────────────────────────────────────────────
 
-# Buffered zone polygon
-_zone_xy = [(e, n) for n, e in ZONE_VERTS]   # matplotlib uses (x=east, y=north)
+# Raw detection zone boundary — solid white outline, no fill
+_raw_zone_xy = [(e, n) for n, e in RAW_ZONE_VERTS]
+raw_zone_poly = MplPolygon(_raw_zone_xy, closed=True,
+                            fill=False, edgecolor="#ffffff",
+                            linestyle="-", linewidth=1.5, zorder=1)
+ax_top.add_patch(raw_zone_poly)
+
+# Buffered zone (30 m inward) — orange dashed, faint fill
+_zone_xy = [(e, n) for n, e in ZONE_VERTS]
 zone_poly = MplPolygon(_zone_xy, closed=True,
                         fill=True, facecolor="#ff880011", edgecolor="#ff8800",
                         linestyle="--", linewidth=1.0, zorder=1)
@@ -196,7 +212,17 @@ det_scatter = ax_top.scatter([], [], s=100, marker="*", zorder=8,
 alt_line,  = ax_alt.plot([], [], color="#44ddaa", linewidth=1.5)
 time_dot,  = ax_alt.plot([], [], "o", color="#ffffff", markersize=7, zorder=5)
 
-ax_top.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=7,
+from matplotlib.lines import Line2D as _Line2D
+_legend_handles = [
+    _Line2D([0],[0], color="#ffffff",  lw=1.5, ls="-",  label="Zone boundary"),
+    _Line2D([0],[0], color="#ff8800",  lw=1.0, ls="--", label="Buffered boundary (30 m)"),
+    _Line2D([0],[0], color="#666688",  lw=0.8, ls=":",  label="Planned route"),
+    _Line2D([0],[0], color="#4488ff",  lw=1.5, ls="-",  label="Actual path"),
+    _Line2D([0],[0], marker="^", color="#aaffaa", ms=8, ls="none", label="Home"),
+    _Line2D([0],[0], marker="*", color="#ff4444", ms=10, ls="none", label="Detection"),
+]
+ax_top.legend(handles=_legend_handles,
+              facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=7,
               loc="upper right")
 ax_alt.legend(facecolor="#2a2a3e", edgecolor="#555577", labelcolor="white", fontsize=8)
 
