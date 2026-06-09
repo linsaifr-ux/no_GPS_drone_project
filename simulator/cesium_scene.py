@@ -205,7 +205,7 @@ def make_car(root_path, car_lat, car_lon, yaw_deg=0.0):
 
     Coordinate convention (local frame):
         +Y = car front,  +X = car right,  +Z = up
-        root placed at (car_x, car_y, centre_elev) so wheels touch terrain.
+        root placed at (car_x, car_y, terrain_elev_at(car_x, car_y)) so wheels touch terrain.
 
     yaw_deg: compass heading of front (0=N, 90=E, 180=S, 270=W).
     In this scene X=East, Y=North, Z=Up; front=+Y at yaw=0 → RotateZ(0) is north.
@@ -218,7 +218,7 @@ def make_car(root_path, car_lat, car_lon, yaw_deg=0.0):
         Length 4.64 m, Width 1.775 m, Height 1.45 m, Wheelbase 2.70 m
     """
     car_x, car_y = to_xy(car_lat, car_lon)
-    car_z = centre_elev   # bottom of car at terrain level
+    car_z = terrain_elev_at(car_x, car_y)  # terrain height at this car's position
 
     # ── Materials ─────────────────────────────────────────────────────────────
     P = root_path
@@ -768,8 +768,9 @@ terrain_tiles, terrain_token = fetch_terrain_tiles()
 if terrain_token is None:
     _, terrain_token, _ = fetch_ion_endpoint(CESIUM_TERRAIN_ASSET)
 
-n_terrain_tiles = 0
-centre_elev     = 0.0   # elevation at scene origin, used for camera height
+n_terrain_tiles     = 0
+centre_elev         = 0.0   # elevation at scene origin, used for camera height
+_all_terrain_verts  = []    # accumulated for per-position elevation lookup
 
 for tile_info in terrain_tiles:
     bounds = tile_info["bounds"]   # [west, south, east, north]
@@ -787,11 +788,20 @@ for tile_info in terrain_tiles:
         dists = np.hypot(verts_enu[:, 0], verts_enu[:, 1])
         centre_elev = float(verts_enu[dists.argmin(), 2])
 
+    _all_terrain_verts.append(verts_enu)
     prim_path = upath(f"/World/Terrain/T{n_terrain_tiles:04d}")
     make_terrain_mesh(prim_path, verts_enu, faces, lons, lats, sat_path)
     n_terrain_tiles += 1
 
-print(f"[TERRAIN] Loaded {n_terrain_tiles} terrain tiles")
+_terrain_verts_all = (np.vstack(_all_terrain_verts)
+                      if _all_terrain_verts else np.zeros((1, 3)))
+
+def terrain_elev_at(x, y):
+    """Terrain elevation (m MSL) at ENU (x, y) by nearest-vertex lookup."""
+    dists = np.hypot(_terrain_verts_all[:, 0] - x, _terrain_verts_all[:, 1] - y)
+    return float(_terrain_verts_all[dists.argmin(), 2])
+
+print(f"[TERRAIN] Loaded {n_terrain_tiles} terrain tiles  ({len(_terrain_verts_all)} vertices)")
 print(f"[TERRAIN] centre_elev = {centre_elev:.1f} m MSL  (use this for SITL -l and HOME_ALT_MSL)")
 
 # Write terrain elevation so run_flight.py and SITL can use the real value.

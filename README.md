@@ -373,7 +373,9 @@ python3 tools/plot_trace.py --all       # overlay all traces
 ### Target Vehicles (Isaac Sim)
 
 Three procedural sedan models (`make_car()` in `cesium_scene.py`) placed inside the
-detection zone for end-to-end survey pipeline testing:
+detection zone for end-to-end survey pipeline testing. Each car's Z position is looked
+up from the terrain mesh via `terrain_elev_at()` so wheels sit on the ground at their
+actual lat/lon rather than at home-origin elevation:
 
 | Model | NED (m) | Yaw | Strip area |
 |-------|---------|-----|------------|

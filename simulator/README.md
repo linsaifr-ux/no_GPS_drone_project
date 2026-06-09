@@ -146,6 +146,10 @@ Each model is a procedural white sedan built from USD `Cube`/`Cylinder` primitiv
 (body, cabin, hood, trunk, bumpers, windows, headlights, tail-lights, wheels, roof
 identification panel). Dimensions approximate a Toyota Altis (4.64 m × 1.775 m × 1.45 m).
 
+Car Z is set by `terrain_elev_at(car_x, car_y)` — a nearest-vertex lookup over all
+loaded terrain tile vertices — so each car sits at the true terrain elevation at its
+position rather than the home-origin elevation (`centre_elev`).
+
 The terrain cache (`cesium_terrain_cache/`) and tile cache (`cesium_tile_cache/`) are pre-downloaded — no network required at runtime.
 
 ---

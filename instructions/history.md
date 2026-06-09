@@ -1,5 +1,19 @@
 # Project History
 
+## 2026-06-09 — Fix sim cars floating above terrain
+
+**Problem:** `make_car()` placed all three cars at `centre_elev` (home-origin elevation,
+~28 m MSL) regardless of their actual lat/lon. The cars are 700–1100 m west of home
+where terrain elevation differs slightly, causing them to float visibly above the ground
+(shadow visible below the car body).
+
+**Fix:** accumulate all terrain tile vertices into `_terrain_verts_all` during the tile
+loading loop. Add `terrain_elev_at(x, y)` which finds the nearest vertex by Euclidean
+distance and returns its Z. `make_car()` now calls `terrain_elev_at(car_x, car_y)` for
+each car's root Z so wheels sit on the actual terrain surface at that position.
+
+---
+
 ## 2026-06-09 — PX4 SITL stop script + launch improvements
 
 Added `control/stop_px4_sitl.sh` so users can stop PX4 SITL without using `pkill` directly.
