@@ -1,5 +1,29 @@
 # Project History
 
+## 2026-06-09 — Imagery: Esri World Imagery → NLSC PHOTO2
+
+Switched satellite imagery back from Esri World Imagery to Taiwan NLSC PHOTO2 WMTS in
+both `simulator/cesium_scene.py` and `anyloc/build_database.py`.
+
+```python
+NLSC_TILE_URL = "https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/{z}/{y}/{x}"
+SAT_ZOOM = 18   # ~0.60 m/px effective
+```
+
+The previous Esri zoom-19 mosaic gave ~0.37 m/px but NLSC zoom-18 at ~0.60 m/px is
+sufficient and uses the authoritative Taiwan government orthophoto.
+
+**Action required after pulling:** delete `simulator/satellite_ground.jpg` so it
+re-downloads as NLSC on the next run. AnyLoc database must also be rebuilt:
+```bash
+rm simulator/satellite_ground.jpg
+conda run -n isaac_sim_test python anyloc/build_database.py --rebuild
+```
+
+**Files changed:** `simulator/cesium_scene.py`, `anyloc/build_database.py`, `README.md`.
+
+---
+
 ## 2026-06-09 — Survey route: 6-strip → 7-strip (91.7 m spacing, 33 m overlap)
 
 **Motivation:** 6-strip 110 m spacing gave only 15 m cross-track overlap between adjacent

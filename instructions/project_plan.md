@@ -23,7 +23,7 @@ no_GPS_drone_project/
 │   ├── vo_refiner.py                 # VORefiner (LK optical flow)
 │   ├── ros2_node.py                  # ROS2: sub camera/pose → pub VPE + detections
 │   ├── run_ros2_localizer.sh         # Launch script
-│   ├── test_accuracy_esri.py         # accuracy benchmark — random points, Esri imagery
+│   ├── test_accuracy_esri.py         # accuracy benchmark — random points, NLSC PHOTO2 imagery
 │   └── test_accuracy_constrained.py  # benchmark — anchor-chain constrained search vs global (no VO)
 ├── detection/
 │   ├── detector.py             # YOLODetector (auto class-map)
@@ -96,7 +96,7 @@ Isaac Sim 6.0.0 scene centred on Chiayi, Taiwan (23.4509°N, 120.2861°E).
 
 - **Terrain:** Cesium World Terrain (asset 1) — quantized-mesh-1.0, 9 tiles at level 13
 - **Buildings:** Cesium OSM Buildings (asset 96188) — B3DM, ~83 buildings
-- **Imagery:** Esri World Imagery WMTS (zoom 19, ~0.37 m/px effective); `satellite_ground.jpg` re-downloaded on first run after deletion; `MAX_TEX=16384`
+- **Imagery:** Taiwan NLSC PHOTO2 WMTS (zoom 18, ~0.60 m/px effective); `satellite_ground.jpg` re-downloaded on first run after deletion; `MAX_TEX=16384`
 - **Physics thread (100 Hz):** `_run_physics()` — kinematic 6-DOF model + `SITLBridge`; publishes `/drone/state`; rate decoupled from render loop
 - **Render loop (~13 Hz):** reads shared kinematic state under lock; updates `/World/Drone` mesh position/orientation; captures nadir camera frames
 - **Motor layout:** ArduCopter X-frame ch1=FR(NE), ch2=RL(SW), ch3=RR(SE), ch4=FL(NW)
@@ -124,7 +124,7 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 **Status:** Working — AnyLoc + VO; ~2,820-entry database (65 m AGL only — single layer matching mission cruise altitude); ~15–20 m anchor error
 
 **Database build** (`anyloc/build_database.py`) — self-contained, no Isaac Sim required:
-- Downloads Esri World Imagery tiles (zoom 19) automatically if `satellite_ground.jpg` missing
+- Downloads NLSC PHOTO2 tiles (zoom 18) automatically if `satellite_ground.jpg` missing
 - Single AGL: `--agl-min 65 --agl-max 65` (1 level × ~2820 positions); was 13 levels × 36,673 entries
 - 3-pass memory-safe: crop→disk, sample 2000 for codebook, batch VLADs (peak ~4.5 GB RAM)
 - `db_meta.json` cache: Pass 1 skipped on subsequent `--rebuild` runs

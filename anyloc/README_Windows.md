@@ -134,10 +134,10 @@ This runs inference only — no ROS2 or MAVROS2 needed.
 
 ---
 
-## 5. Accuracy Benchmark (Esri World Imagery)
+## 5. Accuracy Benchmark (NLSC PHOTO2)
 
 `test_accuracy_esri.py` measures localizer accuracy against known ground-truth
-coordinates. It fetches **Esri World Imagery** tiles (no API key required),
+coordinates. It fetches **NLSC PHOTO2** tiles (no API key required),
 feeds each image to AnyLoc, and reports the Euclidean error in metres between
 the true and estimated position.
 
@@ -264,7 +264,7 @@ roughly 1–2 km.
 
 #### Per-step execution
 
-For each trajectory step both modes run on the **same Esri image**:
+For each trajectory step both modes run on the **same NLSC image**:
 
 | | Global search | Constrained search |
 |---|---|---|

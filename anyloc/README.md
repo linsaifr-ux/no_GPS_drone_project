@@ -19,7 +19,7 @@ In the full pipeline, AnyLoc provides Phase 2 VPE (visual position estimates) wh
 | NumPy | ≥ 1.24 | |
 | faiss-cpu | ≥ 1.7 | Install via conda-forge |
 | OpenCV (cv2) | ≥ 4.7 | Pre-installed by Isaac Sim |
-| requests | any | For Esri tile download |
+| requests | any | For NLSC tile download |
 | ROS2 Jazzy | — | Required for `ros2_node.py` |
 | MAVROS2 | — | Required for VPE publishing |
 
@@ -41,7 +41,7 @@ conda install -n isaac_sim_test -c conda-forge faiss-cpu -y
 
 ## 2. Build the Image Database
 
-Build once before running the localizer. Downloads Esri World Imagery tiles (zoom 19) and encodes them as VLAD vectors.
+Build once before running the localizer. Downloads NLSC PHOTO2 tiles (zoom 18) and encodes them as VLAD vectors.
 
 Run from the **project root**:
 
@@ -61,7 +61,7 @@ conda run -n isaac_sim_test python anyloc/build_database.py
 
 ### What the build does
 
-1. Downloads Esri World Imagery tiles at zoom 19 and stitches them into a mosaic (~0.37 m/px effective after MAX_TEX=16384 cap)
+1. Downloads NLSC PHOTO2 tiles at zoom 18 and stitches them into a mosaic (~0.60 m/px effective after MAX_TEX=16384 cap)
 2. Crops satellite patches for each (lat, lon, AGL) grid point simulating a nadir drone camera
 3. Encodes each crop with DINOv2 ViT-B/14 (~400 MB download on first run)
 4. Clusters patch descriptors into a VLAD codebook (k=64) with FAISS k-means
@@ -93,9 +93,9 @@ conda run -n isaac_sim_test python anyloc/run_localizer.py
 
 ---
 
-## 4. Accuracy Benchmark (Esri World Imagery)
+## 4. Accuracy Benchmark (NLSC PHOTO2)
 
-Measures localizer accuracy at known ground-truth coordinates using Esri imagery.
+Measures localizer accuracy at known ground-truth coordinates using NLSC imagery.
 
 ```bash
 conda run -n isaac_sim_test python anyloc/test_accuracy_esri.py
@@ -207,7 +207,7 @@ The covariance difference lets PX4's EKF2 automatically weight the two sources: 
 → DINOv2 runs on CPU by default. GPU: ensure PyTorch+CUDA is installed.
 
 **Database build fails on tile download**  
-→ Check connectivity to `server.arcgisonline.com` (Esri). Script retries 3× per tile; persists on failure.
+→ Check connectivity to `wmts.nlsc.gov.tw` (NLSC). Script retries 3× per tile; persists on failure.
 
 **`latest_estimate.json` not updating**  
 → The node only publishes when AGL ≥ 50 m. The file is written as a stub at startup; the VPE guard requires the altitude threshold to be satisfied.

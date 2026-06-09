@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build AnyLoc geo-tagged image database from Esri World Imagery satellite orthophoto.
+Build AnyLoc geo-tagged image database from NLSC PHOTO2 satellite orthophoto.
 
 Creates anyloc/database/ with:
   database.pt    — torch save: lats, lons, alts, vlads (N×D), codebook (k×768)
@@ -36,7 +36,7 @@ CENTER_LON = 120.286135
 RADIUS_M   = 2000.0
 R_EARTH    = 6_371_000.0
 COS_LAT    = math.cos(math.radians(CENTER_LAT))
-SAT_ZOOM   = 19   # ~0.37 m/px effective after MAX_TEX=16384 downsample
+SAT_ZOOM   = 18   # ~0.60 m/px effective after MAX_TEX=16384 downsample
 
 # Drone camera: AP-IMX900-Mini-USB3-I5, EFL 3.1 mm, 113.1°(D)×88°(H)×65.1°(V)
 # GSD ≈ 75 mm/px @ 80 m AGL
@@ -57,13 +57,12 @@ def to_latlon(x_enu, y_enu):
     return lat, lon
 
 
-# ── Esri World Imagery tile download ─────────────────────────────────────────
-# No API key required. No watermarks — safe for YOLO training/inference.
-ESRI_TILE_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services"
-                 "/World_Imagery/MapServer/tile/{z}/{y}/{x}")
+# ── NLSC PHOTO2 tile download ─────────────────────────────────────────────────
+# Taiwan NLSC WMTS — free, no API key required.
+NLSC_TILE_URL = "https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/{z}/{y}/{x}"
 
 def fetch_satellite(sat_path, margin_factor=1.5):
-    """Download Esri World Imagery tiles and stitch to sat_path."""
+    """Download NLSC PHOTO2 tiles and stitch to sat_path."""
     d_lat = RADIUS_M * margin_factor / 111_320.0
     d_lon = RADIUS_M * margin_factor / (111_320.0 * COS_LAT)
     tx_min, ty_min = _deg2tile(CENTER_LAT + d_lat, CENTER_LON - d_lon, SAT_ZOOM)
@@ -74,14 +73,14 @@ def fetch_satellite(sat_path, margin_factor=1.5):
     TILE = 256
     mosaic = Image.new("RGB", (nx * TILE, ny * TILE))
 
-    print(f"[DB] Downloading {nx}×{ny} Esri World Imagery tiles at zoom {SAT_ZOOM} …")
+    print(f"[DB] Downloading {nx}×{ny} NLSC PHOTO2 tiles at zoom {SAT_ZOOM} …")
     sess = requests.Session()
     sess.headers.update({"User-Agent": "AnyLocDB/1.0"})
     total = nx * ny
     done  = 0
     for tx in range(tx_min, tx_max + 1):
         for ty in range(ty_min, ty_max + 1):
-            url = ESRI_TILE_URL.format(z=SAT_ZOOM, y=ty, x=tx)
+            url = NLSC_TILE_URL.format(z=SAT_ZOOM, y=ty, x=tx)
             for attempt in range(3):
                 try:
                     r = sess.get(url, timeout=15)

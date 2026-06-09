@@ -368,7 +368,7 @@ python3 tools/plot_trace.py --all       # overlay all traces
 |-------|--------|---------|
 | Terrain | Cesium World Terrain (asset 1) | © Cesium ion |
 | Buildings | Cesium OSM Buildings (asset 96188) | © OpenStreetMap (ODbL) |
-| Satellite imagery (sim + database build) | Esri World Imagery (zoom 19, ~0.37 m/px) | © Esri / contributors |
+| Satellite imagery (sim + database build) | Taiwan NLSC PHOTO2 (zoom 18, ~0.60 m/px) | © 內政部國土測繪中心 (NLSC) |
 
 ### Target Vehicles (Isaac Sim)
 
