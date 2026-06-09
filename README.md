@@ -168,6 +168,12 @@ bash run.sh --tmux --px4 --no-window --anyloc --detection
 tmux windows: **0 Isaac** · **1 PX4** · **2 MAVROS** · **3 Commander** · **4 AnyLoc** · **5 Detection**  
 Switch with `Ctrl-B 0–5`. The commander prints `[PX4Cmd]` progress to window 3.
 
+**Live flight viewer** (open in a separate terminal before or during the flight):
+```bash
+python3 tools/live_trace.py
+```
+Overlays the survey route, zone boundary, sim car positions, and YOLO detections in real time.
+
 > **AnyLoc startup:** the database is now ~2,820 entries (AGL 65 m only). Load time is much shorter than the old 36,673-entry database.
 
 ### Run — distributed (PC = sim only, Jetson = everything that runs on real drone)
