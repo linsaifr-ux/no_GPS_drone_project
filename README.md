@@ -41,7 +41,7 @@ DINOv2+VLAD localisation  YOLOv8 detection
  ── PX4 path (active) ─────────────────────────────────────────────────
  PX4 SITL (TCP 4560 HIL) → UDP 14540/14580 → MAVROS2
  /mavros/vision_pose/pose_cov → EKF2 (EV_CTRL=15)
- px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→5-strip E-W survey 12m/s→fly home→AUTO.LAND
+ px4_commander.py: stream setpoints→OFFBOARD→arm→climb 65m→6-strip E-W survey 12m/s→fly home→AUTO.LAND
 ```
 
 **Headless fallback:** `control/drone_sim.py` provides the same kinematic bridge without Isaac Sim — used for fast control-loop testing. Not used when Isaac Sim runs.
@@ -60,11 +60,12 @@ no_GPS_drone_project/
 │   ├── drone_sim.py              # headless physics rig (PX4_SIM=0/1)
 │   ├── px4_sim_bridge.py         # PX4 HIL bridge (TCP 4560, pymavlink)
 │   ├── sitl_bridge.py            # ArduPilot SIM_JSON bridge (UDP 9002)
-│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→5-strip E-W 12m/s lawnmower; YOLO logs via yaw-corrected pixel projection→fly home→AUTO.LAND
+│   ├── px4_commander.py          # PX4 survey: OFFBOARD→65m→6-strip E-W 12m/s lawnmower; YOLO logs via yaw-corrected pixel projection→fly home→AUTO.LAND
 │   ├── flight_commander.py       # ArduPilot mission (reference; WP nav unsolved)
 │   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
 │   ├── no_gps.parm               # ArduPilot: EK3 ExternalNav, GPS off
-│   ├── launch_px4_sitl.sh        # start PX4 SITL (waits for TCP 4560 then UDP 14580)
+│   ├── launch_px4_sitl.sh        # start PX4 SITL; saves PID → /tmp/px4_sitl.pid; overwrites /tmp/px4_sitl.log
+│   ├── stop_px4_sitl.sh          # stop PX4 SITL (MAVLink shutdown → SIGTERM → SIGKILL)
 │   ├── launch_mavros_px4.sh      # MAVROS2 → PX4 (UDP 14540)
 │   ├── launch_commander_px4.sh   # run px4_commander.py
 │   ├── apply_px4_params.sh       # set + save PX4 params, auto-reboot
@@ -110,7 +111,7 @@ no_GPS_drone_project/
 | PX4-6 | End-to-end Isaac Sim waypoint flight (65 m AGL, 699 m leg, horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection integration in PX4 pipeline | In progress |
 | PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO log-in-flight (no divert) | Done ✓ |
+| PX4-9 | Survey commander: 12 m/s, 6-strip E-W lawnmower (120m spacing), YOLO log-in-flight (no divert) | Done ✓ |
 | PX4-10 | Jetson distributed sim (Jetson = commander+AnyLoc+YOLO; PC = Isaac+PX4) | TODO |
 | 8 | Deploy to real hardware | TODO |
 
@@ -222,6 +223,16 @@ python3 control/px4_commander.py
 
 </details>
 
+### Stop PX4 SITL after mission
+
+PX4 is launched with `setsid nohup` and survives terminal/tmux-window close. After the mission lands, stop it with:
+
+```bash
+bash control/stop_px4_sitl.sh
+```
+
+Tries (in order): MAVLink `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` (if MAVROS is up) → SIGTERM to saved PID → pkill SIGTERM → SIGKILL.
+
 ### Hold-gate test only (Phase 3 regression check)
 
 ```bash
@@ -332,9 +343,9 @@ python3 tools/live_trace.py              # auto-attach to latest trace
 DISPLAY=:2 python3 tools/live_trace.py  # headless display
 ```
 
-Overlays: planned 5-strip E-W survey route, raw zone boundary (solid white), buffered zone
-boundary 30 m inward (orange dashed), detection markers from `detections.csv` (refreshed
-live, filtered to current flight only), 65 m AGL target line.
+Overlays: planned 6-strip E-W survey route, raw zone boundary (solid white), buffered zone
+boundary 30 m inward (orange dashed), sim car positions (yellow squares), detection markers
+from `detections.csv` (refreshed live, filtered to current flight only), 65 m AGL target line.
 Status bar shows nearest WP name + distance and running detection count.
 
 **Post-flight plot** (saves `simulator/flight_traces/trace_plot.png`):
@@ -360,6 +371,6 @@ detection zone for end-to-end survey pipeline testing:
 
 | Model | NED (m) | Yaw | Strip area |
 |-------|---------|-----|------------|
-| `/World/Car_01` | N+350 E−700 | 45° NE | Strip 1 |
-| `/World/Car_02` | N+150 E−900 | 270° W | Strip 2 |
+| `/World/Car_01` | N+350 E−700 | 45° NE | Strip 3 |
+| `/World/Car_02` | N+150 E−900 | 270° W | Strip 1 |
 | `/World/Car_03` | N+450 E−1100 | 135° SE | Strip 4 |

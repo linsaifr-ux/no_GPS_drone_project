@@ -47,18 +47,20 @@ TARGET_AGL = 65.0
 WP_RADIUS  = 60.0
 
 # (north_m, east_m) — mirror of SURVEY_WPS in px4_commander.py
-# 5-strip E-W boustrophedon; 150 m N-S spacing; enter from east, S→N.
+# 6-strip E-W boustrophedon; 110 m N-S spacing; enter from east, S→N.
 SURVEY_WPS = [
     (60.0,    -573.0),   # ENTRY: E end strip S
     (60.0,    -972.0),   # WP01 : W end strip S
-    (210.0,  -1280.0),   # WP02 : W end strip 1
-    (210.0,   -545.0),   # WP03 : E end strip 1
-    (360.0,   -517.0),   # WP04 : E end strip 2
-    (360.0,  -1257.0),   # WP05 : W end strip 2
-    (510.0,  -1235.0),   # WP06 : W end strip 3
-    (510.0,   -505.0),   # WP07 : E end strip 3
-    (580.0,   -882.0),   # WP08 : E end strip N
-    (580.0,  -1224.0),   # WP09 : W end strip N
+    (170.0,  -1286.0),   # WP02 : W end strip 1
+    (170.0,   -553.0),   # WP03 : E end strip 1
+    (280.0,   -532.0),   # WP04 : E end strip 2
+    (280.0,  -1269.0),   # WP05 : W end strip 2
+    (390.0,  -1253.0),   # WP06 : W end strip 3
+    (390.0,   -511.0),   # WP07 : E end strip 3
+    (500.0,   -490.0),   # WP08 : E end strip 4
+    (500.0,  -1236.0),   # WP09 : W end strip 4
+    (610.0,  -1220.0),   # WP10 : W end strip N
+    (610.0,  -1043.0),   # WP11 : E end strip N
 ]
 
 # Raw detection zone boundary (actual area corners), CW: NW→NE→SE→SW
@@ -185,6 +187,18 @@ for idx, (wn, we) in enumerate(SURVEY_WPS):
     ax_top.annotate(label, (we, wn), textcoords="offset points", xytext=(4, 2),
                     color="#8888bb", fontsize=6, zorder=3)
 
+# Simulator target cars (from cesium_scene.py make_car calls)
+_SIM_CARS = [
+    (-701.0,  350.0, "Car_01"),
+    (-902.0,  150.0, "Car_02"),
+    (-1102.0, 451.0, "Car_03"),
+]
+for ce, cn, clabel in _SIM_CARS:
+    ax_top.plot(ce, cn, "s", color="#ffe066", markersize=8, zorder=4,
+                markeredgecolor="#cc9900", markeredgewidth=0.8)
+    ax_top.annotate(clabel, (ce, cn), textcoords="offset points", xytext=(5, 3),
+                    color="#ffe066", fontsize=7, zorder=4)
+
 # Home
 ax_top.plot(0, 0, "^", color="#aaffaa", markersize=9, zorder=4, label="Home")
 
@@ -218,6 +232,8 @@ _legend_handles = [
     _Line2D([0],[0], color="#666688",  lw=0.8, ls=":",  label="Planned route"),
     _Line2D([0],[0], color="#4488ff",  lw=1.5, ls="-",  label="Actual path"),
     _Line2D([0],[0], marker="^", color="#aaffaa", ms=8, ls="none", label="Home"),
+    _Line2D([0],[0], marker="s", color="#ffe066", ms=8, ls="none",
+            markeredgecolor="#cc9900", label="Sim car"),
     _Line2D([0],[0], marker="*", color="#ff4444", ms=10, ls="none", label="Detection"),
 ]
 ax_top.legend(handles=_legend_handles,

@@ -70,8 +70,9 @@ conda run -n isaac_sim_test --no-capture-output python3 detection/ros2_node.py
 | Publish | `/yolo/detections` | `vision_msgs/Detection2DArray` | bounding boxes + class + confidence |
 
 **Survey mission integration:** `px4_commander.py` subscribes to `/yolo/detections` and on
-vehicle detection inside the survey zone flies to centre the target in frame, then appends
-to `detections.csv` (timestamp, category, confidence, lat, lon, agl_m). No changes to this
+vehicle detection projects the bounding-box centre to world coordinates via yaw-corrected
+GSD, deduplicates within 30 m, and appends to `detections.csv` (timestamp, category,
+confidence, lat, lon, agl_m). The survey route is never interrupted. No changes to this
 node are required — it publishes detections and the commander handles the response.
 
 ### Detection2D fields

@@ -44,7 +44,7 @@ Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop i
 - Vision injection: 20 Hz `PoseWithCovarianceStamped` to `/mavros/vision_pose/pose_cov` + velocity to `/mavros/vision_speed/speed_twist`
 - Two-phase VPE: Phase 1 (AGL < 50 m) = kinematic truth, cov=0.1 m²; Phase 2 (≥ 50 m) = AnyLoc `latest_estimate.json`, cov = max(1, err_m²)
 - VPE heading: ENU yaw = π/2 (North) in **both** phases. `/drone/pose` encodes `−_kyaw_rad` not `π/2−_kyaw_rad`, so `yaw_deg=0` in the JSON maps to East, not North. Since the drone never yaws, π/2 is always correct and avoids a 90° EKF2 heading jump at the Phase 1→2 transition.
-- **Survey mission:** climb 65 m → 5-strip E-W lawnmower at 12 m/s / 150 m N-S spacing (~8.2 min, ~5.9 km); strips run east-west (long axis), enter from east, boustrophedon S→N; YOLO vehicle detection → yaw-corrected GSD pixel projection → log to `detections.csv` (timestamp, category, confidence, lat, lon, agl_m). No divert — survey continues unbroken. Dedup: `_logged_positions` list; detections within 30 m of an already-logged entry are discarded.
+- **Survey mission:** climb 65 m → 6-strip E-W lawnmower at 12 m/s / 110 m N-S spacing (~8.5 min, ~6.1 km); strips run east-west (long axis), enter from east, boustrophedon S→N; 110 m uniform spacing < 125 m swath → 15 m overlap, zero coverage gaps; YOLO vehicle detection → yaw-corrected GSD pixel projection → log to `detections.csv` (timestamp, category, confidence, lat, lon, agl_m). No divert — survey continues unbroken. Dedup: `_logged_positions` list; detections within 30 m of an already-logged entry are discarded.
 - See `instructions/survey_mission_plan.md` for zone geometry, strip table, and waypoint list.
 - `HOLDTEST=1`: 3 m hold gate (Phase 3 regression test)
 - `TAKEOFF_ALT=<m>`: override cruise altitude (default 65 m)
@@ -70,7 +70,8 @@ Publishes `/drone/state` (ENU PoseStamped, 100 Hz). Used for fast control-loop i
 
 | Script | Purpose |
 |--------|---------|
-| `launch_px4_sitl.sh` | Start PX4 SITL (checks TCP 4560, waits for UDP 14580) |
+| `launch_px4_sitl.sh` | Start PX4 SITL (checks TCP 4560, waits for UDP 14580); saves PID to `/tmp/px4_sitl.pid`; overwrites `/tmp/px4_sitl.log` on each launch |
+| `stop_px4_sitl.sh` | Stop PX4 SITL gracefully — tries MAVLink shutdown → SIGTERM (saved PID) → pkill SIGTERM → SIGKILL |
 | `apply_px4_params.sh` | Set + save PX4 params, auto-reboot PX4 |
 | `launch_mavros_px4.sh` | MAVROS2 → PX4 (`fcu_url udp://:14540@127.0.0.1:14580`) |
 | `launch_commander_px4.sh` | Run `px4_commander.py` (sources ROS2) |
@@ -94,7 +95,7 @@ PX4_SIM=1 python3 control/drone_sim.py          # headless
 # or:  bash simulator/run_chiayi.sh --px4       # Isaac Sim
 
 # 2. PX4 SITL
-bash control/launch_px4_sitl.sh [--wipe]        # --wipe deletes parameters.bson
+bash control/launch_px4_sitl.sh [--wipe]        # --wipe deletes parameters.bson; log overwrites /tmp/px4_sitl.log; PID → /tmp/px4_sitl.pid
 
 # 3. Apply params (first run only — persists)
 bash control/apply_px4_params.sh
@@ -113,6 +114,16 @@ Or use the top-level launcher:
 bash run.sh --tmux --px4              # full Isaac Sim pipeline
 bash run.sh --tmux --px4 --params     # + apply params (first run)
 ```
+
+### Stopping PX4 SITL
+
+PX4 is launched with `setsid nohup` and survives terminal/tmux-window close. To stop it after the mission:
+
+```bash
+bash control/stop_px4_sitl.sh
+```
+
+The script tries (in order): MAVLink `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` (if MAVROS is up) → SIGTERM to `/tmp/px4_sitl.pid` → pkill SIGTERM → SIGKILL.
 
 ### Hard-won PX4 notes
 
@@ -136,7 +147,7 @@ bash run.sh --tmux --px4 --params     # + apply params (first run)
 | 5 | Done | Isaac Sim pipeline wired (`run_chiayi.sh --px4`, `run.sh --tmux --px4`) |
 | 6 | Done ✓ | End-to-end Isaac Sim waypoint flight: horiz_err < 60 m at 699 m leg |
 | 7 | In progress | AnyLoc + detection integration in full pipeline |
-| 8 | Done ✓ | Survey mission: 5-strip E-W lawnmower at 12 m/s + YOLO log-in-flight (no divert) |
+| 8 | Done ✓ | Survey mission: 6-strip E-W lawnmower 110 m uniform spacing + YOLO log-in-flight (no divert) |
 
 ---
 

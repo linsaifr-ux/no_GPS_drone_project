@@ -138,8 +138,8 @@ end-to-end testing of the survey detection pipeline:
 
 | Prim | NED north (m) | NED east (m) | Yaw | Strip area |
 |------|--------------|-------------|-----|------------|
-| `/World/Car_01` | +350 | −700 | 45° (NE) | Strip 1 |
-| `/World/Car_02` | +150 | −900 | 270° (W) | Strip 2 |
+| `/World/Car_01` | +350 | −700 | 45° (NE) | Strip 3 |
+| `/World/Car_02` | +150 | −900 | 270° (W) | Strip 1 |
 | `/World/Car_03` | +450 | −1100 | 135° (SE) | Strip 4 |
 
 Each model is a procedural white sedan built from USD `Cube`/`Cylinder` primitives

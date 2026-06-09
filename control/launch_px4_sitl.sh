@@ -43,9 +43,10 @@ cd "$PX4_ROOTFS" || { echo "[PX4SITL] ERROR: rootfs not found: $PX4_ROOTFS"; exi
 
 # setsid + nohup: new session (survives terminal close) + ignore SIGHUP.
 # NO -d flag: keeps working-dir=rootfs so px4-param IPC socket is resolvable.
-setsid nohup env PX4_SYS_AUTOSTART=10016 "$PX4_BIN" >> "$PX4_LOG" 2>&1 &
+setsid nohup env PX4_SYS_AUTOSTART=10016 "$PX4_BIN" > "$PX4_LOG" 2>&1 &
 PX4_PID=$!
-echo "[PX4SITL] PX4 PID=$PX4_PID"
+echo $PX4_PID > /tmp/px4_sitl.pid
+echo "[PX4SITL] PX4 PID=$PX4_PID  (saved to /tmp/px4_sitl.pid)"
 
 # Wait for simulator_mavlink to connect (TCP 4560 handshake) and UDP 14580 to bind
 echo "[PX4SITL] Waiting for PX4 startup (up to 20 s)..."

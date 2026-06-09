@@ -1,5 +1,98 @@
 # Project History
 
+## 2026-06-09 — PX4 SITL stop script + launch improvements
+
+Added `control/stop_px4_sitl.sh` so users can stop PX4 SITL without using `pkill` directly.
+Two improvements to `control/launch_px4_sitl.sh`:
+
+- **PID file:** saves the PX4 process PID to `/tmp/px4_sitl.pid` on every launch, so the stop script can target it precisely.
+- **Log overwrite:** changed `>>` to `>` so `/tmp/px4_sitl.log` is overwritten fresh on each launch instead of accumulating across sessions.
+
+`stop_px4_sitl.sh` stop sequence:
+1. MAVLink `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` via MAVROS (graceful — if MAVROS is up)
+2. SIGTERM to `/tmp/px4_sitl.pid`
+3. pkill SIGTERM fallback
+4. SIGKILL if still alive
+
+Usage: `bash control/stop_px4_sitl.sh`
+
+---
+
+## 2026-06-08 — Sim car positions added to live_trace.py overlay
+
+Three static yellow square markers (■) now appear in `tools/live_trace.py` at the
+simulator car positions, with Car_01/02/03 labels and a "Sim car" legend entry.
+
+| Marker | NED (m) | Strip area |
+|--------|---------|------------|
+| Car_01 | N+350 E−700 | Strip 2 (N=300) |
+| Car_02 | N+150 E−900 | Strip 1 (N=180) |
+| Car_03 | N+450 E−1100 | Strip 3 (N=420) |
+
+Markers are drawn once at startup alongside the zone boundary and route — not
+refreshed each frame. Added to `_legend_handles` as `_Line2D` with marker `"s"`,
+color `#ffe066`.
+
+---
+
+## 2026-06-08 — Strip spacing equalized to 110 m (was 120 m with unequal last gap)
+
+**Problem:** the 6-strip 120 m spacing plan placed strip N at N=600, only 60 m above
+strip 4 at N=540 — half the intended spacing. The zone's northern boundary (N=642)
+prevents placing the 6th strip at N=660 (120 m above strip 4).
+
+**Fix:** recompute uniform spacing to fit 6 strips within the zone:
+- Zone span N=−13 to N=642 (655 m)
+- Desired: first swath covers zone south boundary, last swath covers zone north boundary
+- Strip S stays at N=60 (clips to SE boundary); strip N at N=610 (swath reaches 672, clips to 642)
+- Uniform gap: (610−60)/5 = **110 m** between all consecutive strips
+
+| Strip | N (m) | E east | E west | Width |
+|-------|-------|--------|--------|-------|
+| S |  60 | −573  | −972  | 399 m (partial SE) |
+| 1 | 170 | −553  | −1286 | 733 m (full) |
+| 2 | 280 | −532  | −1269 | 737 m (full) |
+| 3 | 390 | −511  | −1253 | 742 m (full) |
+| 4 | 500 | −490  | −1236 | 746 m (full) |
+| N | 610 | −1043 | −1220 | 177 m (partial NW) |
+
+Strip overlap: 125 m swath − 110 m spacing = **15 m** between every consecutive pair.
+~6.1 km / ~8.5 min. Files changed: `control/px4_commander.py`, `tools/live_trace.py`.
+
+---
+
+## 2026-06-08 — Survey route: 5 E-W strips → 6 E-W strips (120 m spacing)
+
+**Motivation:** 150 m strip spacing left a 25 m gap between consecutive 125 m
+swaths. Reducing to 120 m spacing gives a 5 m overlap — zero coverage gaps across
+the entire detection zone.
+
+**Old route (5 strips, 150 m spacing):**
+- Strips at N = 60, 210, 360, 510, 580 m; 10 waypoints; ~5.9 km; ~8.2 min
+
+**New route (6 strips, 120 m spacing):**
+- Strips at N = 60, 180, 300, 420, 540, 600 m; 12 waypoints; ~6.0 km; ~8.3 min
+
+| Strip | N (m) | E west | E east | Direction | Length |
+|-------|-------|--------|--------|-----------|--------|
+| S  |  60 | −972  | −573  | E→W | 399 m (partial SE) |
+| 1  | 180 | −1284 | −551  | W→E | 733 m (full) |
+| 2  | 300 | −1266 | −528  | E→W | 738 m (full) |
+| 3  | 420 | −1248 | −505  | W→E | 743 m (full) |
+| 4  | 540 | −1230 | −667  | E→W | 563 m (partial, NE corner) |
+| N  | 600 | −1221 | −989  | W→E | 232 m (partial NW) |
+
+Strip 4's east limit retreats to −667 (not the polygon eastern edge) because at
+N>507 the eastern polygon boundary is the northern edge running NW, which pushes
+the clipped E limit westward.
+
+**Car strip assignments updated** (with 120 m spacing):
+Car_01 (N=350) → Strip 2; Car_02 (N=150) → Strip 1; Car_03 (N=450) → Strip 3.
+
+**Files changed:** `control/px4_commander.py`, `tools/live_trace.py`
+
+---
+
 ## 2026-06-07 — Survey route changed from N-S strips to E-W strips
 
 **Motivation:** The detection zone is ~873 m E-W × 655 m N-S. Flying E-W strips

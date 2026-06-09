@@ -11,10 +11,10 @@ and logged to `detections.csv`. The drone never diverts — the survey route run
 | Cruise AGL | 65 m |
 | Cruise speed | 12 m/s |
 | Strip orientation | E-W (long axis of zone) |
-| Strip spacing | 150 m N-S |
-| Strips | 5 (3 full + 2 partial edge strips) |
-| Total distance | ≈ 5.9 km |
-| Estimated flight time | ≈ 8.2 min |
+| Strip spacing | 110 m N-S |
+| Strips | 6 (4 full + 2 partial edge strips) |
+| Total distance | ≈ 6.1 km |
+| Estimated flight time | ≈ 8.5 min |
 | AnyLoc error | ~20 m → 30 m inward buffer |
 | Camera footprint at 65 m | 125 m × 83 m (HFOV 88°, VFOV 65.1°) |
 | Cross-track swath (N-S, ⊥ to flight) | 125 m → 25 m gap between strips |
@@ -71,8 +71,8 @@ Polygon edges (CW):
 
 - Strips run E-W (long axis of zone, ~730 m) rather than N-S (~540 m), reducing
   the number of strips and simplifying transitions.
-- N-S spacing 150 m, cross-track swath 125 m → 25 m gap between strips.
-- 5 strips cover the buffered zone N-S extent (655 m).
+- N-S spacing 110 m, cross-track swath 125 m → 15 m overlap between strips (no gaps).
+- 6 strips with uniform 110 m spacing cover the buffered zone N-S extent (655 m) fully.
 - At 12 m/s + 5 fps the drone advances 2.4 m between frames — unchanged.
 - 12 m/s is within PX4's default `MPC_XY_VEL_MAX` (12 m/s).
 - Enter from east side (closest to home); boustrophedon S→N.
@@ -84,10 +84,11 @@ East limits at each strip N position clipped to the buffered polygon edges.
 | Strip | North (m) | E west (m) | E east (m) | Direction | Length |
 |-------|-----------|------------|------------|-----------|--------|
 | S  |  60  | −972  | −573  | E→W | 399 m — partial (SE boundary) |
-| 1  | 210  | −1280 | −545  | W→E | 735 m — full |
-| 2  | 360  | −1257 | −517  | E→W | 740 m — full |
-| 3  | 510  | −1235 | −505  | W→E | 730 m — full |
-| N  | 580  | −1224 | −882  | E→W | 342 m — partial (NW corner) |
+| 1  | 170  | −1286 | −553  | W→E | 733 m — full |
+| 2  | 280  | −1269 | −532  | E→W | 737 m — full |
+| 3  | 390  | −1253 | −511  | W→E | 742 m — full |
+| 4  | 500  | −1236 | −490  | E→W | 746 m — full |
+| N  | 610  | −1220 | −1043 | W→E | 177 m — partial (NW corner) |
 
 ---
 
@@ -98,16 +99,18 @@ All coordinates: `(north_m, east_m, 65.0)` — relative to home, metres.
 ```
 HOME    (0, 0)               takeoff to 65 m AGL, fly at 12 m/s
 
-ENTRY:  (60,   −573)         E end strip S                    → fly W
-WP01:   (60,   −972)         W end strip S
-WP02:   (210, −1280)         W end strip 1  (transition NW)  → fly E
-WP03:   (210,  −545)         E end strip 1
-WP04:   (360,  −517)         E end strip 2  (transition N)   → fly W
-WP05:   (360, −1257)         W end strip 2
-WP06:   (510, −1235)         W end strip 3  (transition N)   → fly E
-WP07:   (510,  −505)         E end strip 3
-WP08:   (580,  −882)         E end strip N  (transition NW)  → fly W
-WP09:   (580, −1224)         W end strip N
+ENTRY:  (60,    −573)        E end strip S                    → fly W
+WP01:   (60,    −972)        W end strip S
+WP02:   (170,  −1286)        W end strip 1  (transition NW)  → fly E
+WP03:   (170,   −553)        E end strip 1
+WP04:   (280,   −532)        E end strip 2  (transition N)   → fly W
+WP05:   (280,  −1269)        W end strip 2
+WP06:   (390,  −1253)        W end strip 3  (transition N)   → fly E
+WP07:   (390,   −511)        E end strip 3
+WP08:   (500,   −490)        E end strip 4  (transition N)   → fly W
+WP09:   (500,  −1236)        W end strip 4
+WP10:   (610,  −1220)        W end strip N  (transition N)   → fly E
+WP11:   (610,  −1043)        E end strip N
 
 HOME    (0, 0)               fly home → AUTO.LAND
 ```
@@ -118,16 +121,18 @@ lat = 23.450868 + N/111320;  lon = 120.286135 + E/(111320 × 0.9175)
 
 | WP | North (m) | East (m) | Lat | Lon |
 |----|-----------|----------|-----|-----|
-| ENTRY |  60 | −573  | 23.451407 | 120.280528 |
-| WP01  |  60 | −972  | 23.451407 | 120.276620 |
-| WP02  | 210 | −1280 | 23.452755 | 120.273608 |
-| WP03  | 210 | −545  | 23.452755 | 120.280799 |
-| WP04  | 360 | −517  | 23.454103 | 120.281073 |
-| WP05  | 360 | −1257 | 23.454103 | 120.273902 |
-| WP06  | 510 | −1235 | 23.455451 | 120.274117 |
-| WP07  | 510 | −505  | 23.455451 | 120.281269 |
-| WP08  | 580 | −882  | 23.456080 | 120.277578 |
-| WP09  | 580 | −1224 | 23.456080 | 120.274228 |
+| ENTRY |  60 | −573  | 23.451407 | 120.280525 |
+| WP01  |  60 | −972  | 23.451407 | 120.276618 |
+| WP02  | 170 | −1286 | 23.452395 | 120.273544 |
+| WP03  | 170 | −553  | 23.452395 | 120.280721 |
+| WP04  | 280 | −532  | 23.453383 | 120.280926 |
+| WP05  | 280 | −1269 | 23.453383 | 120.273710 |
+| WP06  | 390 | −1253 | 23.454371 | 120.273867 |
+| WP07  | 390 | −511  | 23.454371 | 120.281132 |
+| WP08  | 500 | −490  | 23.455360 | 120.281337 |
+| WP09  | 500 | −1236 | 23.455360 | 120.274033 |
+| WP10  | 610 | −1220 | 23.456348 | 120.274190 |
+| WP11  | 610 | −1043 | 23.456348 | 120.275923 |
 
 ---
 
@@ -196,18 +201,18 @@ detection logging.
 SURVEY_SPEED  = 12.0   # m/s — strip cruise speed
 DEDUP_RADIUS  = 30.0   # m — suppress duplicate log within this radius
 SURVEY_WPS = [         # (north_m, east_m, agl_m)
-    (210.0,   -545.0,  65.0),  # ENTRY: south end strip E
-    (517.0,   -545.0,  65.0),  # WP01: north end strip E
-    (545.0,   -695.0,  65.0),  # WP02: north end strip 1
-    (8.0,     -695.0,  65.0),  # WP03: south end strip 1
-    (36.0,    -845.0,  65.0),  # WP04: south end strip 2
-    (573.0,   -845.0,  65.0),  # WP05: north end strip 2
-    (601.0,   -995.0,  65.0),  # WP06: north end strip 3
-    (65.0,    -995.0,  65.0),  # WP07: south end strip 3
-    (93.0,   -1145.0,  65.0),  # WP08: south end strip 4
-    (629.0,  -1145.0,  65.0),  # WP09: north end strip 4
-    (408.0,  -1250.0,  65.0),  # WP10: north end strip W
-    (113.0,  -1250.0,  65.0),  # WP11: south end strip W
+    (60.0,    -573.0,  65.0),  # ENTRY: E end strip S
+    (60.0,    -972.0,  65.0),  # WP01 : W end strip S
+    (170.0,  -1286.0,  65.0),  # WP02 : W end strip 1 [diag NW]
+    (170.0,   -553.0,  65.0),  # WP03 : E end strip 1
+    (280.0,   -532.0,  65.0),  # WP04 : E end strip 2
+    (280.0,  -1269.0,  65.0),  # WP05 : W end strip 2
+    (390.0,  -1253.0,  65.0),  # WP06 : W end strip 3
+    (390.0,   -511.0,  65.0),  # WP07 : E end strip 3
+    (500.0,   -490.0,  65.0),  # WP08 : E end strip 4
+    (500.0,  -1236.0,  65.0),  # WP09 : W end strip 4
+    (610.0,  -1220.0,  65.0),  # WP10 : W end strip N
+    (610.0,  -1043.0,  65.0),  # WP11 : E end strip N
 ]
 ```
 
@@ -276,17 +281,19 @@ while wp_idx < len(SURVEY_WPS):
 | Segment | Distance | Time (12 m/s) |
 |---------|----------|----------------|
 | Home → ENTRY | 576 m | 48.0 s |
-| Strip S (partial) | 399 m | 33.3 s |
-| WP01 → WP02 (diagonal NW) | 342 m | 28.5 s |
-| Strip 1 | 735 m | 61.3 s |
-| WP03 → WP04 (short N) | 153 m | 12.8 s |
-| Strip 2 | 740 m | 61.7 s |
-| WP05 → WP06 (short N) | 152 m | 12.7 s |
-| Strip 3 | 730 m | 60.8 s |
-| WP07 → WP08 (diagonal NW) | 383 m | 31.9 s |
-| Strip N (partial) | 342 m | 28.5 s |
-| WP09 → Home | 1354 m | 112.8 s |
-| **Total** | **≈ 5906 m** | **≈ 492 s ≈ 8.2 min** |
+| Strip S (partial) | 399 m | 33.2 s |
+| WP01 → WP02 (diagonal NW) | 333 m | 27.7 s |
+| Strip 1 | 733 m | 61.1 s |
+| WP03 → WP04 (short N) | 112 m | 9.3 s |
+| Strip 2 | 737 m | 61.4 s |
+| WP05 → WP06 (short N) | 111 m | 9.3 s |
+| Strip 3 | 742 m | 61.8 s |
+| WP07 → WP08 (short N) | 112 m | 9.3 s |
+| Strip 4 | 746 m | 62.2 s |
+| WP09 → WP10 (short N) | 111 m | 9.3 s |
+| Strip N (partial) | 177 m | 14.8 s |
+| WP11 → Home | 1208 m | 100.7 s |
+| **Total** | **≈ 6097 m** | **≈ 508 s ≈ 8.5 min** |
 
 No detection diversions — cars are logged in-flight; flight time is fixed at ~8.2 min.
 
@@ -297,9 +304,9 @@ No detection diversions — cars are logged in-flight; flight time is fixed at ~
 | Metric | Value |
 |--------|-------|
 | Buffered zone area | ≈ 0.46 km² |
-| Strips | 5 (3 full + 2 partial edge strips) |
-| Zone N-S extent covered | ≈ 643 m of 655 m (≈ 98%) |
-| Strip spacing / footprint | 150 m / 125 m → 25 m gap |
+| Strips | 6 (4 full + 2 partial edge strips) |
+| Zone N-S extent covered | 655 m of 655 m (100% — 15 m uniform overlap between strips) |
+| Strip spacing / footprint | 110 m / 125 m → 15 m overlap |
 | Along-track: footprint / advance per frame | 83 m / 2.4 m → heavy overlap |
 | AnyLoc buffer from boundary | 30 m |
-| Estimated flight time (no detections) | ≈ 8.2 min |
+| Estimated flight time (no detections) | ≈ 8.5 min |
