@@ -1,5 +1,35 @@
 # Project History
 
+## 2026-06-09 — Survey route: 6-strip → 7-strip (91.7 m spacing, 33 m overlap)
+
+**Motivation:** 6-strip 110 m spacing gave only 15 m cross-track overlap between adjacent
+125 m swaths. Adding a 7th strip reduces N-S spacing to 91.7 m (= 550 m / 6 gaps) within
+the same N=60→610 extent, increasing overlap to 33 m.
+
+**Strip parameters (7 strips):**
+
+| Strip | N (m) | E east | E west | Length | Direction |
+|-------|-------|--------|--------|--------|-----------|
+| S  |  60 | −573  | −972  | 399 m  | E→W (partial SE) |
+| 1  | 152 | −556  | −1288 | 732 m  | W→E (full) |
+| 2  | 243 | −539  | −1275 | 736 m  | E→W (full) |
+| 3  | 335 | −521  | −1261 | 740 m  | W→E (full) |
+| 4  | 427 | −504  | −1247 | 743 m  | E→W (full) |
+| 5  | 518 | −548  | −1234 | 686 m  | W→E (full) |
+| N  | 610 | −1043 | −1220 | 177 m  | E→W (partial NW) |
+
+**T6 diagonal note:** with 7 (odd) strips the boustrophedon parity means strip 5 exits
+east (E=−548) and strip N also starts east (E=−1043). The WP11→WP12 transit is ~504 m
+(~42 s) — unavoidable given the zone geometry.
+
+**Route totals:** 14 waypoints; ~7.36 km; ~10.2 min (was 12 WPs / ~6.1 km / ~8.5 min).
+
+**Files changed:** `control/px4_commander.py` (SURVEY_WPS 12→14 entries), `tools/live_trace.py`
+(SURVEY_WPS mirror), `instructions/survey_mission_plan.md` (full rewrite for 7-strip),
+`README.md`, `control/README.md`.
+
+---
+
 ## 2026-06-09 — Fix sim cars floating above terrain
 
 **Problem:** `make_car()` placed all three cars at `centre_elev` (home-origin elevation,

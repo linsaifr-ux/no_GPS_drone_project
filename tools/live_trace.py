@@ -47,20 +47,22 @@ TARGET_AGL = 65.0
 WP_RADIUS  = 60.0
 
 # (north_m, east_m) — mirror of SURVEY_WPS in px4_commander.py
-# 6-strip E-W boustrophedon; 110 m N-S spacing; enter from east, S→N.
+# 7-strip E-W boustrophedon; 91.7 m N-S spacing; enter from east, S→N.
 SURVEY_WPS = [
-    (60.0,    -573.0),   # ENTRY: E end strip S
-    (60.0,    -972.0),   # WP01 : W end strip S
-    (170.0,  -1286.0),   # WP02 : W end strip 1
-    (170.0,   -553.0),   # WP03 : E end strip 1
-    (280.0,   -532.0),   # WP04 : E end strip 2
-    (280.0,  -1269.0),   # WP05 : W end strip 2
-    (390.0,  -1253.0),   # WP06 : W end strip 3
-    (390.0,   -511.0),   # WP07 : E end strip 3
-    (500.0,   -490.0),   # WP08 : E end strip 4
-    (500.0,  -1236.0),   # WP09 : W end strip 4
-    (610.0,  -1220.0),   # WP10 : W end strip N
-    (610.0,  -1043.0),   # WP11 : E end strip N
+    ( 60.0,   -573.0),   # ENTRY: E end strip S
+    ( 60.0,   -972.0),   # WP01 : W end strip S
+    (152.0,  -1288.0),   # WP02 : W end strip 1
+    (152.0,   -556.0),   # WP03 : E end strip 1
+    (243.0,   -539.0),   # WP04 : E end strip 2
+    (243.0,  -1275.0),   # WP05 : W end strip 2
+    (335.0,  -1261.0),   # WP06 : W end strip 3
+    (335.0,   -521.0),   # WP07 : E end strip 3
+    (427.0,   -504.0),   # WP08 : E end strip 4
+    (427.0,  -1247.0),   # WP09 : W end strip 4
+    (518.0,  -1234.0),   # WP10 : W end strip 5
+    (518.0,   -548.0),   # WP11 : E end strip 5
+    (610.0,  -1043.0),   # WP12 : E end strip N
+    (610.0,  -1220.0),   # WP13 : W end strip N
 ]
 
 # Raw detection zone boundary (actual area corners), CW: NW→NE→SE→SW
