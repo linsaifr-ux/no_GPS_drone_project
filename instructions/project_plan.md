@@ -10,61 +10,82 @@ Build a drone system that can localize itself and detect objects without GPS, us
 
 ```
 no_GPS_drone_project/
-├── instructions/               # Plans, notes, contest references
+├── run.sh                        # Top-level tmux launcher (ArduPilot + PX4 modes)
+├── instructions/                 # Plans, notes, history
 ├── simulator/
-│   ├── cesium_scene.py         # Physics engine + visualiser
-│   │                           #   100 Hz background thread: 6-DOF kinematic model + SITLBridge (UDP 9002)
-│   │                           #   render loop (~5 Hz): reads state, updates mesh, captures camera
-│   │                           #   publishes /drone/state (100 Hz) + /drone/camera/image_raw (1024×768) + /drone/pose + /drone/agl
-│   └── run_chiayi.sh           # Launch: sources ROS2 Jazzy, runs in conda env
+│   ├── cesium_scene.py           # Physics engine + visualiser
+│   │                             #   100 Hz background thread: 6-DOF kinematic model + PX4SimBridge/SITLBridge
+│   │                             #   render loop (~5 Hz): reads state, updates mesh, captures camera
+│   │                             #   publishes /drone/state (100 Hz) + /drone/camera/image_raw (1024×768) + /drone/pose + /drone/agl
+│   └── run_chiayi.sh             # Launch: sources ROS2 Jazzy, runs in conda env; --px4 flag
 ├── anyloc/
-│   ├── build_database.py             # Build VLAD database (run once)
+│   ├── build_database.py             # Build VLAD database (run once; NLSC PHOTO2 zoom-18)
 │   ├── localizer.py                  # AnyLocLocalizer (DINOv2 + VLAD + FAISS)
 │   ├── vo_refiner.py                 # VORefiner (LK optical flow)
-│   ├── ros2_node.py                  # ROS2: sub camera/pose → pub VPE + detections
+│   ├── ros2_node.py                  # ROS2: sub camera/pose → write latest_estimate.json
 │   ├── run_ros2_localizer.sh         # Launch script
 │   ├── test_accuracy_esri.py         # accuracy benchmark — random points, NLSC PHOTO2 imagery
-│   └── test_accuracy_constrained.py  # benchmark — anchor-chain constrained search vs global (no VO)
+│   └── test_accuracy_constrained.py  # benchmark — anchor-chain constrained search vs global
 ├── detection/
-│   ├── detector.py             # YOLODetector (auto class-map)
-│   └── ros2_node.py            # ROS2: sub /drone/camera → pub /yolo/detections
+│   ├── detector.py               # YOLODetector (auto class-map COCO/VisDrone)
+│   └── ros2_node.py              # ROS2: sub /drone/camera → pub /yolo/detections
+├── tools/
+│   ├── live_trace.py             # Real-time viewer: survey route + zone + detections overlay
+│   └── plot_trace.py             # Post-flight two-panel plot (top view + altitude)
 ├── control/
-│   ├── drone_sim.py            # Headless-only fallback: kinematic physics + SITL bridge
-│   │                           #   publishes /drone/state; NOT used when Isaac Sim runs
-│   ├── sitl_bridge.py          # UDP :9002 server — binary servo in → JSON physics out
-│   │                           #   shared by cesium_scene.py and drone_sim.py
-│   ├── stub_bridge.py          # DEPRECATED
-│   ├── flight_commander.py     # ROS2: arm → NAV_TAKEOFF → waypoints → RTL
-│   ├── launch_mavros.sh        # MAVROS2 on UDP 14550 (fcu_url=udp://:14550@)
-│   ├── no_gps.parm             # SITL: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
-│   ├── mavlink_ctrl.py         # Legacy pymavlink controller
-│   ├── run_flight.py           # Legacy pymavlink flight script
-│   └── run_vision.py           # Legacy standalone vision bridge
-└── main.py                     # Top-level orchestrator (TODO)
+│   ├── px4_commander.py          # [ACTIVE] PX4 survey mission commander
+│   ├── px4_sim_bridge.py         # PX4 HIL bridge — TCP 4560 server; HIL_ACTUATOR_CONTROLS in / HIL_SENSOR out
+│   ├── px4_no_gps.params         # PX4: EKF2_EV_CTRL=15, GPS off, no RC
+│   ├── launch_px4_sitl.sh        # Start PX4 SITL; saves PID → /tmp/px4_sitl.pid; overwrites /tmp/px4_sitl.log
+│   ├── stop_px4_sitl.sh          # Stop PX4 SITL (MAVLink shutdown → SIGTERM → SIGKILL)
+│   ├── apply_px4_params.sh       # Set + save PX4 params, auto-reboot
+│   ├── launch_mavros_px4.sh      # MAVROS2 → PX4 (UDP 14540)
+│   ├── launch_commander_px4.sh   # Run px4_commander.py
+│   ├── drone_sim.py              # Headless-only fallback: kinematic physics + bridge (PX4_SIM=0/1)
+│   │                             #   publishes /drone/state; NOT used when Isaac Sim runs
+│   ├── sitl_bridge.py            # ArduPilot UDP :9002 server — binary servo in → JSON physics out
+│   ├── flight_commander.py       # [REFERENCE] ArduPilot mission (WP nav abandoned — AC_PosControl inversion)
+│   ├── launch_mavros.sh          # MAVROS2 on UDP 14550 (ArduPilot)
+│   ├── launch_sitl.sh            # ArduPilot SITL via MAVProxy
+│   ├── launch_commander.sh       # Run flight_commander.py
+│   └── no_gps.parm               # ArduPilot: GPS_TYPE=0, EK3_SRC1_POSXY=6, VISO_TYPE=1
+└── yolov8l_visdrone.pt           # YOLOv8l fine-tuned on VisDrone (active)
 ```
 
 ---
 
 ## System Architecture
 
-```
-simulator/cesium_scene.py
-  100 Hz background thread: kinematic model + SITLBridge
-  UDP 9002 ◄──PWM──► ArduPilot SITL
-  publishes /drone/state (ENU PoseStamped, 100 Hz)
-            │
-            ├── flight_commander.py  (reads AGL truth from /drone/state)
-            │
-            └── anyloc/ros2_node.py
-                → /mavros/vision_pose/pose_cov (VPE, ENU via vision_pose plugin)
+### PX4 path (active)
 
-ArduPilot SITL
-  ─UDP 14550──► MAVROS2  ◄── /mavros/vision_pose/pose_cov (EKF3 VPE fusion)
-                │           └── /uas1/mavlink_source (BEST_EFFORT)
-                │               EKF origin confirm (msg 49) + EKF status (msg 193) + motor PWM (msg 36)
-                ├─ /mavros/global_position/set_gp_origin → SET_GPS_GLOBAL_ORIGIN
-                ├─ /mavros/setpoint_raw/local (PositionTarget FRAME_LOCAL_NED) → SET_POSITION_TARGET_LOCAL_NED
-                └─ MAV_CMD_NAV_TAKEOFF              → ArduPilot altitude controller
+```
+simulator/cesium_scene.py  (or drone_sim.py headless)
+  100 Hz background thread: kinematic model + PX4SimBridge
+  TCP 4560 ◄──HIL_ACTUATOR_CONTROLS──► PX4 SITL ──HIL_SENSOR──►
+  publishes /drone/state (ENU PoseStamped, 100 Hz)
+            /drone/camera/image_raw  /drone/pose  /drone/agl
+            │
+            ├── px4_commander.py
+            │     VPE: Phase1 kinematic → Phase2 AnyLoc latest_estimate.json
+            │     → /mavros/vision_pose/pose_cov  (EKF2 VPE fusion)
+            │     → /mavros/setpoint_raw/local    (PositionTarget, position carrot 25 m)
+            │     ← /yolo/detections              (log via yaw-corrected GSD, no divert)
+            │
+            ├── anyloc/ros2_node.py  → latest_estimate.json  (AGL ≥ 50 m)
+            └── detection/ros2_node.py → /yolo/detections    (AGL ≥ 50 m)
+
+PX4 SITL
+  ─UDP 14540/14580──► MAVROS2 ◄── /mavros/vision_pose/pose_cov
+                      └── /mavros/setpoint_raw/local → SET_POSITION_TARGET_LOCAL_NED
+```
+
+### ArduPilot path (reference / legacy)
+
+```
+cesium_scene.py  UDP 9002 ◄──PWM──► ArduPilot SITL
+  ─TCP 5760──► MAVProxy ─UDP 14550──► MAVROS2
+                          ◄── /mavros/vision_pose/pose_cov (EKF3 VPE)
+                          ◄── /mavros/setpoint_raw/local
 ```
 
 ### Coordinate conventions
@@ -72,17 +93,21 @@ ArduPilot SITL
 | Frame | x | y | z | Used by |
 |-------|---|---|---|---------|
 | Isaac Sim / ENU | East | North | Up | cesium_scene.py, /drone/state, vision_pose VPE |
-| ArduPilot NED | North | East | Down (−=alt) | SET_POSITION_TARGET_LOCAL_NED, VISION_POSITION_ESTIMATE |
+| PX4 / ArduPilot NED | North | East | Down (−=alt) | autopilot internal |
 | MAVROS2 vision_pose | ENU in, NED out | | | converts correctly |
-| MAVROS2 setpoint_raw/local (PositionTarget) | **explicit FRAME_LOCAL_NED** | | | unambiguous NED; x=north, y=east, z=down |
+| MAVROS2 setpoint_raw/local (PositionTarget) | **explicit FRAME_LOCAL_NED** | | | MAVROS always applies ENU→NED; send x=East, y=North, z=Up |
 
 ### Port map
 
 | Port | Protocol | Owner |
 |------|----------|-------|
+| TCP 4560 | MAVLink HIL | PX4SimBridge (server) ↔ PX4 SITL (client) |
+| UDP 14540 | MAVLink | MAVROS2 receives from PX4 |
+| UDP 14580 | MAVLink | PX4 SITL listens (onboard link) |
+| UDP 18570 | MAVLink | PX4 SITL → GCS (QGC) |
+| UDP 9002 | JSON FDM | SITLBridge ↔ ArduPilot SITL |
 | TCP 5760 | MAVLink | MAVProxy ↔ ArduPilot SITL (internal; single client only) |
-| UDP 9002 | JSON SITL | cesium_scene.py (or drone_sim.py headless) ↔ ArduPilot |
-| UDP 14550 | MAVLink | MAVROS2 listens (MAVProxy → MAVROS2) |
+| UDP 14550 | MAVLink | MAVROS2 listens (MAVProxy → MAVROS2, ArduPilot) |
 
 ---
 
@@ -138,21 +163,21 @@ Standalone ROS2 node for headless SITL testing without Isaac Sim. Provides the s
 
 **Status:** Survey mission implemented ✓ (PX4-9 Done). 12 m/s lawnmower, YOLO log-in-flight (no divert).
 
-ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (velocity setpoints).
+ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (position targets with 25 m carrot).
 
 **Mission sequence (survey):**
 1. Pre-stream 40 position setpoints at 20 Hz (PX4 requires setpoints before OFFBOARD)
 2. Switch to OFFBOARD mode + arm
 3. Climb to 65 m AGL (`takeoff()`)
 4. Hold 5 s
-5. `go_to_ned(speed=12)` — iterate 12 survey waypoints sequentially
+5. `go_to_ned(speed=12)` — iterate 14 survey waypoints sequentially (7-strip boustrophedon)
    - YOLO detections: yaw-corrected GSD pixel projection → dedup (30 m) → log to `detections.csv`; survey never interrupted
    - On arrival (60 m radius) or timeout: advance waypoint index
 6. Survey complete: `go_to_ned(0, 0, TAKEOFF_ALT)` fly home → `AUTO.LAND`
    (RTL not used — requires GPS-derived home; unreliable with external vision only)
 
 **Survey constants (module level):**
-- `SURVEY_WPS` — 12 boustrophedon waypoints at 65 m AGL (see `instructions/survey_mission_plan.md`)
+- `SURVEY_WPS` — 14 boustrophedon waypoints at 65 m AGL, 7 E-W strips, 91.7 m N-S spacing (see `instructions/survey_mission_plan.md`)
 - `SURVEY_SPEED = 12.0` m/s, `DEDUP_RADIUS = 30.0` m, `ZONE_VERTS` — buffered boundary (visualisation only)
 - `CAM_W/H = 1024/768`, `HFOV_DEG = 88`, `VFOV_DEG = 65.1` — for GSD pixel-to-ground mapping
 - `DET_LOG = detections.csv` — auto-header on first write
@@ -331,7 +356,7 @@ bash control/launch_commander.sh
 | PX4-6 | End-to-end Isaac Sim waypoint flight (horiz_err < 60 m) | Done ✓ |
 | PX4-7 | AnyLoc + detection end-to-end in PX4 pipeline | In progress (code ready; pending test) |
 | PX4-8 | Survey mission plan: lawnmower + car detection response | Done ✓ |
-| PX4-9 | Implement survey commander: 12 m/s, 6 strips, YOLO log-in-flight (no divert) | Done ✓ |
+| PX4-9 | Implement survey commander: 12 m/s, 7-strip E-W lawnmower (91.7 m spacing, 33 m overlap, ~10.2 min), YOLO log-in-flight (no divert) | Done ✓ |
 | PX4-10 | Jetson distributed sim: Jetson runs commander+AnyLoc+YOLO, PC runs Isaac+PX4 | TODO |
 | 6c | HIGHRES_IMU from ArduPilot → localization pipeline | TODO |
 | 6d | IMU fusion: AnyLoc anchor validator + VO quality gate | TODO |
