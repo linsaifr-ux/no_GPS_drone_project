@@ -7,11 +7,12 @@ Usage:
     python3 tools/live_trace.py <trace.csv>   # specific file
 
 Overlays:
-  - Planned survey route (12 waypoints, 6-strip lawnmower)
+  - Planned survey route (14 waypoints, 7-strip lawnmower)
   - Raw detection zone boundary (solid white)
   - Buffered boundary 30 m inward (orange dashed)
   - Detected vehicles from detections.csv (refreshed live)
   - AGL target line at 65 m
+  - Latest 3 detection crops with label, category, and coordinates (right panel)
 
 The window updates at ~5 Hz as drone_sim.py / cesium_scene.py writes new rows.
 Close the window to stop.
@@ -27,6 +28,8 @@ import time
 try:
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
+    import matplotlib.image as mpimg
+    from matplotlib.gridspec import GridSpec
     from matplotlib.patches import Polygon as MplPolygon
     import numpy as np
 except ImportError:
@@ -36,6 +39,7 @@ HERE      = os.path.dirname(os.path.abspath(__file__))
 PROJ_ROOT = os.path.join(HERE, "..")
 TRACE_DIR = os.path.join(PROJ_ROOT, "simulator", "flight_traces")
 DET_LOG   = os.path.join(PROJ_ROOT, "detections.csv")
+CROP_DIR  = os.path.join(PROJ_ROOT, "det_crops")
 
 # ── Survey constants (mirror of px4_commander.py) ─────────────────────────────
 HOME_LAT  = 23.450868
@@ -121,10 +125,10 @@ def read_csv_fast(path):
 
 
 def read_detections(min_timestamp=0.0):
-    """Return list of (east_m, north_m, category) from detections.csv.
+    """Return list of detection dicts from detections.csv (current flight only).
 
-    Only rows whose Unix timestamp >= min_timestamp are returned, so detections
-    from previous flights (which share the same CSV file) are not shown.
+    Each dict: east, north, category, confidence, lat, lon, crop_path, idx.
+    Only rows whose Unix timestamp >= min_timestamp are returned.
     """
     dets = []
     try:
@@ -138,7 +142,16 @@ def read_detections(min_timestamp=0.0):
                     lon = float(row["lon"])
                     north = (lat - HOME_LAT) * M_PER_DEG
                     east  = (lon - HOME_LON) * M_PER_DEG * COS_LAT
-                    dets.append((east, north, row["category"]))
+                    dets.append({
+                        "east":       east,
+                        "north":      north,
+                        "category":   row.get("category", "car"),
+                        "confidence": float(row.get("confidence", 0)),
+                        "lat":        lat,
+                        "lon":        lon,
+                        "crop_path":  row.get("crop_path", ""),
+                        "idx":        len(dets),
+                    })
                 except (ValueError, KeyError):
                     pass
     except FileNotFoundError:
@@ -148,8 +161,14 @@ def read_detections(min_timestamp=0.0):
 
 # ── Build figure ───────────────────────────────────────────────────────────────
 
-fig, (ax_top, ax_alt) = plt.subplots(1, 2, figsize=(14, 7))
+fig = plt.figure(figsize=(18, 8))
 fig.patch.set_facecolor("#1e1e2e")
+
+gs = GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.35)
+ax_top  = fig.add_subplot(gs[:2, :2])
+ax_alt  = fig.add_subplot(gs[2, :2])
+ax_crops = [fig.add_subplot(gs[i, 2]) for i in range(3)]
+
 for ax in (ax_top, ax_alt):
     ax.set_facecolor("#2a2a3e")
     ax.tick_params(colors="white")
@@ -159,6 +178,13 @@ for ax in (ax_top, ax_alt):
     for spine in ax.spines.values():
         spine.set_edgecolor("#555577")
     ax.grid(True, color="#444466", linewidth=0.5)
+
+for ax_c in ax_crops:
+    ax_c.set_facecolor("#1e1e2e")
+    ax_c.set_xticks([]); ax_c.set_yticks([])
+    ax_c.title.set_color("white")
+    for sp in ax_c.spines.values():
+        sp.set_edgecolor("#555577")
 
 # ── Top view — static elements ─────────────────────────────────────────────────
 
@@ -254,10 +280,11 @@ ax_top.set_ylim(-200, 800)
 ax_alt.set_xlim(0, 120)
 ax_alt.set_ylim(0, TARGET_AGL + 20)
 
-_csv_path          = [None]
-_det_last_mtime    = [0.0]
-_det_cache         = [[]]   # list of (east, north, cat)
-_flight_start_epoch = [0.0]  # Unix timestamp of the current flight (from trace filename)
+_csv_path           = [None]
+_det_last_mtime     = [0.0]
+_det_cache          = [[]]    # list of detection dicts
+_flight_start_epoch = [0.0]   # Unix timestamp of current flight (from trace filename)
+_crops_count        = [-1]    # triggers crop panel redraw when det count changes
 
 
 def _expand_top(xs, ys, margin=80):
@@ -306,10 +333,49 @@ def update(_frame):
 
     dets = _det_cache[0]
     if dets:
-        det_e = np.array([d[0] for d in dets])
-        det_n = np.array([d[1] for d in dets])
+        det_e = np.array([d["east"]  for d in dets])
+        det_n = np.array([d["north"] for d in dets])
         det_scatter.set_offsets(np.c_[det_e, det_n])
         det_scatter.set_sizes([100] * len(dets))
+
+    # ── Detection crop panels (right column) ───────────────────────────────────
+    if len(dets) != _crops_count[0]:
+        _crops_count[0] = len(dets)
+        recent = list(reversed(dets))[:3]   # newest first
+        for i, ax_c in enumerate(ax_crops):
+            ax_c.cla()
+            ax_c.set_xticks([]); ax_c.set_yticks([])
+            ax_c.set_facecolor("#1e1e2e")
+            if i < len(recent):
+                d = recent[i]
+                label_n = d["idx"] + 1
+                cat     = d["category"]
+                lat, lon = d["lat"], d["lon"]
+                color   = _CAT_COLOR.get(cat, "#ff4444")
+                for sp in ax_c.spines.values():
+                    sp.set_edgecolor(color); sp.set_linewidth(1.5)
+                crop_path = d.get("crop_path", "")
+                if not crop_path or not os.path.exists(crop_path):
+                    crop_path = os.path.join(CROP_DIR, f"det_{d['idx']:03d}.jpg")
+                if crop_path and os.path.exists(crop_path):
+                    try:
+                        img = mpimg.imread(crop_path)
+                        ax_c.imshow(img)
+                    except Exception:
+                        ax_c.text(0.5, 0.5, "image\nerror", ha="center", va="center",
+                                  color="#888888", fontsize=8, transform=ax_c.transAxes)
+                else:
+                    ax_c.text(0.5, 0.5, "no image", ha="center", va="center",
+                              color="#666688", fontsize=9, transform=ax_c.transAxes)
+                ax_c.set_title(f"Det-{label_n}  |  {cat}",
+                               color=color, fontsize=15, pad=3)
+                ax_c.set_xlabel(f"{lat:.5f}°N  {lon:.5f}°E",
+                                color="#44ff88", fontsize=15, labelpad=2)
+            else:
+                for sp in ax_c.spines.values():
+                    sp.set_edgecolor("#555577")
+                ax_c.text(0.5, 0.5, "—", ha="center", va="center",
+                          color="#555577", fontsize=14, transform=ax_c.transAxes)
 
     # Nearest survey WP
     dists = [math.hypot(e[-1] - we, n[-1] - wn) for wn, we in SURVEY_WPS]

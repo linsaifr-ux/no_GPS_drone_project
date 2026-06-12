@@ -48,6 +48,13 @@ try:
 except ImportError:
     _HAVE_VISION_MSGS = False
 
+try:
+    from sensor_msgs.msg import Image as _RosImage
+    from PIL import Image as _PilImage
+    _HAVE_PIL = True
+except ImportError:
+    _HAVE_PIL = False
+
 _SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                          durability=DurabilityPolicy.VOLATILE, depth=10)
 
@@ -72,7 +79,6 @@ WAYPOINT_TIMEOUT     = 900.0  # s per waypoint
 MIN_LOCALISATION_AGL = 50.0   # m — below this use truth VPE; above, use AnyLoc
 
 SURVEY_SPEED   = 12.0   # m/s — strip cruise speed
-DEDUP_RADIUS   = 30.0   # m   — suppress duplicate log within this radius of an existing entry
 
 COS_LAT   = math.cos(math.radians(HOME_LAT))
 M_PER_DEG = 111_320.0
@@ -128,6 +134,8 @@ DET_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "detections.csv"
 )
+CROP_DIR     = os.path.join(os.path.dirname(DET_LOG), "det_crops")
+DEDUP_RADIUS = 5.0   # metres — skip re-logging the same vehicle within this distance
 
 ESTIMATE_JSON = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -160,8 +168,9 @@ class PX4Commander(rclpy.node.Node):
         self._local_vel = None   # /mavros/local_position/velocity_local (ENU)
         self._drone     = None   # /drone/state  (ENU, kinematic truth)
 
-        # Detection dedup guard
-        self._logged_positions = []   # (north_m, east_m) list
+        self._latest_frame    = None  # cached PIL image for crop saving
+        self._det_count       = 0     # monotonic crop file index
+        self._logged_positions = []   # (north_m, east_m) list for dedup
 
         # Subscribers
         from geometry_msgs.msg import PoseStamped
@@ -179,6 +188,14 @@ class PX4Commander(rclpy.node.Node):
             self.get_logger().info("YOLO detection subscriber active")
         else:
             self.get_logger().warn("vision_msgs not found — YOLO detection disabled")
+
+        if _HAVE_PIL:
+            _img_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                  durability=DurabilityPolicy.VOLATILE, depth=1)
+            self.create_subscription(_RosImage, "/drone/camera/image_raw",
+                                     self._cb_image, _img_qos)
+        else:
+            self.get_logger().warn("PIL not available — detection crops will not be saved")
 
         # Publishers
         self._vpe_pub  = self.create_publisher(
@@ -199,6 +216,13 @@ class PX4Commander(rclpy.node.Node):
     def _cb_local(self, m):  self._local_pos = m
     def _cb_vel(self, m):    self._local_vel = m
     def _cb_drone(self, m):  self._drone     = m
+
+    def _cb_image(self, msg):
+        try:
+            self._latest_frame = _PilImage.frombytes(
+                "RGB", (msg.width, msg.height), bytes(msg.data))
+        except Exception:
+            pass
 
     def _cb_detections(self, msg):
         """
@@ -242,26 +266,45 @@ class PX4Commander(rclpy.node.Node):
         cat   = best.results[0].hypothesis.class_id
         conf  = best.results[0].hypothesis.score
 
-        # Skip if already logged a vehicle within DEDUP_RADIUS
-        for ln, le in self._logged_positions:
-            if math.hypot(obj_n - ln, obj_e - le) < DEDUP_RADIUS:
+        for pn, pe in self._logged_positions:
+            if math.hypot(obj_n - pn, obj_e - pe) < DEDUP_RADIUS:
                 return
 
-        self._log_detection(cat, conf, obj_n, obj_e, agl)
+        bbox = (cx, cy, best.bbox.size_x, best.bbox.size_y)
+        self._log_detection(cat, conf, obj_n, obj_e, agl, bbox=bbox)
         print(f"[PX4Cmd] {cat} conf={conf:.2f}  N={obj_n:+.1f} E={obj_e:+.1f}"
               f"  (Δn={dn:+.1f} Δe={de:+.1f} m)")
 
-    def _log_detection(self, category, confidence, north_m, east_m, agl_m):
-        """Append one row to detections.csv and record position for dedup."""
+    def _log_detection(self, category, confidence, north_m, east_m, agl_m, bbox=None):
+        """Append one row to detections.csv and save crop image."""
         lat = HOME_LAT + north_m / M_PER_DEG
         lon = HOME_LON + east_m  / (M_PER_DEG * COS_LAT)
+
+        crop_path = ""
+        if _HAVE_PIL and bbox is not None and self._latest_frame is not None:
+            try:
+                cx, cy, bw, bh = bbox
+                pad = 20
+                x1 = max(0, int(cx - bw / 2) - pad)
+                y1 = max(0, int(cy - bh / 2) - pad)
+                x2 = min(self._latest_frame.width,  int(cx + bw / 2) + pad)
+                y2 = min(self._latest_frame.height, int(cy + bh / 2) + pad)
+                crop = self._latest_frame.crop((x1, y1, x2, y2))
+                os.makedirs(CROP_DIR, exist_ok=True)
+                crop_path = os.path.join(CROP_DIR, f"det_{self._det_count:03d}.jpg")
+                crop.save(crop_path, "JPEG", quality=90)
+            except Exception as e:
+                print(f"[PX4Cmd] crop save failed: {e}")
+                crop_path = ""
+
         need_header = not os.path.exists(DET_LOG)
         with open(DET_LOG, "a") as f:
             if need_header:
-                f.write("timestamp,category,confidence,lat,lon,agl_m\n")
+                f.write("timestamp,category,confidence,lat,lon,agl_m,crop_path\n")
             f.write(f"{time.time():.3f},{category},{confidence:.3f},"
-                    f"{lat:.6f},{lon:.6f},{agl_m:.1f}\n")
+                    f"{lat:.6f},{lon:.6f},{agl_m:.1f},{crop_path}\n")
         self._logged_positions.append((north_m, east_m))
+        self._det_count += 1
         print(f"[PX4Cmd] logged: {category} conf={confidence:.2f}"
               f"  lat={lat:.6f} lon={lon:.6f}  agl={agl_m:.1f} m")
 

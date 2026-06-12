@@ -1,5 +1,17 @@
 # Project History
 
+## 2026-06-12 — Dedup radius 30 m → 5 m; live_trace detection crop text enlarged
+
+`DEDUP_RADIUS` in `control/px4_commander.py` reduced from 30 m to 5 m. The 30 m radius was
+originally sized to cover ~20 m AnyLoc position uncertainty, but it also suppressed logging
+of genuinely distinct vehicles parked within 30 m of each other. 5 m suppresses same-vehicle
+duplicate frames while allowing nearby distinct cars to be logged separately.
+
+`tools/live_trace.py` detection crop panel text sizes increased: panel title (label + category)
+from 8 → 15 pt, coordinate line from 7 → 15 pt (green `#44ff88`).
+
+---
+
 ## 2026-06-09 — Imagery: Esri World Imagery → NLSC PHOTO2
 
 Switched satellite imagery back from Esri World Imagery to Taiwan NLSC PHOTO2 WMTS in

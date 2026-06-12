@@ -171,14 +171,14 @@ ROS2 node. MAVROS2 + PX4 OFFBOARD mode via `setpoint_raw/local` (position target
 3. Climb to 65 m AGL (`takeoff()`)
 4. Hold 5 s
 5. `go_to_ned(speed=12)` — iterate 14 survey waypoints sequentially (7-strip boustrophedon)
-   - YOLO detections: yaw-corrected GSD pixel projection → dedup (30 m) → log to `detections.csv`; survey never interrupted
+   - YOLO detections: yaw-corrected GSD pixel projection → dedup (5 m) → log to `detections.csv`; survey never interrupted
    - On arrival (60 m radius) or timeout: advance waypoint index
 6. Survey complete: `go_to_ned(0, 0, TAKEOFF_ALT)` fly home → `AUTO.LAND`
    (RTL not used — requires GPS-derived home; unreliable with external vision only)
 
 **Survey constants (module level):**
 - `SURVEY_WPS` — 14 boustrophedon waypoints at 65 m AGL, 7 E-W strips, 91.7 m N-S spacing (see `instructions/survey_mission_plan.md`)
-- `SURVEY_SPEED = 12.0` m/s, `DEDUP_RADIUS = 30.0` m, `ZONE_VERTS` — buffered boundary (visualisation only)
+- `SURVEY_SPEED = 12.0` m/s, `DEDUP_RADIUS = 5.0` m, `ZONE_VERTS` — buffered boundary (visualisation only)
 - `CAM_W/H = 1024/768`, `HFOV_DEG = 88`, `VFOV_DEG = 65.1` — for GSD pixel-to-ground mapping
 - `DET_LOG = detections.csv` — auto-header on first write
 

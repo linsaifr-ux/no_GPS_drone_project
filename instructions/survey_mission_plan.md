@@ -180,7 +180,7 @@ obj_east  = cur_east  + Δeast
 ### Log procedure
 
 1. Compute `(obj_north, obj_east)` using the yaw-corrected formula above.
-2. Check dedup: skip if within `DEDUP_RADIUS = 30 m` of any already-logged position.
+2. Check dedup: skip if within `DEDUP_RADIUS = 5 m` of any already-logged position.
 3. Log highest-confidence vehicle to `detections.csv`:
    ```
    timestamp, category, confidence, lat, lon, agl_m
@@ -192,9 +192,9 @@ obj_east  = cur_east  + Δeast
 
 After a vehicle is logged its position `(north_m, east_m)` is appended to
 `self._logged_positions`. Any subsequent detection whose estimated ground position
-falls within `DEDUP_RADIUS = 30 m` of an already-logged entry is silently discarded.
-The 30 m radius covers the ~20 m AnyLoc position uncertainty, preventing the same
-physical car from being re-logged on successive passes or frames.
+falls within `DEDUP_RADIUS = 5 m` of an already-logged entry is silently discarded.
+The 5 m radius suppresses duplicate logs from successive frames detecting the same
+physical car without discarding nearby distinct vehicles.
 
 ### Boundary visualisation
 
@@ -210,7 +210,7 @@ detection logging.
 
 ```python
 SURVEY_SPEED  = 12.0   # m/s — strip cruise speed
-DEDUP_RADIUS  = 30.0   # m — suppress duplicate log within this radius
+DEDUP_RADIUS  = 5.0    # m — suppress duplicate log within this radius
 SURVEY_WPS = [         # (north_m, east_m, agl_m)
     ( 60.0,   -573.0,  65.0),  # ENTRY: E end strip S
     ( 60.0,   -972.0,  65.0),  # WP01 : W end strip S

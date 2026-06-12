@@ -67,8 +67,9 @@ terrain/
 # AnyLoc runtime output (written each anchor frame, read by run_vision.py)
 anyloc/latest_estimate.json
 
-# Survey detection log (written by px4_commander.py at runtime)
+# Survey detection log and crops (written by px4_commander.py at runtime)
 detections.csv
+det_crops/
 
 # Terrain elevation written by cesium_scene.py on startup (runtime, machine-specific)
 control/home_elevation.json
